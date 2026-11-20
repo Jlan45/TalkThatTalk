@@ -1,0 +1,28 @@
+# TalkThatTalk AI Unified Gateway - Bootstrap Configuration
+# All upstream providers, client API keys, and request logs are persisted
+# in the embedded SQLite database and managed via the Web Console / API.
+
+[server]
+listen_addr = "0.0.0.0:8080"
+tcp_nodelay = true
+graceful_shutdown_secs = 30
+max_inspect_body_bytes = 4194304
+# Optional admin API key protecting /api/v1/* management endpoints:
+# admin_api_key = "replace-with-strong-secret"
+
+[pool]
+idle_timeout_secs = 90
+max_idle_per_host = 64
+connect_timeout_ms = 5000
+http2_adaptive_window = true
+
+[telemetry]
+tap_channel_capacity = 4096
+
+[storage]
+# Embedded SQLite database (WAL mode) for encrypted upstreams, client keys & request logs.
+db_path = "data/talkthattalk.db"
+# AES-256-GCM encrypted OAuth token store.
+store_path = "data/oauth-tokens.enc"
+# Base64-encoded 32-byte master key env var (auto-generates a 0600 local key if unset).
+master_key_env = "TTT_MASTER_KEY"

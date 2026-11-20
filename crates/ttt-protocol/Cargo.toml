@@ -1,0 +1,15 @@
+[package]
+name = "ttt-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+memchr.workspace = true
+pin-project-lite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ttt-core.workspace = true

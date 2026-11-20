@@ -1,0 +1,12 @@
+/target
+Cargo.lock
+config.toml
+*.local.toml
+.ttt-tokens.enc*
+data/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+web/node_modules
+web/dist

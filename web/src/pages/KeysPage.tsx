@@ -114,6 +114,24 @@ export function KeysPage() {
 
   const gatewayOrigin = window.location.origin;
   const sampleKey = keys.find((k) => k.enabled)?.key ?? keys[0]?.key ?? "sk-ttt-your-key";
+  const agentPrompt = `请帮我配置当前 AI 工具接入本地统一模型网关（TalkThatTalk）：
+
+1. 网关地址：${gatewayOrigin}
+2. API Key：${sampleKey}
+3. 可用协议端点：
+   - OpenAI Chat Completions：${gatewayOrigin}/v1/chat/completions（OPENAI_BASE_URL=${gatewayOrigin}/v1）
+   - OpenAI Responses（Codex）：${gatewayOrigin}/v1/responses（OPENAI_BASE_URL=${gatewayOrigin}/v1）
+   - Anthropic Messages（Claude Code）：${gatewayOrigin}/v1/messages（ANTHROPIC_BASE_URL=${gatewayOrigin}）
+   - 模型列表接口：GET ${gatewayOrigin}/v1/models
+4. 鉴权方式：
+   - OpenAI 协议：Authorization: Bearer ${sampleKey}
+   - Anthropic 协议：x-api-key: ${sampleKey} 或 Authorization: Bearer ${sampleKey}
+5. 获取可用模型：请先请求 GET ${gatewayOrigin}/v1/models（携带 Authorization: Bearer ${sampleKey}）获取当前令牌可用的模型列表，再按需选择模型写入配置。
+6. 会话亲和与 Prompt 缓存优化（可选，不强制）：
+   - 网关会自动识别主流 Agent 自带的会话标识（如 Codex 的 session_id、Claude Code 的 metadata.user_id、OpenCode 的 x-opencode-session、以及 x-session-id、prompt_cache_key 等），未携带时也会自动按上下文前缀指纹做亲和路由，普通工具无需额外配置。
+   - 若自研客户端或脚本支持按每次对话动态传递请求头，可优先传入稳定的会话 ID：x-ttt-session-id: <per-conversation-uuid>（或 x-session-id），同一会话多轮复用同一上游与 Key，网关转发前会自动剥离 x-ttt-session-id 并按目标渠道转换为对应的会话头（切勿使用每次请求变化的 request-id，也不要在全局静态配置里写死固定值）。
+
+请根据当前工具的配置文件格式（如 Claude Code ~/.claude/settings.json、Codex ~/.codex/config.toml、OpenCode / Cursor / Cline 等）自动完成配置，并优先使用与当前工具匹配的原生协议端点；配置完成后发一条简短测试请求验证连通性。`;
 
   return (
     <div>
@@ -209,44 +227,13 @@ export function KeysPage() {
           <div className="card-title">Agent 接入提示词</div>
           <button
             className="btn btn-ghost btn-sm"
-            onClick={() => {
-              const prompt = `请帮我配置当前 AI 工具接入本地统一模型网关（TalkThatTalk）：
-
-1. 网关地址：${gatewayOrigin}
-2. API Key：${sampleKey}
-3. 可用协议端点：
-   - OpenAI Chat Completions：${gatewayOrigin}/v1/chat/completions（OPENAI_BASE_URL=${gatewayOrigin}/v1）
-   - OpenAI Responses（Codex）：${gatewayOrigin}/v1/responses（OPENAI_BASE_URL=${gatewayOrigin}/v1）
-   - Anthropic Messages（Claude Code）：${gatewayOrigin}/v1/messages（ANTHROPIC_BASE_URL=${gatewayOrigin}）
-   - 模型列表接口：GET ${gatewayOrigin}/v1/models
-4. 鉴权方式：
-   - OpenAI 协议：Authorization: Bearer ${sampleKey}
-   - Anthropic 协议：x-api-key: ${sampleKey} 或 Authorization: Bearer ${sampleKey}
-5. 获取可用模型：请先请求 GET ${gatewayOrigin}/v1/models（携带 Authorization: Bearer ${sampleKey}）获取当前令牌可用的模型列表，再按需选择模型写入配置。
-
-请根据当前工具的配置文件格式（如 Claude Code ~/.claude/settings.json、Codex ~/.codex/config.toml、OpenCode / Cursor / Cline 等）自动完成配置，并优先使用与当前工具匹配的原生协议端点；配置完成后发一条简短测试请求验证连通性。`;
-              void copyText(prompt);
-            }}
+            onClick={() => void copyText(agentPrompt)}
           >
             <IconCopy width={13} height={13} />
-            {copiedKey?.startsWith("请帮我配置当前 AI 工具") ? "已复制" : "复制提示词"}
+            {copiedKey === agentPrompt ? "已复制" : "复制提示词"}
           </button>
         </div>
-        <pre className="code-block">{`请帮我配置当前 AI 工具接入本地统一模型网关（TalkThatTalk）：
-
-1. 网关地址：${gatewayOrigin}
-2. API Key：${sampleKey}
-3. 可用协议端点：
-   - OpenAI Chat Completions：${gatewayOrigin}/v1/chat/completions（OPENAI_BASE_URL=${gatewayOrigin}/v1）
-   - OpenAI Responses（Codex）：${gatewayOrigin}/v1/responses（OPENAI_BASE_URL=${gatewayOrigin}/v1）
-   - Anthropic Messages（Claude Code）：${gatewayOrigin}/v1/messages（ANTHROPIC_BASE_URL=${gatewayOrigin}）
-   - 模型列表接口：GET ${gatewayOrigin}/v1/models
-4. 鉴权方式：
-   - OpenAI 协议：Authorization: Bearer ${sampleKey}
-   - Anthropic 协议：x-api-key: ${sampleKey} 或 Authorization: Bearer ${sampleKey}
-5. 获取可用模型：请先请求 GET ${gatewayOrigin}/v1/models（携带 Authorization: Bearer ${sampleKey}）获取当前令牌可用的模型列表，再按需选择模型写入配置。
-
-请根据当前工具的配置文件格式（如 Claude Code ~/.claude/settings.json、Codex ~/.codex/config.toml、OpenCode / Cursor / Cline 等）自动完成配置，并优先使用与当前工具匹配的原生协议端点；配置完成后发一条简短测试请求验证连通性。`}</pre>
+        <pre className="code-block">{agentPrompt}</pre>
       </div>
 
       <div className="two-col">
@@ -257,9 +244,11 @@ export function KeysPage() {
           <pre className="code-block">{`export OPENAI_BASE_URL="${gatewayOrigin}/v1"
 export OPENAI_API_KEY="${sampleKey}"
 
+# 可选：携带稳定的会话头 x-ttt-session-id（每轮对话保持一致）以提升 Prompt 缓存命中率
 curl ${gatewayOrigin}/v1/chat/completions \\
   -H "Authorization: Bearer ${sampleKey}" \\
   -H "Content-Type: application/json" \\
+  -H "x-ttt-session-id: conv-demo-001" \\
   -d '{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"Hello"}]}'`}</pre>
         </div>
 
@@ -270,10 +259,12 @@ curl ${gatewayOrigin}/v1/chat/completions \\
           <pre className="code-block">{`export ANTHROPIC_BASE_URL="${gatewayOrigin}"
 export ANTHROPIC_API_KEY="${sampleKey}"
 
+# 可选：Claude Code 会自动带 metadata.user_id；自定义脚本也可传 x-ttt-session-id
 curl ${gatewayOrigin}/v1/messages \\
   -H "x-api-key: ${sampleKey}" \\
   -H "anthropic-version: 2023-06-01" \\
   -H "Content-Type: application/json" \\
+  -H "x-ttt-session-id: conv-demo-001" \\
   -d '{"model":"claude-sonnet-4-20250514","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}'`}</pre>
         </div>
       </div>

@@ -24,13 +24,19 @@ pub struct RequestLogEntry {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UpstreamStats {
     pub requests: u64,
     pub errors: u64,
+    pub input_tokens: u64,
     pub total_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_hit_rate: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,6 +49,11 @@ pub struct GatewayStatsSnapshot {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_cache_write_tokens: u64,
+    pub cache_hit_rate: f64,
+    pub cache_hit_requests: u64,
+    pub cache_request_hit_rate: f64,
     pub by_upstream: HashMap<String, UpstreamStats>,
     pub by_model: HashMap<String, u64>,
     pub recent_requests: Vec<RequestLogEntry>,
@@ -65,6 +76,10 @@ struct InnerMetrics {
     total_input_tokens: u64,
     total_output_tokens: u64,
     total_tokens: u64,
+    total_cache_read_tokens: u64,
+    total_cache_write_tokens: u64,
+    cache_hit_requests: u64,
+    usage_requests: u64,
     by_upstream: HashMap<String, UpstreamStats>,
     by_model: HashMap<String, u64>,
     pending: HashMap<RequestId, PendingMeta>,
@@ -89,6 +104,10 @@ impl MetricsStore {
                 total_input_tokens: 0,
                 total_output_tokens: 0,
                 total_tokens: 0,
+                total_cache_read_tokens: 0,
+                total_cache_write_tokens: 0,
+                cache_hit_requests: 0,
+                usage_requests: 0,
                 by_upstream: HashMap::new(),
                 by_model: HashMap::new(),
                 pending: HashMap::new(),
@@ -133,13 +152,26 @@ impl MetricsStore {
                 g.total_input_tokens += entry.input_tokens;
                 g.total_output_tokens += entry.output_tokens;
                 g.total_tokens += entry.total_tokens;
+                g.total_cache_read_tokens += entry.cache_read_tokens;
+                g.total_cache_write_tokens += entry.cache_write_tokens;
+                if entry.input_tokens > 0 {
+                    g.usage_requests += 1;
+                }
+                if entry.cache_read_tokens > 0 {
+                    g.cache_hit_requests += 1;
+                }
 
                 let up_stat = g.by_upstream.entry(entry.upstream.clone()).or_default();
                 up_stat.requests += 1;
                 if entry.status >= 400 {
                     up_stat.errors += 1;
                 }
+                up_stat.input_tokens += entry.input_tokens;
                 up_stat.total_tokens += entry.total_tokens;
+                up_stat.cache_read_tokens += entry.cache_read_tokens;
+                up_stat.cache_write_tokens += entry.cache_write_tokens;
+                up_stat.cache_hit_rate = pct_rate(up_stat.cache_read_tokens, up_stat.input_tokens);
+
                 if let Some(ref m) = entry.model {
                     *g.by_model.entry(m.clone()).or_insert(0) += 1;
                 }
@@ -183,13 +215,25 @@ impl MetricsStore {
             g.total_input_tokens += usage.input_tokens;
             g.total_output_tokens += usage.output_tokens;
             g.total_tokens += usage.total_tokens;
+            g.total_cache_read_tokens += usage.cache_read_tokens;
+            g.total_cache_write_tokens += usage.cache_write_tokens;
+            if usage.input_tokens > 0 {
+                g.usage_requests += 1;
+            }
+            if usage.cache_read_tokens > 0 {
+                g.cache_hit_requests += 1;
+            }
 
             let up_stat = g.by_upstream.entry(meta.upstream.clone()).or_default();
             up_stat.requests += 1;
             if status >= 400 {
                 up_stat.errors += 1;
             }
+            up_stat.input_tokens += usage.input_tokens;
             up_stat.total_tokens += usage.total_tokens;
+            up_stat.cache_read_tokens += usage.cache_read_tokens;
+            up_stat.cache_write_tokens += usage.cache_write_tokens;
+            up_stat.cache_hit_rate = pct_rate(up_stat.cache_read_tokens, up_stat.input_tokens);
 
             if let Some(ref m) = meta.model {
                 *g.by_model.entry(m.clone()).or_insert(0) += 1;
@@ -209,6 +253,8 @@ impl MetricsStore {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
                 total_tokens: usage.total_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
             };
 
             if g.recent.len() >= MAX_RECENT_LOGS {
@@ -234,6 +280,10 @@ impl MetricsStore {
         let mut total_input_tokens = 0u64;
         let mut total_output_tokens = 0u64;
         let mut total_tokens = 0u64;
+        let mut total_cache_read_tokens = 0u64;
+        let mut total_cache_write_tokens = 0u64;
+        let mut cache_hit_requests = 0u64;
+        let mut usage_requests = 0u64;
         let mut by_upstream: HashMap<String, UpstreamStats> = HashMap::new();
         let mut by_model: HashMap<String, u64> = HashMap::new();
 
@@ -248,19 +298,37 @@ impl MetricsStore {
             total_input_tokens += e.input_tokens;
             total_output_tokens += e.output_tokens;
             total_tokens += e.total_tokens;
+            total_cache_read_tokens += e.cache_read_tokens;
+            total_cache_write_tokens += e.cache_write_tokens;
+            if e.input_tokens > 0 {
+                usage_requests += 1;
+            }
+            if e.cache_read_tokens > 0 {
+                cache_hit_requests += 1;
+            }
 
             let up = by_upstream.entry(e.upstream.clone()).or_default();
             up.requests += 1;
             if e.status >= 400 {
                 up.errors += 1;
             }
+            up.input_tokens += e.input_tokens;
             up.total_tokens += e.total_tokens;
+            up.cache_read_tokens += e.cache_read_tokens;
+            up.cache_write_tokens += e.cache_write_tokens;
+
             if let Some(ref m) = e.model {
                 *by_model.entry(m.clone()).or_insert(0) += 1;
             }
         }
 
+        for up in by_upstream.values_mut() {
+            up.cache_hit_rate = pct_rate(up.cache_read_tokens, up.input_tokens);
+        }
+
         let avg_ttft_ms = ttft_sum_ms.checked_div(total_requests).unwrap_or(0);
+        let cache_hit_rate = pct_rate(total_cache_read_tokens, total_input_tokens);
+        let cache_request_hit_rate = pct_rate(cache_hit_requests, usage_requests);
         let recent_requests = entries.into_iter().take(MAX_RECENT_LOGS).collect();
 
         GatewayStatsSnapshot {
@@ -272,6 +340,11 @@ impl MetricsStore {
             total_input_tokens,
             total_output_tokens,
             total_tokens,
+            total_cache_read_tokens,
+            total_cache_write_tokens,
+            cache_hit_rate,
+            cache_hit_requests,
+            cache_request_hit_rate,
             by_upstream,
             by_model,
             recent_requests,
@@ -281,6 +354,8 @@ impl MetricsStore {
     pub fn snapshot(&self) -> GatewayStatsSnapshot {
         let g = self.inner.lock().expect("metrics mutex poisoned");
         let avg_ttft_ms = g.ttft_sum_ms.checked_div(g.ttft_count).unwrap_or(0);
+        let cache_hit_rate = pct_rate(g.total_cache_read_tokens, g.total_input_tokens);
+        let cache_request_hit_rate = pct_rate(g.cache_hit_requests, g.usage_requests);
         GatewayStatsSnapshot {
             uptime_secs: now_secs().saturating_sub(g.started_at_secs),
             total_requests: g.total_requests,
@@ -290,6 +365,11 @@ impl MetricsStore {
             total_input_tokens: g.total_input_tokens,
             total_output_tokens: g.total_output_tokens,
             total_tokens: g.total_tokens,
+            total_cache_read_tokens: g.total_cache_read_tokens,
+            total_cache_write_tokens: g.total_cache_write_tokens,
+            cache_hit_rate,
+            cache_hit_requests: g.cache_hit_requests,
+            cache_request_hit_rate,
             by_upstream: g.by_upstream.clone(),
             by_model: g.by_model.clone(),
             recent_requests: g.recent.iter().cloned().collect(),
@@ -304,9 +384,84 @@ impl Default for MetricsStore {
 }
 
 #[inline]
+fn pct_rate(num: u64, den: u64) -> f64 {
+    if den == 0 {
+        0.0
+    } else {
+        let pct = ((num as f64 / den as f64) * 1000.0).round() / 10.0;
+        pct.clamp(0.0, 100.0)
+    }
+}
+
+#[inline]
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computes_weighted_and_per_upstream_cache_hit_rates() {
+        let store = MetricsStore::new();
+
+        // Request 1 on up-a: 1000 input, 800 cache_read
+        let id1 = RequestId::next();
+        store.record_start(id1, Some(1), "up-a".into(), Some("gpt-4o".into()), "/v1/chat/completions".into());
+        store.record_end(
+            id1,
+            200,
+            128,
+            Some(120),
+            200,
+            TokenUsage {
+                input_tokens: 1000,
+                output_tokens: 50,
+                total_tokens: 1050,
+                cache_read_tokens: 800,
+                cache_write_tokens: 0,
+            },
+        );
+
+        // Request 2 on up-b: 3000 input, 0 cache_read, 3000 cache_write
+        let id2 = RequestId::next();
+        store.record_start(id2, Some(1), "up-b".into(), Some("claude-sonnet-4".into()), "/v1/messages".into());
+        let e2 = store
+            .record_end(
+                id2,
+                200,
+                128,
+                Some(250),
+                400,
+                TokenUsage {
+                    input_tokens: 3000,
+                    output_tokens: 100,
+                    total_tokens: 3100,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 3000,
+                },
+            )
+            .unwrap();
+
+        let snap = store.snapshot();
+        // Weighted global token hit rate: 800 / 4000 = 20.0%
+        assert_eq!(snap.total_input_tokens, 4000);
+        assert_eq!(snap.total_cache_read_tokens, 800);
+        assert_eq!(snap.total_cache_write_tokens, 3000);
+        assert_eq!(snap.cache_hit_rate, 20.0);
+        // Request-level hit rate: 1 / 2 = 50.0%
+        assert_eq!(snap.cache_hit_requests, 1);
+        assert_eq!(snap.cache_request_hit_rate, 50.0);
+        assert_eq!(snap.by_upstream["up-a"].cache_hit_rate, 80.0);
+        assert_eq!(snap.by_upstream["up-b"].cache_hit_rate, 0.0);
+
+        // User-isolated snapshot matches the same calculation
+        let iso = store.snapshot_from_entries(vec![snap.recent_requests[1].clone(), e2]);
+        assert_eq!(iso.cache_hit_rate, 20.0);
+        assert_eq!(iso.cache_request_hit_rate, 50.0);
+    }
 }

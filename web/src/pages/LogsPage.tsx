@@ -92,37 +92,57 @@ export function LogsPage() {
                 <th>TTFT</th>
                 <th>总耗时</th>
                 <th>Tokens (入/出/总)</th>
+                <th>缓存命中</th>
               </tr>
             </thead>
             <tbody>
-              {filtered.map((row) => (
-                <tr key={row.req_id}>
-                  <td className="tabular muted">{formatTime(row.timestamp_secs)}</td>
-                  <td className="mono">{row.req_id}</td>
-                  <td>
-                    <span className="tag">{row.model ?? "-"}</span>
-                  </td>
-                  <td className="mono">{row.upstream}</td>
-                  <td className="mono muted">{row.path}</td>
-                  <td>
-                    <span
-                      className={`chip ${
-                        row.status < 300 ? "chip-ok" : row.status < 500 ? "chip-warn" : "chip-err"
-                      }`}
-                    >
-                      {row.status}
-                    </span>
-                  </td>
-                  <td className="tabular">{row.ttft_ms} ms</td>
-                  <td className="tabular">{row.duration_ms} ms</td>
-                  <td className="tabular muted">
-                    {row.input_tokens} / {row.output_tokens} / <strong>{row.total_tokens}</strong>
-                  </td>
-                </tr>
-              ))}
+              {filtered.map((row) => {
+                const hitPct =
+                  row.input_tokens > 0 && row.cache_read_tokens > 0
+                    ? `${Math.min(100, (row.cache_read_tokens / row.input_tokens) * 100).toFixed(1)}%`
+                    : null;
+                return (
+                  <tr key={row.req_id}>
+                    <td className="tabular muted">{formatTime(row.timestamp_secs)}</td>
+                    <td className="mono">{row.req_id}</td>
+                    <td>
+                      <span className="tag">{row.model ?? "-"}</span>
+                    </td>
+                    <td className="mono">{row.upstream}</td>
+                    <td className="mono muted">{row.path}</td>
+                    <td>
+                      <span
+                        className={`chip ${
+                          row.status < 300 ? "chip-ok" : row.status < 500 ? "chip-warn" : "chip-err"
+                        }`}
+                      >
+                        {row.status}
+                      </span>
+                    </td>
+                    <td className="tabular">{row.ttft_ms} ms</td>
+                    <td className="tabular">{row.duration_ms} ms</td>
+                    <td className="tabular muted">
+                      {row.input_tokens} / {row.output_tokens} / <strong>{row.total_tokens}</strong>
+                    </td>
+                    <td className="tabular">
+                      {hitPct ? (
+                        <span className="chip chip-ok">
+                          {row.cache_read_tokens.toLocaleString("en-US")} ({hitPct})
+                        </span>
+                      ) : row.cache_write_tokens > 0 ? (
+                        <span className="chip chip-warn">
+                          写 {row.cache_write_tokens.toLocaleString("en-US")}
+                        </span>
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
               {filtered.length === 0 && (
                 <tr>
-                  <td colSpan={9} className="muted" style={{ textAlign: "center", padding: 32 }}>
+                  <td colSpan={10} className="muted" style={{ textAlign: "center", padding: 32 }}>
                     暂无匹配的调用日志
                   </td>
                 </tr>

@@ -342,6 +342,8 @@ async fn run_tap_worker(
                     input_tokens = usage.input_tokens,
                     output_tokens = usage.output_tokens,
                     total_tokens = usage.total_tokens,
+                    cache_read_tokens = usage.cache_read_tokens,
+                    cache_write_tokens = usage.cache_write_tokens,
                     "proxy request completed"
                 );
             }

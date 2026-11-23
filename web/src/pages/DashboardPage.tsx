@@ -101,6 +101,22 @@ export function DashboardPage() {
 
         <div className="card card-accent card-accent-purple">
           <div className="kpi-head">
+            <div className="kpi-label" style={{ marginBottom: 0 }}>Prompt 缓存命中率</div>
+          </div>
+          <div className="kpi-value" style={{ color: "var(--ok)" }}>
+            {stats ? `${stats.cache_hit_rate.toFixed(1)}%` : "—"}
+          </div>
+          <div className="kpi-sub">
+            命中 {formatNumber(stats?.total_cache_read_tokens ?? 0)} · 请求命中{" "}
+            {stats ? `${stats.cache_request_hit_rate.toFixed(1)}%` : "0.0%"}
+            {(stats?.total_cache_write_tokens ?? 0) > 0
+              ? ` · 写入 ${formatNumber(stats?.total_cache_write_tokens ?? 0)}`
+              : ""}
+          </div>
+        </div>
+
+        <div className="card card-accent">
+          <div className="kpi-head">
             <div className="kpi-label" style={{ marginBottom: 0 }}>网关运行时间</div>
           </div>
           <div className="kpi-value">{stats ? formatUptime(stats.uptime_secs) : "—"}</div>
@@ -124,6 +140,7 @@ export function DashboardPage() {
                   <span className="mono">{name}</span>
                   <span className="muted tabular">
                     {item.requests} reqs · {formatNumber(item.total_tokens)} tok
+                    {item.input_tokens > 0 ? ` · 缓存 ${item.cache_hit_rate.toFixed(1)}%` : ""}
                   </span>
                 </div>
                 <div className="bar-track">
@@ -181,35 +198,51 @@ export function DashboardPage() {
                 <th>TTFT</th>
                 <th>总耗时</th>
                 <th>Tokens</th>
+                <th>缓存命中</th>
               </tr>
             </thead>
             <tbody>
-              {(stats?.recent_requests ?? []).slice(0, 6).map((row) => (
-                <tr key={row.req_id}>
-                  <td className="mono">{row.req_id}</td>
-                  <td>
-                    <span className="tag">{row.model ?? "-"}</span>
-                  </td>
-                  <td className="mono">{row.upstream}</td>
-                  <td>
-                    <span
-                      className={`chip ${
-                        row.status < 300 ? "chip-ok" : row.status < 500 ? "chip-warn" : "chip-err"
-                      }`}
-                    >
-                      {row.status}
-                    </span>
-                  </td>
-                  <td className="tabular">{row.ttft_ms} ms</td>
-                  <td className="tabular">{row.duration_ms} ms</td>
-                  <td className="tabular muted">
-                    {row.input_tokens} / {row.output_tokens}
-                  </td>
-                </tr>
-              ))}
+              {(stats?.recent_requests ?? []).slice(0, 6).map((row) => {
+                const rowHitPct =
+                  row.input_tokens > 0 && row.cache_read_tokens > 0
+                    ? `${Math.min(100, (row.cache_read_tokens / row.input_tokens) * 100).toFixed(1)}%`
+                    : null;
+                return (
+                  <tr key={row.req_id}>
+                    <td className="mono">{row.req_id}</td>
+                    <td>
+                      <span className="tag">{row.model ?? "-"}</span>
+                    </td>
+                    <td className="mono">{row.upstream}</td>
+                    <td>
+                      <span
+                        className={`chip ${
+                          row.status < 300 ? "chip-ok" : row.status < 500 ? "chip-warn" : "chip-err"
+                        }`}
+                      >
+                        {row.status}
+                      </span>
+                    </td>
+                    <td className="tabular">{row.ttft_ms} ms</td>
+                    <td className="tabular">{row.duration_ms} ms</td>
+                    <td className="tabular muted">
+                      {row.input_tokens} / {row.output_tokens}
+                    </td>
+                    <td className="tabular">
+                      {rowHitPct ? (
+                        <span className="chip chip-ok">
+                          {formatNumber(row.cache_read_tokens)} ({rowHitPct})
+                        </span>
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
               {(!stats || stats.recent_requests.length === 0) && (
                 <tr>
-                  <td colSpan={7} className="muted" style={{ textAlign: "center", padding: 28 }}>
+                  <td colSpan={8} className="muted" style={{ textAlign: "center", padding: 28 }}>
                     尚无请求记录
                   </td>
                 </tr>

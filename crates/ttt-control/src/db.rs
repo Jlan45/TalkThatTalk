@@ -475,8 +475,8 @@ impl GatewayDb {
         conn.execute(
             "INSERT OR REPLACE INTO request_logs
                (req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms, duration_ms,
-                total_bytes, input_tokens, output_tokens, total_tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                total_bytes, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 entry.req_id,
                 entry.user_id,
@@ -491,6 +491,8 @@ impl GatewayDb {
                 entry.input_tokens as i64,
                 entry.output_tokens as i64,
                 entry.total_tokens as i64,
+                entry.cache_read_tokens as i64,
+                entry.cache_write_tokens as i64,
             ],
         )
         .map_err(db_err)?;
@@ -505,7 +507,8 @@ impl GatewayDb {
         let mut stmt = conn
             .prepare(
                 "SELECT req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms,
-                        duration_ms, total_bytes, input_tokens, output_tokens, total_tokens
+                        duration_ms, total_bytes, input_tokens, output_tokens, total_tokens,
+                        cache_read_tokens, cache_write_tokens
                  FROM request_logs
                  ORDER BY id DESC
                  LIMIT ?1",
@@ -528,6 +531,8 @@ impl GatewayDb {
                     input_tokens: row.get::<_, i64>(10)? as u64,
                     output_tokens: row.get::<_, i64>(11)? as u64,
                     total_tokens: row.get::<_, i64>(12)? as u64,
+                    cache_read_tokens: row.get::<_, i64>(13)? as u64,
+                    cache_write_tokens: row.get::<_, i64>(14)? as u64,
                 })
             })
             .map_err(db_err)?;
@@ -551,7 +556,8 @@ impl GatewayDb {
         let mut stmt = conn
             .prepare(
                 "SELECT req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms,
-                        duration_ms, total_bytes, input_tokens, output_tokens, total_tokens
+                        duration_ms, total_bytes, input_tokens, output_tokens, total_tokens,
+                        cache_read_tokens, cache_write_tokens
                  FROM request_logs
                  WHERE user_id = ?1
                  ORDER BY id DESC
@@ -575,6 +581,8 @@ impl GatewayDb {
                     input_tokens: row.get::<_, i64>(10)? as u64,
                     output_tokens: row.get::<_, i64>(11)? as u64,
                     total_tokens: row.get::<_, i64>(12)? as u64,
+                    cache_read_tokens: row.get::<_, i64>(13)? as u64,
+                    cache_write_tokens: row.get::<_, i64>(14)? as u64,
                 })
             })
             .map_err(db_err)?;
@@ -1136,7 +1144,9 @@ fn init_schema(conn: &Connection) -> Result<(), GatewayError> {
              total_bytes INTEGER NOT NULL,
              input_tokens INTEGER NOT NULL,
              output_tokens INTEGER NOT NULL,
-             total_tokens INTEGER NOT NULL
+             total_tokens INTEGER NOT NULL,
+             cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+             cache_write_tokens INTEGER NOT NULL DEFAULT 0
          );
 
          CREATE TABLE IF NOT EXISTS quota_snapshots (
@@ -1170,6 +1180,14 @@ fn init_schema(conn: &Connection) -> Result<(), GatewayError> {
         [],
     );
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN user_id INTEGER", []);
+    let _ = conn.execute(
+        "ALTER TABLE request_logs ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE request_logs ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     Ok(())
 }
 
@@ -1340,5 +1358,29 @@ mod tests {
             db.get_setting("admin_api_key").unwrap().as_deref(),
             Some("secret-admin")
         );
+
+        // Verify request_logs persistence with cache token fields
+        db.insert_request_log(&RequestLogEntry {
+            req_id: "req-cache-1".into(),
+            user_id: Some(7),
+            timestamp_secs: 1_700_000_000,
+            upstream: "deepseek".into(),
+            model: Some("deepseek-chat".into()),
+            path: "/v1/chat/completions".into(),
+            status: 200,
+            ttft_ms: 95,
+            duration_ms: 420,
+            total_bytes: 512,
+            input_tokens: 10_000,
+            output_tokens: 200,
+            total_tokens: 10_200,
+            cache_read_tokens: 8_000,
+            cache_write_tokens: 500,
+        })
+        .unwrap();
+        let logs = db.load_recent_logs_for_user(7, 10).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].cache_read_tokens, 8_000);
+        assert_eq!(logs[0].cache_write_tokens, 500);
     }
 }

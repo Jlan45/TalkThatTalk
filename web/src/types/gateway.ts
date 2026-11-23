@@ -156,7 +156,11 @@ export interface QuotaSnapshot {
 export interface UpstreamStats {
   requests: number;
   errors: number;
+  input_tokens: number;
   total_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cache_hit_rate: number;
 }
 
 export interface RequestLogEntry {
@@ -172,6 +176,8 @@ export interface RequestLogEntry {
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
 }
 
 export interface GatewayStatsSnapshot {
@@ -183,6 +189,11 @@ export interface GatewayStatsSnapshot {
   total_input_tokens: number;
   total_output_tokens: number;
   total_tokens: number;
+  total_cache_read_tokens: number;
+  total_cache_write_tokens: number;
+  cache_hit_rate: number;
+  cache_hit_requests: number;
+  cache_request_hit_rate: number;
   by_upstream: Record<string, UpstreamStats>;
   by_model: Record<string, number>;
   recent_requests: RequestLogEntry[];

@@ -21,8 +21,8 @@ use ttt_auth::{
     TokenStore,
 };
 use ttt_core::{
-    ClientKeyConfig, GatewayError, OAuthPreset, ProtocolFamily, ProxyConfig, QuotaMonitorConfig,
-    QuotaSnapshot, UpstreamAuthConfig, UpstreamConfig,
+    ClientKeyConfig, GatewayError, OAuthPreset, PromptCacheMode, ProtocolFamily, ProxyConfig,
+    QuotaMonitorConfig, QuotaSnapshot, UpstreamAuthConfig, UpstreamConfig,
 };
 use ttt_proxy::{AccessPolicy, ProxyBody, ProxyEngine};
 
@@ -67,6 +67,9 @@ pub struct UpstreamView {
     pub quota_config: Option<QuotaMonitorConfig>,
     pub can_probe_quota: bool,
     pub quota: Option<QuotaSnapshot>,
+    pub session_header_out: Option<String>,
+    pub strip_other_session_headers: bool,
+    pub prompt_cache_mode: PromptCacheMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -750,6 +753,9 @@ impl ControlPlane {
                 quota_config: up.quota.clone(),
                 can_probe_quota: resolve_probe_kind(up).is_some(),
                 quota: quota_map.get(&up.name).cloned(),
+                session_header_out: up.session_header_out.clone(),
+                strip_other_session_headers: up.strip_other_session_headers,
+                prompt_cache_mode: up.prompt_cache_mode,
             });
         }
 

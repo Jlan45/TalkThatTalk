@@ -1,0 +1,1050 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TalkThatTalk — 路由引擎与上下文前缀亲和架构设计</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --bg-elev: #111827;
+      --bg-card: #151e2e;
+      --bg-code: #0d1320;
+      --border: #243047;
+      --border-soft: #1c2638;
+      --text: #e5ecf6;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --primary: #6366f1;
+      --primary-soft: rgba(99, 102, 241, 0.14);
+      --cyan: #22d3ee;
+      --cyan-soft: rgba(34, 211, 238, 0.12);
+      --emerald: #10b981;
+      --emerald-soft: rgba(16, 185, 129, 0.14);
+      --amber: #f59e0b;
+      --amber-soft: rgba(245, 158, 11, 0.14);
+      --rose: #f43f5e;
+      --rose-soft: rgba(244, 63, 94, 0.14);
+      --radius: 12px;
+      --radius-sm: 8px;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: radial-gradient(circle at 15% 0%, rgba(99, 102, 241, 0.12), transparent 38%),
+                  radial-gradient(circle at 85% 10%, rgba(34, 211, 238, 0.08), transparent 34%),
+                  var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      line-height: 1.65;
+      min-height: 100vh;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      max-width: 1400px;
+      margin: 0 auto;
+      gap: 32px;
+      padding: 28px 24px 80px;
+    }
+
+    /* Sidebar */
+    .sidebar {
+      position: sticky;
+      top: 24px;
+      align-self: start;
+      background: rgba(17, 24, 39, 0.78);
+      backdrop-filter: blur(12px);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 16px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding-bottom: 14px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid var(--border-soft);
+    }
+    .brand-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--primary), var(--cyan));
+      box-shadow: 0 0 12px var(--primary);
+    }
+    .brand-title { font-weight: 700; font-size: 15px; letter-spacing: 0.2px; }
+    .brand-sub { font-size: 11px; color: var(--text-dim); }
+    .toc { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+    .toc a {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      border-radius: var(--radius-sm);
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 13px;
+      transition: all 0.15s ease;
+    }
+    .toc a:hover, .toc a.active {
+      background: var(--primary-soft);
+      color: #c7d2fe;
+    }
+    .toc-num {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-dim);
+      width: 18px;
+    }
+
+    /* Main Content */
+    .main { display: flex; flex-direction: column; gap: 28px; min-width: 0; }
+
+    .hero {
+      background: linear-gradient(135deg, rgba(99, 102, 241, 0.16), rgba(34, 211, 238, 0.06) 60%, rgba(17, 24, 39, 0.9));
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px 34px;
+    }
+    .hero-badges { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-family: var(--font-mono);
+    }
+    .badge-primary { background: var(--primary-soft); color: #a5b4fc; border-color: rgba(99,102,241,0.3); }
+    .badge-cyan { background: var(--cyan-soft); color: #67e8f9; border-color: rgba(34,211,238,0.3); }
+    .badge-emerald { background: var(--emerald-soft); color: #6ee7b7; border-color: rgba(16,185,129,0.3); }
+    .badge-amber { background: var(--amber-soft); color: #fcd34d; border-color: rgba(245,158,11,0.3); }
+    .badge-rose { background: var(--rose-soft); color: #fda4af; border-color: rgba(244,63,94,0.3); }
+
+    .hero h1 {
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: -0.4px;
+      margin-bottom: 10px;
+      background: linear-gradient(90deg, #ffffff, #c7d2fe);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .hero p { color: var(--text-muted); font-size: 14.5px; max-width: 820px; }
+
+    .section {
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 26px 28px;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 18px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border-soft);
+    }
+    .section-header h2 {
+      font-size: 19px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .sec-tag {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--cyan);
+      background: var(--cyan-soft);
+      padding: 2px 8px;
+      border-radius: 6px;
+    }
+
+    h3 { font-size: 15px; font-weight: 700; margin: 18px 0 10px; color: #f1f5f9; }
+    p { font-size: 14px; color: var(--text-muted); margin-bottom: 10px; }
+    ul, ol { padding-left: 20px; color: var(--text-muted); font-size: 14px; margin-bottom: 12px; }
+    li { margin-bottom: 6px; }
+    strong { color: var(--text); }
+    code {
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      background: rgba(99, 102, 241, 0.12);
+      color: #c7d2fe;
+      padding: 1.5px 6px;
+      border-radius: 5px;
+    }
+
+    /* Grid cards */
+    .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-sm);
+      padding: 16px;
+    }
+    .card-title { font-weight: 700; font-size: 14px; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+    .card p { font-size: 13px; margin-bottom: 0; }
+
+    /* Alerts */
+    .alert {
+      border-radius: var(--radius-sm);
+      padding: 14px 16px;
+      margin: 14px 0;
+      font-size: 13.5px;
+      border-left: 3px solid;
+    }
+    .alert-warn { background: var(--amber-soft); border-color: var(--amber); color: #fde68a; }
+    .alert-warn strong { color: #fef3c7; }
+    .alert-danger { background: var(--rose-soft); border-color: var(--rose); color: #fecdd3; }
+    .alert-danger strong { color: #ffe4e6; }
+    .alert-info { background: var(--primary-soft); border-color: var(--primary); color: #c7d2fe; }
+
+    /* Tables */
+    .table-wrap { overflow-x: auto; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); margin: 12px 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+    th {
+      background: var(--bg-card);
+      color: var(--text);
+      font-weight: 600;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border-soft);
+      color: var(--text-muted);
+      vertical-align: top;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(255, 255, 255, 0.02); }
+
+    /* Waterfall tiers */
+    .waterfall { display: flex; flex-direction: column; gap: 10px; margin: 14px 0; }
+    .tier-box {
+      display: grid;
+      grid-template-columns: 110px 1fr;
+      gap: 14px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-soft);
+      border-radius: var(--radius-sm);
+      padding: 14px 16px;
+      align-items: start;
+    }
+    .tier-pill {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 700;
+      text-align: center;
+      padding: 6px 8px;
+      border-radius: 6px;
+    }
+    .t0 { background: var(--rose-soft); color: #fda4af; border: 1px solid rgba(244,63,94,0.3); }
+    .t1 { background: var(--emerald-soft); color: #6ee7b7; border: 1px solid rgba(16,185,129,0.3); }
+    .t2 { background: var(--cyan-soft); color: #67e8f9; border: 1px solid rgba(34,211,238,0.3); }
+    .t3 { background: var(--primary-soft); color: #a5b4fc; border: 1px solid rgba(99,102,241,0.3); }
+
+    /* Header chips */
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .chip {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      color: #cbd5e1;
+    }
+    .chip.bad { border-color: rgba(244,63,94,0.4); color: #fda4af; background: rgba(244,63,94,0.08); text-decoration: line-through; }
+
+    /* Code blocks */
+    .code-wrap { position: relative; margin: 12px 0; }
+    pre {
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 16px;
+      overflow-x: auto;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      line-height: 1.55;
+      color: #dbeafe;
+    }
+    .copy-btn {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background: var(--bg-card);
+      color: var(--text-muted);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 11.5px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .copy-btn:hover { color: #fff; border-color: var(--primary); }
+
+    /* Filter input */
+    .filter-bar { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }
+    .filter-input {
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 7px 12px;
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+      min-width: 240px;
+      outline: none;
+    }
+    .filter-input:focus { border-color: var(--primary); }
+
+    /* Interactive Simulator */
+    .sim-box {
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 18px;
+      margin-top: 12px;
+    }
+    .sim-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 14px;
+    }
+    .sim-btn {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      border-radius: 7px;
+      padding: 7px 14px;
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .sim-btn:hover { filter: brightness(1.1); }
+    .sim-btn.secondary { background: var(--bg-card); border: 1px solid var(--border); color: var(--text); }
+    .bar-row { display: grid; grid-template-columns: 165px 1fr 75px; gap: 10px; align-items: center; margin-bottom: 8px; font-size: 12.5px; }
+    .bar-track { height: 12px; background: #1e293b; border-radius: 999px; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 999px; transition: width 0.3s ease; }
+
+    /* SVG diagram container */
+    .diagram-box {
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 16px;
+      overflow-x: auto;
+    }
+
+    /* Decision cards */
+    .decision-card {
+      background: linear-gradient(135deg, rgba(99,102,241,0.1), rgba(17,24,39,0.9));
+      border: 1px solid rgba(99,102,241,0.35);
+      border-radius: var(--radius-sm);
+      padding: 16px 18px;
+    }
+
+    @media (max-width: 980px) {
+      .layout { grid-template-columns: 1fr; }
+      .sidebar { position: static; }
+      .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+      .tier-box { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <!-- Sidebar TOC -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-dot"></div>
+        <div>
+          <div class="brand-title">TalkThatTalk</div>
+          <div class="brand-sub">Routing Architecture Spec</div>
+        </div>
+      </div>
+      <ul class="toc">
+        <li><a href="#overview"><span class="toc-num">01</span>设计目标与现状诊断</a></li>
+        <li><a href="#flow"><span class="toc-num">02</span>总体路由数据流</a></li>
+        <li><a href="#agents"><span class="toc-num">03</span>多 Agent 异构 Session 识别</a></li>
+        <li><a href="#prefix"><span class="toc-num">04</span>上下文前缀指纹与命名空间</a></li>
+        <li><a href="#router"><span class="toc-num">05</span>多 Provider 路由与 HRW 算法</a></li>
+        <li><a href="#sim"><span class="toc-num">06</span>交互演示：原轮询 vs HRW</a></li>
+        <li><a href="#resilience"><span class="toc-num">07</span>软粘性、多 Key 亲和与熔断</a></li>
+        <li><a href="#config"><span class="toc-num">08</span>配置扩展与可观测性</a></li>
+        <li><a href="#roadmap"><span class="toc-num">09</span>分阶段实施计划</a></li>
+        <li><a href="#decisions"><span class="toc-num">10</span>待确认决策</a></li>
+      </ul>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main">
+      <!-- Hero -->
+      <header class="hero">
+        <div class="hero-badges">
+          <span class="badge badge-primary">ttt-proxy / router.rs</span>
+          <span class="badge badge-cyan">Multi-Agent Session Affinity</span>
+          <span class="badge badge-emerald">Weighted HRW + Smooth WRR</span>
+          <span class="badge badge-amber">Prompt Cache Friendly</span>
+        </div>
+        <h1>TalkThatTalk 路由引擎与上下文前缀亲和架构设计</h1>
+        <p>
+          系统性修复多 Provider 同模型路由中的权重失真、回退缺失与跨协议死路问题，并建立兼容异构 Coding Agent（Claude Code、Codex CLI、OpenCode、Cline/Roo、Cursor 及无头 SDK）的多级会话与前缀亲和路由体系。
+        </p>
+      </header>
+
+      <!-- 01 Overview -->
+      <section class="section" id="overview">
+        <div class="section-header">
+          <h2><span class="sec-tag">01</span>设计目标与现状问题清单</h2>
+        </div>
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-title"><span class="badge badge-rose">问题一</span> 多 Provider 同模型路由缺陷</div>
+            <ul>
+              <li><strong>权重倾斜与突刺</strong>：<code>weighted_ring</code> 连续展开造成突刺；协议分层与 <code>AccessPolicy</code> 过滤在选点之后执行，导致被跳过节点之后的紧邻节点吃掉大量偏移流量。</li>
+              <li><strong>Exact 无法回退 Wildcard</strong>：若私有 Provider 命中 <code>exact</code> 池但当前用户无权访问，直接报 <code>403</code>，不会降级到全局 <code>"*"</code> 池。</li>
+              <li><strong>跨协议死路未跳过</strong>：Tier 2 未校验 <code>ttt-protocol</code> 是否支持翻译，选中后直接报错中断，不尝试后续候选。</li>
+              <li><strong>重试与冷却不足</strong>：<code>max_attempts</code> 只看首节点 <code>max_retries</code>；5xx/连接失败不触发冷却；<code>/v1/models</code> 误推进轮询 <code>cursor</code>。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <div class="card-title"><span class="badge badge-amber">问题二</span> 同前缀上下文 Prompt Cache 击穿</div>
+            <ul>
+              <li><strong>无任何会话/前缀亲和</strong>：当前只扫描 <code>"model"</code> 字段，每次请求无条件 <code>cursor.fetch_add(1)</code> 轮询切换 Provider。</li>
+              <li><strong>同 Provider 多 Key 击穿</strong>：<code>ApiKeyPool::acquire</code> 同样每次无条件轮询切 Key，按账号/Key 隔离缓存的上游仍会 Cache Miss。</li>
+              <li><strong>异构 Agent 头不统一</strong>：Codex 发 <code>session_id</code>、Claude Code 放 <code>metadata.user_id</code>、OpenAI 用 <code>prompt_cache_key</code>、各类 IDE Agent 用不同的 <code>x-*-id</code>，必须统一抽象并支持前缀兜底。</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- 02 Dataflow SVG -->
+      <section class="section" id="flow">
+        <div class="section-header">
+          <h2><span class="sec-tag">02</span>总体路由数据流</h2>
+          <span class="badge badge-emerald">单节点单 Key 零开销快路径</span>
+        </div>
+        <div class="diagram-box">
+          <svg viewBox="0 0 1020 330" width="100%" height="auto" xmlns="http://www.w3.org/2000/svg" style="font-family: ui-sans-serif, system-ui, sans-serif;">
+            <defs>
+              <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1 L 10 5 L 0 9 z" fill="#64748b" />
+              </marker>
+              <marker id="arrow-cyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1 L 10 5 L 0 9 z" fill="#22d3ee" />
+              </marker>
+            </defs>
+
+            <!-- Step 1: Request -->
+            <rect x="16" y="118" width="136" height="68" rx="10" fill="#151e2e" stroke="#6366f1" stroke-width="1.5"/>
+            <text x="84" y="146" fill="#e5ecf6" font-size="13" font-weight="700" text-anchor="middle">Incoming Request</text>
+            <text x="84" y="166" fill="#94a3b8" font-size="11" text-anchor="middle">AccessPolicy + Model</text>
+
+            <line x1="152" y1="152" x2="194" y2="152" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+            <!-- Step 2: Affinity Extraction Box -->
+            <rect x="196" y="20" width="236" height="282" rx="12" fill="#111827" stroke="#22d3ee" stroke-width="1.5" stroke-dasharray="5,4"/>
+            <text x="314" y="44" fill="#67e8f9" font-size="12.5" font-weight="700" text-anchor="middle">AffinityExtractor（四级瀑布）</text>
+
+            <rect x="212" y="58" width="204" height="44" rx="7" fill="rgba(244,63,94,0.12)" stroke="rgba(244,63,94,0.45)"/>
+            <text x="314" y="76" fill="#fda4af" font-size="11.5" font-weight="700" text-anchor="middle">Tier 0: 强状态依赖 Body</text>
+            <text x="314" y="93" fill="#cbd5e1" font-size="10.5" text-anchor="middle">previous_response_id / cachedContent</text>
+
+            <rect x="212" y="112" width="204" height="44" rx="7" fill="rgba(16,185,129,0.12)" stroke="rgba(16,185,129,0.45)"/>
+            <text x="314" y="130" fill="#6ee7b7" font-size="11.5" font-weight="700" text-anchor="middle">Tier 1: 异构 Session Header</text>
+            <text x="314" y="147" fill="#cbd5e1" font-size="10.5" text-anchor="middle">x-ttt-session-id / session_id / ...</text>
+
+            <rect x="212" y="166" width="204" height="44" rx="7" fill="rgba(34,211,238,0.12)" stroke="rgba(34,211,238,0.45)"/>
+            <text x="314" y="184" fill="#67e8f9" font-size="11.5" font-weight="700" text-anchor="middle">Tier 2: 协议原生 Body 字段</text>
+            <text x="314" y="201" fill="#cbd5e1" font-size="10.5" text-anchor="middle">prompt_cache_key / metadata.user_id</text>
+
+            <rect x="212" y="220" width="204" height="44" rx="7" fill="rgba(99,102,241,0.14)" stroke="rgba(99,102,241,0.45)"/>
+            <text x="314" y="238" fill="#a5b4fc" font-size="11.5" font-weight="700" text-anchor="middle">Tier 3: 上下文前缀指纹</text>
+            <text x="314" y="255" fill="#cbd5e1" font-size="10.5" text-anchor="middle">system + first user msg (≤4KB)</text>
+
+            <text x="314" y="288" fill="#94a3b8" font-size="10.5" text-anchor="middle">输出: AffinityKey = SHA256(tenant, model, key)</text>
+
+            <line x1="432" y1="152" x2="474" y2="152" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrow-cyan)"/>
+
+            <!-- Step 3: Filter & Plan -->
+            <rect x="476" y="42" width="246" height="224" rx="12" fill="#151e2e" stroke="#6366f1" stroke-width="1.5"/>
+            <text x="599" y="68" fill="#c7d2fe" font-size="13" font-weight="700" text-anchor="middle">Router::plan_route()</text>
+
+            <rect x="492" y="82" width="214" height="42" rx="7" fill="#0d1320" stroke="#243047"/>
+            <text x="599" y="100" fill="#e5ecf6" font-size="11.5" font-weight="600" text-anchor="middle">1. Filter-Before-Select</text>
+            <text x="599" y="116" fill="#94a3b8" font-size="10.5" text-anchor="middle">权限 + 协议可翻译性 + Exact→Wildcard</text>
+
+            <rect x="492" y="134" width="214" height="42" rx="7" fill="#0d1320" stroke="#243047"/>
+            <text x="599" y="152" fill="#e5ecf6" font-size="11.5" font-weight="600" text-anchor="middle">2. Soft-Sticky Failover 查询</text>
+            <text x="599" y="168" fill="#94a3b8" font-size="10.5" text-anchor="middle">命中且健康则置顶，防止恢复抖动回切</text>
+
+            <rect x="492" y="186" width="214" height="62" rx="7" fill="#0d1320" stroke="#243047"/>
+            <text x="599" y="204" fill="#e5ecf6" font-size="11.5" font-weight="600" text-anchor="middle">3. 四级分桶 + 桶内排序</text>
+            <text x="599" y="220" fill="#6ee7b7" font-size="10.5" text-anchor="middle">有 Affinity → Weighted HRW (-ln(u)/w)</text>
+            <text x="599" y="236" fill="#fcd34d" font-size="10.5" text-anchor="middle">无 Affinity → 预计算 Smooth WRR</text>
+
+            <line x1="722" y1="152" x2="764" y2="152" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+            <!-- Step 4: Execution -->
+            <rect x="766" y="72" width="234" height="162" rx="12" fill="#151e2e" stroke="#10b981" stroke-width="1.5"/>
+            <text x="883" y="98" fill="#6ee7b7" font-size="13" font-weight="700" text-anchor="middle">Execution &amp; Key Affinity</text>
+            <text x="883" y="122" fill="#cbd5e1" font-size="11.5" text-anchor="middle">ApiKeyPool 二级亲和选槽</text>
+            <text x="883" y="142" fill="#94a3b8" font-size="11" text-anchor="middle">start = mix64(affinity) % keys.len()</text>
+            <line x1="786" y1="158" x2="980" y2="158" stroke="#243047"/>
+            <text x="883" y="178" fill="#cbd5e1" font-size="11.5" text-anchor="middle">首字节前 Failover + 熔断</text>
+            <text x="883" y="198" fill="#94a3b8" font-size="10.5" text-anchor="middle">429 冷却 / 5xx 指数退避 (3s→60s)</text>
+            <text x="883" y="216" fill="#67e8f9" font-size="10.5" text-anchor="middle">切节点成功 → 写 Soft-Sticky (300s)</text>
+          </svg>
+        </div>
+      </section>
+
+      <!-- 03 Multi-Agent Session Identification -->
+      <section class="section" id="agents">
+        <div class="section-header">
+          <h2><span class="sec-tag">03</span>多 Agent 异构 Session 标识适配方案</h2>
+          <span class="badge badge-cyan">affinity.rs</span>
+        </div>
+        <p>
+          不同 Coding Agent 和 SDK 传递会话标识的方式完全不统一：有的走裸 Header（如 Codex 的 <code>session_id</code>），有的嵌在 Body 的 <code>metadata.user_id</code>（如 Claude Code），有的走官方 <code>prompt_cache_key</code>，还有的完全不传。设计上采用<strong>四级瀑布提取 + 自定义 Header 扩展 + 反模式黑名单</strong>。
+        </p>
+
+        <div class="filter-bar">
+          <input type="text" id="agentSearch" class="filter-input" placeholder="过滤 Agent / 协议 / Header / 字段名..." />
+          <span style="font-size:12px; color:var(--text-dim);">共 9 类主流客户端/协议映射</span>
+        </div>
+
+        <div class="table-wrap">
+          <table id="agentTable">
+            <thead>
+              <tr>
+                <th>Agent / 客户端</th>
+                <th>协议族</th>
+                <th>标识位置</th>
+                <th>字段 / Header 名</th>
+                <th>提取与规范化规则</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>TalkThatTalk 标准头</strong></td>
+                <td>全部</td>
+                <td><span class="badge badge-emerald">Header</span></td>
+                <td><code>x-ttt-session-id</code></td>
+                <td>最高优先级，供网关下游或自定义 Agent 显式覆盖。</td>
+              </tr>
+              <tr>
+                <td><strong>OpenAI Codex CLI</strong></td>
+                <td>OpenAI Responses</td>
+                <td><span class="badge badge-emerald">Header</span></td>
+                <td><code>session_id</code>, <code>conversation_id</code></td>
+                <td>Codex CLI 原生发送无 <code>x-</code> 前缀的 <code>session_id</code> UUID。</td>
+              </tr>
+              <tr>
+                <td><strong>Anthropic Claude Code</strong></td>
+                <td>Anthropic Messages</td>
+                <td><span class="badge badge-cyan">Body</span> / <span class="badge badge-emerald">Header</span></td>
+                <td><code>metadata.user_id</code><br/><code>x-claude-code-session-id</code></td>
+                <td>从 <code>user_&lt;h&gt;_account_&lt;id&gt;_session_&lt;uuid&gt;</code> 中截取 <code>session_&lt;uuid&gt;</code>，避免同账号并发会话碰撞。</td>
+              </tr>
+              <tr>
+                <td><strong>OpenAI Responses API</strong></td>
+                <td>OpenAI Responses</td>
+                <td><span class="badge badge-rose">Body 强状态</span> / <span class="badge badge-cyan">Body</span></td>
+                <td><code>previous_response_id</code><br/><code>prompt_cache_key</code>, <code>conversation</code></td>
+                <td><code>previous_response_id</code> 强依赖原上游状态（Tier 0）；<code>prompt_cache_key</code> 为官方缓存分片键。</td>
+              </tr>
+              <tr>
+                <td><strong>OpenAI Chat API</strong></td>
+                <td>OpenAI Chat</td>
+                <td><span class="badge badge-cyan">Body</span></td>
+                <td><code>prompt_cache_key</code></td>
+                <td>OpenAI 官方 Prompt Cache 路由键，SIMD 轻量扫描直接提取。</td>
+              </tr>
+              <tr>
+                <td><strong>OpenCode / Cline / Roo</strong></td>
+                <td>OpenAI / Anthropic</td>
+                <td><span class="badge badge-emerald">Header</span></td>
+                <td><code>x-session-id</code>, <code>x-opencode-session-id</code><br/><code>x-cline-task-id</code>, <code>x-roo-task-id</code></td>
+                <td>按配置优先级依次匹配，trim 并过滤占位脏值（如 <code>null</code>/<code>default</code>）。</td>
+              </tr>
+              <tr>
+                <td><strong>Cursor / Windsurf / 通用</strong></td>
+                <td>OpenAI / Anthropic</td>
+                <td><span class="badge badge-emerald">Header</span></td>
+                <td><code>x-conversation-id</code>, <code>x-thread-id</code><br/><code>x-cursor-session-id</code>, <code>x-chat-id</code>, <code>x-client-session-id</code></td>
+                <td>通用对话/线程级会话头；管理员可在 <code>config.toml</code> 中追加私有头名。</td>
+              </tr>
+              <tr>
+                <td><strong>Gemini Context Cache</strong></td>
+                <td>Gemini</td>
+                <td><span class="badge badge-rose">Body 强状态</span></td>
+                <td><code>cachedContent</code></td>
+                <td>指向特定上游创建的缓存资源名，必须强绑定原 Provider（Tier 0）。</td>
+              </tr>
+              <tr>
+                <td><strong>原生 SDK / Playground / 脚本</strong></td>
+                <td>全部</td>
+                <td><span class="badge badge-primary">Body 前缀</span></td>
+                <td><code>system</code> + 首条 <code>user</code> 消息</td>
+                <td>无任何显式会话标识时，回退至上下文前缀指纹（Tier 3）。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>四级提取优先级（Waterfall）</h3>
+        <div class="waterfall">
+          <div class="tier-box">
+            <div class="tier-pill t0">Tier 0<br/>强状态 Body</div>
+            <div>
+              <strong><code>previous_response_id</code> / <code>cachedContent</code></strong>
+              <p>强依赖创建该状态的上游实例，跨 Provider 会直接 404/400，因此优先级高于普通会话头。</p>
+            </div>
+          </div>
+          <div class="tier-box">
+            <div class="tier-pill t1">Tier 1<br/>Session Header</div>
+            <div>
+              <strong>O(1) 零 Body 解析，支持用户前置自定义头</strong>
+              <p>内置匹配顺序（可在 <code>routing.session_headers</code> 扩展），校验长度 <code>4..=256</code> 且非占位脏值：</p>
+              <div class="chips">
+                <span class="chip">x-ttt-session-id</span>
+                <span class="chip">session_id</span>
+                <span class="chip">conversation_id</span>
+                <span class="chip">x-session-id</span>
+                <span class="chip">x-conversation-id</span>
+                <span class="chip">x-thread-id</span>
+                <span class="chip">x-claude-code-session-id</span>
+                <span class="chip">x-opencode-session-id</span>
+                <span class="chip">x-cline-task-id</span>
+                <span class="chip">x-roo-task-id</span>
+                <span class="chip">x-cursor-session-id</span>
+                <span class="chip">x-chat-id</span>
+                <span class="chip">x-client-session-id</span>
+              </div>
+            </div>
+          </div>
+          <div class="tier-box">
+            <div class="tier-pill t2">Tier 2<br/>Body 原生字段</div>
+            <div>
+              <strong>SIMD <code>memchr::memmem</code> 轻量扫描（无需完整 DOM 解析）</strong>
+              <p>按序扫描 <code>prompt_cache_key</code> → <code>conversation</code> → <code>metadata.user_id</code>（对 Claude Code 自动抽取 <code>session_&lt;uuid&gt;</code>）。</p>
+            </div>
+          </div>
+          <div class="tier-box">
+            <div class="tier-pill t3">Tier 3<br/>前缀指纹兜底</div>
+            <div>
+              <strong>无显式标识时的通用上下文前缀指纹</strong>
+              <p>仅在候选数 &gt; 1 且 Tier 0~2 全未命中时触发；流式读取到 <code>system</code> + 首条 <code>user</code> 消息即提前终止。</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="alert alert-danger">
+          <strong>反模式黑名单（严禁作为 Session 亲和键）：</strong>
+          <div class="chips" style="margin-top:6px;">
+            <span class="chip bad">x-request-id</span>
+            <span class="chip bad">x-correlation-id</span>
+            <span class="chip bad">traceparent</span>
+            <span class="chip bad">x-stainless-*</span>
+            <span class="chip bad">authorization</span>
+            <span class="chip bad">user-agent</span>
+            <span class="chip bad">x-forwarded-for</span>
+          </div>
+          <p style="margin-top:8px; margin-bottom:0; color:#fecdd3;">
+            前 4 个为单次请求唯一 ID（会导致每次哈希变化、亲和失效）；后 3 个粒度过粗（同一用户并发开多个 Agent 时会全压到单一 Provider，破坏负载均衡）。
+          </p>
+        </div>
+      </section>
+
+      <!-- 04 Prefix Fingerprint -->
+      <section class="section" id="prefix">
+        <div class="section-header">
+          <h2><span class="sec-tag">04</span>上下文前缀指纹与命名空间隔离</h2>
+        </div>
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-title">为什么是 <code>System + 首条 User 消息</code>？</div>
+            <ul>
+              <li><strong>不能哈希全部 <code>messages</code></strong>：多轮对话每轮都会追加新消息，哈希每轮都变，彻底失去粘性。</li>
+              <li><strong>不能只哈希 <code>system</code></strong>：同一 Agent（如 Cursor/Cline）的所有并发会话共享相同的 System Prompt，会导致全部流量打到单个 Provider。</li>
+              <li><strong>最优解</strong>：<code>CanonicalPrefix = System/Instructions + FirstUserMessage[..4KB]</code>。同一会话第 1 轮到第 50 轮前缀完全不变（100% 粘性）；不同会话首条用户输入不同（自然均衡散列）。</li>
+              <li><strong>短消息豁免</strong>：有效前缀长度 <code>&lt; 64 bytes</code>（如 <code>"hi"</code>）跳过亲和，走无状态平滑轮询。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <div class="card-title">四协议规范化提取规则</div>
+            <ul>
+              <li><strong>OpenAI Chat</strong>：合并所有 <code>role == "system" | "developer"</code> 文本 + 首条 <code>role == "user"</code> 文本。</li>
+              <li><strong>Anthropic Messages</strong>：<code>system</code>（兼容 string / text block 数组，忽略 <code>cache_control</code>）+ 首条 <code>user</code> 文本。</li>
+              <li><strong>OpenAI Responses</strong>：<code>instructions</code> + <code>input</code>（字符串或首条 user 文本）。</li>
+              <li><strong>Gemini</strong>：<code>systemInstruction</code> + <code>contents[0]</code> 文本。</li>
+            </ul>
+          </div>
+        </div>
+
+        <h3>命名空间隔离哈希（零新依赖，复用 <code>sha2</code>）</h3>
+        <pre>AffinityHash = SHA256(
+    owner_user_id_or_global || 0x00 ||
+    requested_model         || 0x00 ||
+    source_tag              || 0x00 ||
+    normalized_raw_key
+)[0..8] as u64</pre>
+        <p>
+          <strong>隔离收益</strong>：① 同一 Agent 会话内，主模型（如 <code>claude-opus-4</code>）与子任务模型（如 <code>claude-haiku-4</code>）拥有独立哈希空间；② 不同租户之间绝不碰撞。
+        </p>
+      </section>
+
+      <!-- 05 Router Refactor -->
+      <section class="section" id="router">
+        <div class="section-header">
+          <h2><span class="sec-tag">05</span>多 Provider 同模型路由重构</h2>
+          <span class="badge badge-primary">Filter-Before-Select</span>
+        </div>
+
+        <div class="grid-3">
+          <div class="card">
+            <div class="card-title">1. 前置过滤 + Exact→Wildcard</div>
+            <p>
+              在选点前先按 <code>AccessPolicy</code> 与 <code>ttt_protocol::supports_translation()</code> 过滤候选。精确池为空（被权限过滤或全故障）时自动降级到去重后的 <code>wildcard("*")</code> 池；仅当两池原始非空且全被权限拦截时才返回 <code>403</code>。
+            </p>
+          </div>
+          <div class="card">
+            <div class="card-title">2. 有亲和 → Weighted HRW</div>
+            <p>
+              在每个优先级桶内，对节点 $i$ 计算确定性得分：
+              <code>score = -ln(u_i) / weight_i</code>（升序）。任意过滤子集内严格满足选中概率 <code>w_i / Σw</code>，节点冷却/上下线时仅迁移受影响会话（极小扰动）。
+            </p>
+          </div>
+          <div class="card">
+            <div class="card-title">3. 无亲和 → 预计算 Smooth WRR</div>
+            <p>
+              构建 <code>RoutingTable</code> 时用 Nginx SWRR 预生成交错序列（如 <code>[A,A,B,A,A,A]</code>），消除连片突刺；同时为 <code>/v1/models</code> 提供只读可见性检查 <code>has_accessible_node()</code>，不再污染游标。
+            </p>
+          </div>
+        </div>
+
+        <h3>四级优先级分桶（Exact 池整体优先于 Wildcard 池）</h3>
+        <div class="grid-4" style="margin-top:10px;">
+          <div class="card" style="border-top: 2px solid var(--emerald);">
+            <div class="card-title">Bucket 1</div>
+            <p><strong>健康 + 原生协议</strong><br/>未冷却、Quota 正常，零拷贝透传</p>
+          </div>
+          <div class="card" style="border-top: 2px solid var(--cyan);">
+            <div class="card-title">Bucket 2</div>
+            <p><strong>健康 + 可翻译</strong><br/>已校验 <code>supports_translation == true</code></p>
+          </div>
+          <div class="card" style="border-top: 2px solid var(--amber);">
+            <div class="card-title">Bucket 3</div>
+            <p><strong>冷却/耗尽 + 原生</strong><br/>429/5xx 冷却或 Quota Exhausted 兜底</p>
+          </div>
+          <div class="card" style="border-top: 2px solid var(--rose);">
+            <div class="card-title">Bucket 4</div>
+            <p><strong>冷却/耗尽 + 可翻译</strong><br/>最后兜底候选</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 06 Interactive Simulator -->
+      <section class="section" id="sim">
+        <div class="section-header">
+          <h2><span class="sec-tag">06</span>交互对比演示：原 WeightedPool vs 新 Weighted HRW</h2>
+          <span class="badge badge-cyan">实时模拟</span>
+        </div>
+        <p>
+          假设同模型 <code>claude-sonnet-4</code> 配置了 3 个 Provider：<strong>Node A</strong>（权重 10，仅支持 OpenAI）、<strong>Node B</strong>（权重 1，原生 Anthropic）、<strong>Node C</strong>（权重 1，原生 Anthropic）。现在模拟 <strong>1,200 个独立 Anthropic 会话</strong> 请求进来，观察 B 与 C 之间的流量分配：
+        </p>
+        <div class="sim-box">
+          <div class="sim-controls">
+            <button class="sim-btn" id="runSimBtn">重新模拟 1200 个会话</button>
+            <button class="sim-btn secondary" id="toggleCooldownBtn">模拟 Node B 触发 429 冷却：关</button>
+            <span id="simNote" style="font-size:12px; color:var(--text-muted);"></span>
+          </div>
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-title" style="color:#fda4af;">旧实现（线性偏移扫描）</div>
+              <p style="font-size:12px; margin-bottom:12px;">当游标落在 A(w=10) 时，A 掉入 Tier 2，线性扫描永远先碰到 B，导致 B 吃掉 11/12 的流量！</p>
+              <div id="oldBars"></div>
+            </div>
+            <div class="card">
+              <div class="card-title" style="color:#6ee7b7;">新设计（Filter-Before-Select + Weighted HRW）</div>
+              <p style="font-size:12px; margin-bottom:12px;">先分桶再在桶内做加权一致哈希：B 与 C 严格按 1:1 分配，且同一会话多轮 100% 命中同一节点。</p>
+              <div id="newBars"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 07 Resilience -->
+      <section class="section" id="resilience">
+        <div class="section-header">
+          <h2><span class="sec-tag">07</span>防抖动软粘性、多 Key 二级亲和与熔断冷却</h2>
+        </div>
+        <div class="grid-3">
+          <div class="card">
+            <div class="card-title"><span class="badge badge-cyan">防抖动</span> Soft-Sticky Failover 缓存</div>
+            <p>
+              正常命中 HRW 首选时<strong>零写锁</strong>。仅当发生 Failover（实际成功节点 ≠ HRW 主选节点）时，将 <code>affinity_hash → actual_upstream</code> 写入有界分片缓存（上限 4096，TTL <strong>300s</strong> 匹配 Prompt Cache 生命周期）。避免主节点 30s 冷却恢复后立刻切回导致备节点缓存失效。
+            </p>
+          </div>
+          <div class="card">
+            <div class="card-title"><span class="badge badge-emerald">二级亲和</span> ApiKeyPool 槽位绑定</div>
+            <p>
+              <code>ApiKeyPool::acquire_with_affinity(Option&lt;u64&gt;)</code> 在有亲和哈希时以 <code>mix64(h) % len</code> 为起点选第一个未冷却 Key 槽位；无亲和时保持轮询。防止单 Provider 多 Key 打散上游 Prompt Cache。
+            </p>
+          </div>
+          <div class="card">
+            <div class="card-title"><span class="badge badge-amber">熔断与重试</span> 5xx 退避 &amp; Quota 联动</div>
+            <p>
+              <code>max_attempts</code> 取候选池最大 <code>max_retries + 1</code>，不再被首节点 0 重试锁死；连续 <code>502/503/504</code> 或连接错误触发指数退避短冷却（<code>3s→6s→12s→...→60s</code>），成功即清零；联动 <code>QuotaStatus::Exhausted</code> 自动降级。
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 08 Config & Observability -->
+      <section class="section" id="config">
+        <div class="section-header">
+          <h2><span class="sec-tag">08</span>配置扩展与可观测性</h2>
+          <span class="badge badge-emerald">100% 向后兼容</span>
+        </div>
+        <div class="code-wrap">
+          <button class="copy-btn" data-copy="tomlBlock">复制 TOML</button>
+          <pre id="tomlBlock">[routing]
+# 是否开启会话与前缀亲和路由（默认 true）
+affinity_enabled = true
+
+# 自定义额外 Session Header 列表（优先于内置主流 Agent 头列表）
+# 内置已包含: x-ttt-session-id, session_id, conversation_id, x-session-id,
+# x-conversation-id, x-thread-id, x-claude-code-session-id, x-opencode-session-id,
+# x-cline-task-id, x-roo-task-id, x-cursor-session-id, x-chat-id, x-client-session-id
+session_headers = []
+
+# 无显式 Session Header/Body 字段时，是否回退到上下文前缀指纹（默认 true）
+prefix_fallback_enabled = true
+prefix_max_bytes = 4096
+prefix_min_bytes = 64
+
+# Failover 后备节点的软粘性保持时间（秒，默认 300s 匹配 Prompt Cache TTL）
+sticky_failover_ttl_secs = 300
+
+# 5xx / 连接错误的基础短冷却时间（秒，指数退避上限 60s）
+failure_cooldown_base_secs = 3
+
+# 是否联动 Quota 监控降级已耗尽额度的 Provider
+quota_aware = true</pre>
+        </div>
+        <div class="alert alert-info">
+          <strong>新增可观测性响应头：</strong>除已有的 <code>x-ttt-upstream</code> 外，新增 <code>x-ttt-affinity-source</code>（如 <code>header:session_id</code>、<code>body:prompt_cache_key</code>、<code>body:claude_metadata</code>、<code>prefix_hash</code>、<code>none</code>），方便直接验证各 Agent 路由是否命中会话亲和。
+        </div>
+      </section>
+
+      <!-- 09 Roadmap -->
+      <section class="section" id="roadmap">
+        <div class="section-header">
+          <h2><span class="sec-tag">09</span>分阶段实施计划</h2>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>阶段</th>
+                <th>涉及文件</th>
+                <th>核心改动内容</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="badge badge-primary">Phase 1</span></td>
+                <td><code>ttt-core/src/config.rs</code><br/><code>ttt-protocol/src/lib.rs</code><br/><code>ttt-auth/src/api_key.rs</code><br/><code>ttt-auth/src/lib.rs</code></td>
+                <td>新增 <code>RoutingConfig</code>；新增 <code>supports_translation()</code>；<code>ApiKeyPool</code> 与 <code>AuthProvider</code> 新增 <code>acquire_with_affinity()</code>。</td>
+              </tr>
+              <tr>
+                <td><span class="badge badge-cyan">Phase 2</span></td>
+                <td><code>ttt-proxy/src/affinity.rs</code> (新建)<br/><code>ttt-proxy/src/model_extract.rs</code></td>
+                <td>实现四级瀑布提取器（多 Agent Header + Body 原生字段 + 四协议前缀指纹）；修复 <code>model_extract.rs</code> 顶层深度校验避免误提取嵌套 <code>"model"</code>。</td>
+              </tr>
+              <tr>
+                <td><span class="badge badge-emerald">Phase 3</span></td>
+                <td><code>ttt-proxy/src/router.rs</code><br/><code>ttt-proxy/src/proxy.rs</code><br/><code>ttt-server/src/main.rs</code></td>
+                <td>重构 <code>Router::plan_route</code>（Filter-Before-Select、Weighted HRW、Smooth WRR、Exact→Wildcard 回退）；实现 <code>StickyFailoverCache</code> 与 5xx 退避冷却；接入 <code>x-ttt-affinity-source</code> 与 Quota 降级。</td>
+              </tr>
+              <tr>
+                <td><span class="badge badge-amber">Phase 4</span></td>
+                <td><code>ttt-proxy/src/router.rs</code><br/><code>ttt-proxy/src/affinity.rs</code><br/><code>ttt-proxy/tests/e2e_proxy.rs</code></td>
+                <td>补全单测与 E2E 测试：权重比例验证、Exact 私有拦截回退 Wildcard、Codex/Claude Code/OpenCode/无头前缀多轮亲和、429 Failover 软粘性、不支持协议自动跳过。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 10 Open Decisions -->
+      <section class="section" id="decisions">
+        <div class="section-header">
+          <h2><span class="sec-tag">10</span>编码前待确认的设计决策</h2>
+        </div>
+        <div class="grid-2">
+          <div class="decision-card">
+            <div class="card-title">决策 1：Exact 池降级到 Wildcard("*") 的边界</div>
+            <p>
+              当前设计默认：当 Exact 池被权限过滤为空 <strong>或</strong> 全部冷却/失败时，允许顺序回退到 Wildcard 池。<br/>
+              <span style="color:#a5b4fc;">→ 需确认：是否保留此行为，还是仅在权限过滤为空时回退？</span>
+            </p>
+          </div>
+          <div class="decision-card">
+            <div class="card-title">决策 2：<code>[routing]</code> 配置暴露范围</div>
+            <p>
+              当前设计默认：先通过 <code>config.toml</code>（全带默认值，开箱即用）提供，后续按需加 Web UI。<br/>
+              <span style="color:#a5b4fc;">→ 需确认：是否需要先同步做到 Web Console / SQLite 持久化里？</span>
+            </p>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    // 1. Agent Table Live Filter
+    const searchInput = document.getElementById('agentSearch');
+    const tableRows = Array.from(document.querySelectorAll('#agentTable tbody tr'));
+    searchInput.addEventListener('input', () => {
+      const q = searchInput.value.trim().toLowerCase();
+      tableRows.forEach(tr => {
+        tr.style.display = tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+      });
+    });
+
+    // 2. Copy TOML Button
+    document.querySelectorAll('.copy-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const el = document.getElementById(btn.dataset.copy);
+        navigator.clipboard?.writeText(el.textContent).then(() => {
+          const orig = btn.textContent;
+          btn.textContent = '已复制 ✓';
+          setTimeout(() => btn.textContent = orig, 1500);
+        });
+      });
+    });
+
+    // 3. Interactive Simulator: Old WeightedPool vs New Weighted HRW
+    let bCooling = false;
+    const toggleBtn = document.getElementById('toggleCooldownBtn');
+    const runBtn = document.getElementById('runSimBtn');
+    const simNote = document.getElementById('simNote');
+
+    function fnv1a(str) {
+      let h = 2166136261 >>> 0;
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 16777619) >>> 0;
+      }
+      return h;
+    }
+
+    function renderBars(containerId, counts, total) {
+      const colors = {
+        'Node A (OpenAI, w=10)': '#64748b',
+        'Node B (Anthropic, w=1)': '#6366f1',
+        'Node C (Anthropic, w=1)': '#22d3ee',
+      };
+      const container = document.getElementById(containerId);
+      container.innerHTML = Object.entries(counts).map(([name, val]) => {
+        const pct = ((val / total) * 100).toFixed(1);
+        return `
+          <div class="bar-row">
+            <span style="color:#cbd5e1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${name}</span>
+            <div class="bar-track"><div class="bar-fill" style="width:${pct}%; background:${colors[name]};"></div></div>
+            <span style="font-family:var(--font-mono); text-align:right; color:#e5ecf6;">${val} (${pct}%)</span>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function runSimulation() {
+      const total = 1200;
+      const salt = Math.floor(Math.random() * 100000);
+      const nodes = [
+        { name: 'Node A (OpenAI, w=10)', weight: 10, native: false, cooling: false },
+        { name: 'Node B (Anthropic, w=1)', weight: 1, native: true, cooling: bCooling },
+        { name: 'Node C (Anthropic, w=1)', weight: 1, native: true, cooling: false },
+      ];
+
+      // Old ring: [0,0,0,0,0,0,0,0,0,0, 1, 2]
+      const ring = [];
+      nodes.forEach((n, idx) => { for (let i = 0; i < n.weight; i++) ring.push(idx); });
+
+      const oldCounts = {
+        'Node A (OpenAI, w=10)': 0,
+        'Node B (Anthropic, w=1)': 0,
+        'Node C (Anthropic, w=1)': 0,
+      };
+      const newCounts = { ...oldCounts };
+
+      for (let i = 0; i < total; i++) {
+        // Old implementation
+        const primary = ring[i % ring.length];
+        const t1 = [], t2 = [], t3 = [], t4 = [];
+        for (let off = 0; off < nodes.length; off++) {
+          const n = nodes[(primary + off) % nodes.length];
+          if (!n.cooling && n.native) t1.push(n);
+          else if (!n.cooling && !n.native) t2.push(n);
+          else if (n.cooling && n.native) t3.push(n);
+          else t4.push(n);
+        }
+        const oldPick = [...t1, ...t2, ...t3, ...t4][0];
+        oldCounts[oldPick.name]++;
+
+        // New HRW implementation (within highest non-empty tier)
+        const sessionKey = `sess-${salt}-${i}`;
+        const tiers = [
+          nodes.filter(n => !n.cooling && n.native),
+          nodes.filter(n => !n.cooling && !n.native),
+          nodes.filter(n => n.cooling && n.native),
+          nodes.filter(n => n.cooling && !n.native),
+        ];
+        const activeTier = tiers.find(t => t.length > 0);
+        let best = activeTier[0], bestScore = Infinity;
+        for (const n of activeTier) {
+          const u = (fnv1a(sessionKey + '|' + n.name) + 1) / 4294967297;
+          const score = -Math.log(u) / n.weight;
+          if (score < bestScore) { bestScore = score; best = n; }
+        }
+        newCounts[best.name]++;
+      }
+
+      renderBars('oldBars', oldCounts, total);
+      renderBars('newBars', newCounts, total);
+      simNote.textContent = bCooling
+        ? 'Node B 冷却时：健康原生节点仅剩 C，全部流量平滑切至 C；B 恢复后经 Soft-Sticky 避免抖动。'
+        : '所有节点健康时：旧实现 B 拿走 91.7% 严重失真；新 HRW 严格贴近 B:C = 50% : 50%。';
+    }
+
+    toggleBtn.addEventListener('click', () => {
+      bCooling = !bCooling;
+      toggleBtn.textContent = `模拟 Node B 触发 429 冷却：${bCooling ? '开' : '关'}`;
+      runSimulation();
+    });
+    runBtn.addEventListener('click', runSimulation);
+    runSimulation();
+  </script>
+</body>
+</html>

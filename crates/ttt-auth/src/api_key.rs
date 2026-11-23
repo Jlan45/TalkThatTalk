@@ -61,8 +61,19 @@ impl ApiKeyPool {
     /// Returns `(slot_index, Credential)`.
     #[inline]
     pub fn acquire(&self) -> (usize, Credential) {
+        self.acquire_with_affinity(None)
+    }
+
+    /// Pick an active API key slot, deterministically pinned when `affinity_hash` is provided,
+    /// or in lock-free round-robin order when `None`.
+    #[inline]
+    pub fn acquire_with_affinity(&self, affinity_hash: Option<u64>) -> (usize, Credential) {
         let len = self.slots.len();
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % len;
+        let start = match affinity_hash {
+            Some(h) if len > 1 => (mix64(h) as usize) % len,
+            Some(_) => 0,
+            None => self.cursor.fetch_add(1, Ordering::Relaxed) % len,
+        };
         let now = now_epoch_ms();
 
         // Try to find a key that is not in cooldown.
@@ -81,7 +92,7 @@ impl ApiKeyPool {
             }
         }
 
-        // All keys are cooling down: fall back to the next slot in round-robin order
+        // All keys are cooling down: fall back to the starting slot
         // rather than failing immediately.
         let slot = &self.slots[start];
         (
@@ -108,6 +119,15 @@ impl ApiKeyPool {
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
+}
+
+#[inline]
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
 }
 
 #[inline]
@@ -143,5 +163,38 @@ mod tests {
         let (i3, c3) = pool.acquire();
         assert_eq!(i3, 1);
         assert_eq!(c3.header_value.to_str().unwrap(), "Bearer k2");
+    }
+
+    #[test]
+    fn affinity_pins_key_slot_and_recovers_after_cooldown() {
+        let pool = ApiKeyPool::new(
+            "authorization",
+            Some("Bearer "),
+            &[
+                "k0".to_string(),
+                "k1".to_string(),
+                "k2".to_string(),
+                "k3".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let aff = Some(0x1234_5678_9abc_def0_u64);
+        let (pinned_idx, pinned_cred) = pool.acquire_with_affinity(aff);
+        for _ in 0..8 {
+            let (idx, cred) = pool.acquire_with_affinity(aff);
+            assert_eq!(idx, pinned_idx);
+            assert_eq!(cred.header_value, pinned_cred.header_value);
+        }
+
+        // Cool down pinned slot -> falls back deterministically to another slot.
+        pool.mark_cooldown(pinned_idx, 60);
+        let (fallback_idx, _) = pool.acquire_with_affinity(aff);
+        assert_ne!(fallback_idx, pinned_idx);
+
+        // Recover pinned slot -> returns to original pinned slot.
+        pool.slots[pinned_idx].cooldown_until_ms.store(0, Ordering::Relaxed);
+        let (recovered_idx, _) = pool.acquire_with_affinity(aff);
+        assert_eq!(recovered_idx, pinned_idx);
     }
 }

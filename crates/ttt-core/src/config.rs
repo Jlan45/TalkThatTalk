@@ -19,9 +19,63 @@ pub struct GatewayConfig {
     #[serde(default, alias = "storage")]
     pub oauth_storage: OAuthStorageConfig,
 
+    #[serde(default)]
+    pub routing: RoutingConfig,
+
     /// Optional bootstrap upstreams (deprecated in TOML; persisted in SQLite at runtime).
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
+}
+
+/// Routing, session affinity, and fault-cooldown policy configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    /// Enable session and context-prefix affinity routing (default: true).
+    #[serde(default = "default_true")]
+    pub affinity_enabled: bool,
+
+    /// Additional custom session header names (checked before built-in agent headers).
+    #[serde(default)]
+    pub session_headers: Vec<String>,
+
+    /// Fall back to canonical context-prefix fingerprinting when no explicit session key exists.
+    #[serde(default = "default_true")]
+    pub prefix_fallback_enabled: bool,
+
+    /// Maximum canonical prefix bytes hashed for context-prefix fingerprinting.
+    #[serde(default = "default_prefix_max_bytes")]
+    pub prefix_max_bytes: usize,
+
+    /// Minimum extracted prefix bytes required to activate prefix affinity.
+    #[serde(default = "default_prefix_min_bytes")]
+    pub prefix_min_bytes: usize,
+
+    /// Soft-sticky TTL (seconds) for keeping sessions on a healthy failover upstream.
+    #[serde(default = "default_sticky_failover_ttl_secs")]
+    pub sticky_failover_ttl_secs: u64,
+
+    /// Base short-cooldown seconds for transient 5xx / connect errors (exponential backoff up to 60s).
+    #[serde(default = "default_failure_cooldown_base_secs")]
+    pub failure_cooldown_base_secs: u64,
+
+    /// Demote upstreams whose background quota probe reports `Exhausted`.
+    #[serde(default = "default_true")]
+    pub quota_aware: bool,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            affinity_enabled: true,
+            session_headers: Vec::new(),
+            prefix_fallback_enabled: true,
+            prefix_max_bytes: default_prefix_max_bytes(),
+            prefix_min_bytes: default_prefix_min_bytes(),
+            sticky_failover_ttl_secs: default_sticky_failover_ttl_secs(),
+            failure_cooldown_base_secs: default_failure_cooldown_base_secs(),
+            quota_aware: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +259,29 @@ pub enum ProtocolFamily {
     Antigravity,
 }
 
+/// Built-in provider prompt cache & outbound session compatibility profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheMode {
+    /// Auto-detect from OAuth preset and endpoint host (default).
+    #[default]
+    Auto,
+    /// OpenAI / Azure OpenAI / Codex style (`session_id` header on Responses, preserves `prompt_cache_key`).
+    OpenAi,
+    /// Strict OpenAI-compatible providers (DeepSeek, Volcengine Ark): strip `prompt_cache_key`
+    /// and `prompt_cache_retention` before forwarding so upstream does not return 400.
+    StripOpenAiCacheFields,
+    /// xAI Grok API (`x-grok-conv-id` outbound sticky header).
+    XaiGrok,
+    /// OpenRouter API (`x-session-id` outbound sticky header).
+    OpenRouter,
+    /// OpenCode Go / Zen (`x-opencode-session` outbound sticky header with per-request fallback).
+    #[serde(rename = "opencode")]
+    OpenCode,
+    /// Pure passthrough without automatic session header injection or cache field stripping.
+    Passthrough,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamConfig {
     pub name: String,
@@ -259,6 +336,21 @@ pub struct UpstreamConfig {
     /// Optional quota / usage monitoring configuration (Claude Code, Codex, or custom HTTP JSON).
     #[serde(default)]
     pub quota: Option<QuotaMonitorConfig>,
+
+    /// Optional outbound HTTP header name used to forward the normalized session ID
+    /// (e.g. `"session_id"`, `"x-session-id"`). Defaults to `"session_id"` on Codex / Responses upstreams.
+    #[serde(default)]
+    pub session_header_out: Option<String>,
+
+    /// When true, strip other incoming agent session headers before forwarding upstream,
+    /// retaining only the resolved outbound session header.
+    #[serde(default)]
+    pub strip_other_session_headers: bool,
+
+    /// Built-in provider prompt cache compatibility mode (`auto`, `open_ai`,
+    /// `strip_open_ai_cache_fields`, `xai_grok`, `open_router`, `passthrough`).
+    #[serde(default)]
+    pub prompt_cache_mode: PromptCacheMode,
 }
 
 /// Supported quota monitoring probe types.
@@ -877,4 +969,20 @@ fn default_auth_header() -> String {
 
 fn default_bearer_prefix() -> Option<String> {
     Some("Bearer ".to_string())
+}
+
+fn default_prefix_max_bytes() -> usize {
+    4096
+}
+
+fn default_prefix_min_bytes() -> usize {
+    64
+}
+
+fn default_sticky_failover_ttl_secs() -> u64 {
+    300
+}
+
+fn default_failure_cooldown_base_secs() -> u64 {
+    3
 }

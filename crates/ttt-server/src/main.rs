@@ -18,8 +18,8 @@ use tracing_subscriber::EnvFilter;
 use ttt_auth::TokenStore;
 use ttt_control::{ControlPlane, GatewayDb, MetricsStore};
 use ttt_core::{
-    GatewayConfig, OAuthStorageConfig, PoolConfig, RequestId, ServerConfig, TapEvent,
-    TelemetryConfig,
+    GatewayConfig, OAuthStorageConfig, PoolConfig, RequestId, RoutingConfig, ServerConfig,
+    TapEvent, TelemetryConfig,
 };
 use ttt_proxy::{ProxyEngine, UsageAccumulator};
 
@@ -88,6 +88,7 @@ fn default_bootstrap_config() -> GatewayConfig {
         pool: PoolConfig::default(),
         telemetry: TelemetryConfig::default(),
         oauth_storage: OAuthStorageConfig::default(),
+        routing: RoutingConfig::default(),
         upstreams: Vec::new(),
     }
 }

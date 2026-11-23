@@ -41,12 +41,42 @@ pub fn needs_translation(ingress: ProtocolFamily, upstream: ProtocolFamily) -> b
     ingress != upstream
 }
 
+/// Returns true if `ingress` can be forwarded natively (`ingress == upstream`)
+/// or translated to `upstream` by `ttt-protocol`.
+#[inline]
+pub fn supports_translation(ingress: ProtocolFamily, upstream: ProtocolFamily) -> bool {
+    if ingress == upstream {
+        return true;
+    }
+    matches!(
+        (ingress, upstream),
+        (ProtocolFamily::OpenAi, ProtocolFamily::Anthropic)
+            | (ProtocolFamily::OpenAi, ProtocolFamily::Gemini)
+            | (ProtocolFamily::OpenAi, ProtocolFamily::Antigravity)
+            | (ProtocolFamily::OpenAi, ProtocolFamily::OpenAiResponses)
+            | (ProtocolFamily::Anthropic, ProtocolFamily::OpenAiResponses)
+            | (ProtocolFamily::Anthropic, ProtocolFamily::OpenAi)
+    )
+}
+
 /// Translate a client request body from `ingress` protocol family to `upstream` protocol family.
 pub fn translate_request(
     ingress: ProtocolFamily,
     upstream: ProtocolFamily,
     raw_body: &[u8],
     model_override: Option<&str>,
+) -> Result<TranslatedRequest, GatewayError> {
+    translate_request_with_session(ingress, upstream, raw_body, model_override, None)
+}
+
+/// Translate a client request body while propagating an optional normalized `session_hint`
+/// into target protocol cache/session fields (e.g. `prompt_cache_key` for Responses).
+pub fn translate_request_with_session(
+    ingress: ProtocolFamily,
+    upstream: ProtocolFamily,
+    raw_body: &[u8],
+    model_override: Option<&str>,
+    session_hint: Option<&str>,
 ) -> Result<TranslatedRequest, GatewayError> {
     match (ingress, upstream) {
         (ProtocolFamily::OpenAi, ProtocolFamily::Anthropic) => {
@@ -59,10 +89,18 @@ pub fn translate_request(
             openai_antigravity::openai_to_antigravity_request(raw_body, model_override)
         }
         (ProtocolFamily::OpenAi, ProtocolFamily::OpenAiResponses) => {
-            openai_responses::openai_to_responses_request(raw_body, model_override)
+            openai_responses::openai_to_responses_request_with_session(
+                raw_body,
+                model_override,
+                session_hint,
+            )
         }
         (ProtocolFamily::Anthropic, ProtocolFamily::OpenAiResponses) => {
-            openai_responses::anthropic_to_responses_request(raw_body, model_override)
+            openai_responses::anthropic_to_responses_request_with_session(
+                raw_body,
+                model_override,
+                session_hint,
+            )
         }
         (ProtocolFamily::Anthropic, ProtocolFamily::OpenAi) => {
             openai_anthropic::anthropic_to_openai_request(raw_body, model_override)
@@ -299,5 +337,46 @@ mod tests {
             .collect();
         assert!(joined.contains("hello"));
         assert!(joined.contains("[DONE]"));
+    }
+
+    #[test]
+    fn responses_translation_propagates_session_prompt_cache_key() {
+        let oai_req = br#"{"model":"gpt-5-codex","messages":[{"role":"user","content":"hi"}]}"#;
+        let tr = translate_request_with_session(
+            ProtocolFamily::OpenAi,
+            ProtocolFamily::OpenAiResponses,
+            oai_req,
+            None,
+            Some("sess-oai-123"),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&tr.body).unwrap();
+        assert_eq!(parsed["prompt_cache_key"], "sess-oai-123");
+
+        // Explicit prompt_cache_key in body takes precedence over session_hint
+        let oai_explicit = br#"{"model":"gpt-5-codex","prompt_cache_key":"explicit-key","messages":[{"role":"user","content":"hi"}]}"#;
+        let tr2 = translate_request_with_session(
+            ProtocolFamily::OpenAi,
+            ProtocolFamily::OpenAiResponses,
+            oai_explicit,
+            None,
+            Some("sess-oai-123"),
+        )
+        .unwrap();
+        let parsed2: serde_json::Value = serde_json::from_slice(&tr2.body).unwrap();
+        assert_eq!(parsed2["prompt_cache_key"], "explicit-key");
+
+        // Anthropic -> OpenAiResponses extracts Claude Code session_... from metadata.user_id
+        let ant_req = br#"{"model":"gpt-5-codex","metadata":{"user_id":"user_1_account_2_session_cc-xyz"},"messages":[{"role":"user","content":"hi"}]}"#;
+        let tr3 = translate_request_with_session(
+            ProtocolFamily::Anthropic,
+            ProtocolFamily::OpenAiResponses,
+            ant_req,
+            None,
+            None,
+        )
+        .unwrap();
+        let parsed3: serde_json::Value = serde_json::from_slice(&tr3.body).unwrap();
+        assert_eq!(parsed3["prompt_cache_key"], "session_cc-xyz");
     }
 }

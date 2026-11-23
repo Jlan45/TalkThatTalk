@@ -266,6 +266,7 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
         pool: PoolConfig::default(),
         telemetry: TelemetryConfig::default(),
         oauth_storage: OAuthStorageConfig::default(),
+        routing: Default::default(),
         upstreams: vec![
             UpstreamConfig {
                 name: "api-base-up".into(),
@@ -287,6 +288,9 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
                 owner_user_id: None,
                 proxy: None,
         quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
                 name: "oauth-up".into(),
@@ -321,6 +325,9 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
                 owner_user_id: None,
                 proxy: None,
         quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
                 name: "flaky-primary".into(),
@@ -342,6 +349,9 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
                 owner_user_id: None,
                 proxy: None,
         quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
                 name: "healthy-backup".into(),
@@ -363,6 +373,9 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
                 owner_user_id: None,
                 proxy: None,
         quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
             },
         ],
     };
@@ -599,6 +612,7 @@ async fn e2e_oauth_401_singleflight_refresh_rotation_and_persistence() {
         pool: PoolConfig::default(),
         telemetry: TelemetryConfig::default(),
         oauth_storage: OAuthStorageConfig::default(),
+        routing: Default::default(),
         upstreams: vec![
             UpstreamConfig {
                 name: "claude-code-up".into(),
@@ -633,6 +647,9 @@ async fn e2e_oauth_401_singleflight_refresh_rotation_and_persistence() {
                 owner_user_id: None,
                 proxy: None,
         quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
                 name: "codex-up".into(),
@@ -667,6 +684,9 @@ async fn e2e_oauth_401_singleflight_refresh_rotation_and_persistence() {
                 owner_user_id: None,
                 proxy: None,
         quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
             },
         ],
     };
@@ -1015,6 +1035,7 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
         pool: PoolConfig::default(),
         telemetry: TelemetryConfig::default(),
         oauth_storage: OAuthStorageConfig::default(),
+        routing: Default::default(),
         upstreams: vec![
             UpstreamConfig {
                 name: "anthropic-up".into(),
@@ -1036,6 +1057,9 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
                 owner_user_id: None,
                 proxy: None,
         quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
                 name: "gemini-up".into(),
@@ -1057,6 +1081,9 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
                 owner_user_id: None,
                 proxy: None,
         quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
                 name: "deepseek-openai-up".into(),
@@ -1078,6 +1105,9 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
                 owner_user_id: None,
                 proxy: None,
         quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
             },
         ],
     };
@@ -1222,6 +1252,7 @@ async fn e2e_client_key_provider_and_model_restrictions() {
         pool: PoolConfig::default(),
         telemetry: TelemetryConfig::default(),
         oauth_storage: OAuthStorageConfig::default(),
+        routing: Default::default(),
         upstreams: vec![
             UpstreamConfig {
                 name: "provider-a".into(),
@@ -1243,6 +1274,9 @@ async fn e2e_client_key_provider_and_model_restrictions() {
                 owner_user_id: None,
                 proxy: None,
         quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
                 name: "provider-b".into(),
@@ -1264,6 +1298,9 @@ async fn e2e_client_key_provider_and_model_restrictions() {
                 owner_user_id: None,
                 proxy: None,
         quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
             },
         ],
     };
@@ -1406,6 +1443,7 @@ async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
         pool: PoolConfig::default(),
         telemetry: TelemetryConfig::default(),
         oauth_storage: OAuthStorageConfig::default(),
+        routing: Default::default(),
         upstreams: vec![UpstreamConfig {
             name: "volcengine-agent-plan".into(),
             base_url: String::new(),
@@ -1426,6 +1464,9 @@ async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
             owner_user_id: None,
             proxy: None,
         quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
         }],
     };
 
@@ -1547,6 +1588,7 @@ async fn e2e_claude_code_oauth_compat_mode() {
         pool: PoolConfig::default(),
         telemetry: TelemetryConfig::default(),
         oauth_storage: OAuthStorageConfig::default(),
+        routing: Default::default(),
         upstreams: vec![UpstreamConfig {
             name: "claude-code-oauth".into(),
             base_url: format!("http://{mock_addr}"),
@@ -1580,6 +1622,9 @@ async fn e2e_claude_code_oauth_compat_mode() {
             owner_user_id: None,
             proxy: None,
         quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
         }],
     };
 
@@ -1655,5 +1700,932 @@ async fn e2e_claude_code_oauth_compat_mode() {
     assert_eq!(
         ant_resp["content"][0]["text"].as_str().unwrap().as_bytes(),
         raw_cli
+    );
+}
+
+#[tokio::test]
+async fn e2e_multi_agent_session_and_prefix_affinity_and_failover() {
+    let make_echo_upstream = |label: &'static str| async move {
+        spawn_mock_upstream(move |req| async move {
+            let auth = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let _ = req.into_body().collect().await;
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-seen-auth", auth)
+                .body(full_body(format!(r#"{{"up":"{label}"}}"#)))
+                .unwrap()
+        })
+        .await
+    };
+
+    let (up_a_addr, _ha) = make_echo_upstream("up-a").await;
+    let (up_b_addr, _hb) = make_echo_upstream("up-b").await;
+
+    let fail_once = Arc::new(AtomicUsize::new(0));
+    let fail_once_ref = Arc::clone(&fail_once);
+    let (flaky_addr, _hf) = spawn_mock_upstream(move |req| {
+        let counter = Arc::clone(&fail_once_ref);
+        async move {
+            let _ = req.into_body().collect().await;
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header(header::RETRY_AFTER, "1")
+                    .body(full_body(r#"{"error":"rate_limited"}"#))
+                    .unwrap()
+            } else {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(full_body(r#"{"up":"flaky-recovered"}"#))
+                    .unwrap()
+            }
+        }
+    })
+    .await;
+
+    let (priv_addr, _hp) = make_echo_upstream("priv-u1").await;
+
+    let cfg = GatewayConfig {
+        server: ServerConfig {
+            client_keys: vec![
+                ClientKeyConfig {
+                    key: "sk-user-2".into(),
+                    name: "u2".into(),
+                    enabled: true,
+                    restrict_upstreams: false,
+                    allowed_upstreams: vec![],
+                    restrict_models: false,
+                    allowed_models: vec![],
+                    owner_user_id: Some(2),
+                },
+            ],
+            ..Default::default()
+        },
+        pool: PoolConfig::default(),
+        telemetry: TelemetryConfig::default(),
+        oauth_storage: OAuthStorageConfig::default(),
+        routing: Default::default(),
+        upstreams: vec![
+            UpstreamConfig {
+                name: "up-a".into(),
+                base_url: format!("http://{up_a_addr}"),
+                protocol: ProtocolFamily::OpenAi,
+                protocol_endpoints: HashMap::from([
+                    (ProtocolFamily::OpenAi, format!("http://{up_a_addr}/v1")),
+                    (ProtocolFamily::Anthropic, format!("http://{up_a_addr}/v1")),
+                ]),
+                auth: UpstreamAuthConfig::ApiKey {
+                    keys: vec!["sk-a-0".into(), "sk-a-1".into(), "sk-a-2".into()],
+                    header_name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+                models: vec!["shared-model".into()],
+                model_mapping: HashMap::new(),
+                extra_headers: HashMap::new(),
+                protocol_headers: HashMap::new(),
+                weight: 1,
+                default_cooldown_secs: 10,
+                max_retries: 1,
+                owner_user_id: None,
+                proxy: None,
+                quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
+            },
+            UpstreamConfig {
+                name: "up-b".into(),
+                base_url: format!("http://{up_b_addr}"),
+                protocol: ProtocolFamily::OpenAi,
+                protocol_endpoints: HashMap::from([
+                    (ProtocolFamily::OpenAi, format!("http://{up_b_addr}/v1")),
+                    (ProtocolFamily::Anthropic, format!("http://{up_b_addr}/v1")),
+                ]),
+                auth: UpstreamAuthConfig::ApiKey {
+                    keys: vec!["sk-b-0".into(), "sk-b-1".into(), "sk-b-2".into()],
+                    header_name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+                models: vec!["shared-model".into()],
+                model_mapping: HashMap::new(),
+                extra_headers: HashMap::new(),
+                protocol_headers: HashMap::new(),
+                weight: 1,
+                default_cooldown_secs: 10,
+                max_retries: 1,
+                owner_user_id: None,
+                proxy: None,
+                quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
+            },
+            UpstreamConfig {
+                name: "flaky-up".into(),
+                base_url: format!("http://{flaky_addr}"),
+                protocol: ProtocolFamily::OpenAi,
+                protocol_endpoints: HashMap::new(),
+                auth: UpstreamAuthConfig::ApiKey {
+                    keys: vec!["sk-flaky".into()],
+                    header_name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+                models: vec!["failover-model".into()],
+                model_mapping: HashMap::new(),
+                extra_headers: HashMap::new(),
+                protocol_headers: HashMap::new(),
+                weight: 1000,
+                default_cooldown_secs: 1,
+                max_retries: 1,
+                owner_user_id: None,
+                proxy: None,
+                quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
+            },
+            UpstreamConfig {
+                name: "backup-up".into(),
+                base_url: format!("http://{up_b_addr}"),
+                protocol: ProtocolFamily::OpenAi,
+                protocol_endpoints: HashMap::new(),
+                auth: UpstreamAuthConfig::ApiKey {
+                    keys: vec!["sk-backup".into()],
+                    header_name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+                models: vec!["failover-model".into()],
+                model_mapping: HashMap::new(),
+                extra_headers: HashMap::new(),
+                protocol_headers: HashMap::new(),
+                weight: 1,
+                default_cooldown_secs: 10,
+                max_retries: 1,
+                owner_user_id: None,
+                proxy: None,
+                quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
+            },
+            UpstreamConfig {
+                name: "priv-u1".into(),
+                base_url: format!("http://{priv_addr}"),
+                protocol: ProtocolFamily::OpenAi,
+                protocol_endpoints: HashMap::new(),
+                auth: UpstreamAuthConfig::ApiKey {
+                    keys: vec!["sk-priv".into()],
+                    header_name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+                models: vec!["priv-only-exact".into()],
+                model_mapping: HashMap::new(),
+                extra_headers: HashMap::new(),
+                protocol_headers: HashMap::new(),
+                weight: 1,
+                default_cooldown_secs: 10,
+                max_retries: 0,
+                owner_user_id: Some(1),
+                proxy: None,
+                quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
+            },
+            UpstreamConfig {
+                name: "global-wild".into(),
+                base_url: format!("http://{up_a_addr}"),
+                protocol: ProtocolFamily::OpenAi,
+                protocol_endpoints: HashMap::new(),
+                auth: UpstreamAuthConfig::ApiKey {
+                    keys: vec!["sk-wild".into()],
+                    header_name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+                models: vec!["*".into()],
+                model_mapping: HashMap::new(),
+                extra_headers: HashMap::new(),
+                protocol_headers: HashMap::new(),
+                weight: 1,
+                default_cooldown_secs: 10,
+                max_retries: 0,
+                owner_user_id: None,
+                proxy: None,
+                quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
+            },
+        ],
+    };
+
+    let (gw_addr, _tap_rx, _gw) = spawn_gateway(cfg, None).await;
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+
+    // 1. Codex `session_id` header pins repeated requests to same upstream AND same API key slot.
+    let mut first_up = None;
+    let mut first_auth = None;
+    for _ in 0..6 {
+        let resp = client
+            .request(
+                Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                    .header(header::AUTHORIZATION, "Bearer sk-user-2")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("session_id", "codex-session-pinned-77")
+                    .body(Full::new(Bytes::from_static(
+                        br#"{"model":"shared-model","messages":[{"role":"user","content":"hi"}]}"#,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-ttt-affinity-source").unwrap().to_str().unwrap(),
+            "header:session_id"
+        );
+        let up = resp.headers().get("x-ttt-upstream").unwrap().to_str().unwrap().to_string();
+        let auth = resp.headers().get("x-seen-auth").unwrap().to_str().unwrap().to_string();
+        if let Some(prev) = &first_up {
+            assert_eq!(&up, prev);
+            assert_eq!(&auth, first_auth.as_ref().unwrap());
+        } else {
+            first_up = Some(up);
+            first_auth = Some(auth);
+        }
+    }
+
+    // 2. Claude Code `metadata.user_id` on `/v1/messages` pins repeated requests.
+    let mut cc_up = None;
+    for _ in 0..5 {
+        let resp = client
+            .request(
+                Request::post(format!("http://{gw_addr}/v1/messages"))
+                    .header(header::AUTHORIZATION, "Bearer sk-user-2")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from_static(
+                        br#"{"model":"shared-model","max_tokens":64,"metadata":{"user_id":"user_x_account_y_session_claude-999"},"messages":[{"role":"user","content":"hi"}]}"#,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-ttt-affinity-source").unwrap().to_str().unwrap(),
+            "body:claude_metadata"
+        );
+        let up = resp.headers().get("x-ttt-upstream").unwrap().to_str().unwrap().to_string();
+        if let Some(prev) = &cc_up {
+            assert_eq!(&up, prev);
+        } else {
+            cc_up = Some(up);
+        }
+    }
+
+    // 3. Headless multi-turn OpenAI requests with growing messages stay pinned via `prefix_hash`.
+    let turn1 = br#"{"model":"shared-model","messages":[{"role":"system","content":"You are a careful database architect helping design indexes."},{"role":"user","content":"Analyze why our Postgres B-tree index on user_events(created_at) is bloated."}]}"#;
+    let turn2 = br#"{"model":"shared-model","messages":[{"role":"system","content":"You are a careful database architect helping design indexes."},{"role":"user","content":"Analyze why our Postgres B-tree index on user_events(created_at) is bloated."},{"role":"assistant","content":"High update churn causes page splits."},{"role":"user","content":"Should we switch to BRIN or partial indexes?"}]}"#;
+    let r1 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::AUTHORIZATION, "Bearer sk-user-2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(turn1)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    assert_eq!(
+        r1.headers().get("x-ttt-affinity-source").unwrap().to_str().unwrap(),
+        "prefix_hash"
+    );
+    let r1_up = r1.headers().get("x-ttt-upstream").unwrap().to_str().unwrap().to_string();
+
+    let r2 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::AUTHORIZATION, "Bearer sk-user-2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(turn2)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    assert_eq!(
+        r2.headers().get("x-ttt-affinity-source").unwrap().to_str().unwrap(),
+        "prefix_hash"
+    );
+    assert_eq!(r2.headers().get("x-ttt-upstream").unwrap().to_str().unwrap(), r1_up);
+
+    // 4. 429 Failover pins next turn to backup-up via Soft-Sticky cache even after 1s cooldown expires.
+    let f1 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::AUTHORIZATION, "Bearer sk-user-2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-session-id", "sticky-failover-session-01")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"model":"failover-model","messages":[{"role":"user","content":"hi"}]}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f1.status(), StatusCode::OK);
+    assert_eq!(
+        f1.headers().get("x-ttt-upstream").unwrap().to_str().unwrap(),
+        "backup-up"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let f2 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::AUTHORIZATION, "Bearer sk-user-2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-session-id", "sticky-failover-session-01")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"model":"failover-model","messages":[{"role":"user","content":"next"}]}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f2.status(), StatusCode::OK);
+    assert_eq!(
+        f2.headers().get("x-ttt-upstream").unwrap().to_str().unwrap(),
+        "backup-up"
+    );
+
+    // 5. Private exact upstream owned by user 1 falls back to global wildcard for user 2.
+    let fb = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::AUTHORIZATION, "Bearer sk-user-2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"model":"priv-only-exact","messages":[{"role":"user","content":"hi"}]}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fb.status(), StatusCode::OK);
+    assert_eq!(
+        fb.headers().get("x-ttt-upstream").unwrap().to_str().unwrap(),
+        "global-wild"
+    );
+}
+
+#[tokio::test]
+async fn e2e_outbound_provider_session_header_translation() {
+    let (plain_addr, _hp) = spawn_mock_upstream(|req| async move {
+        let has_ttt_sid = req.headers().contains_key("x-ttt-session-id");
+        let _ = req.into_body().collect().await;
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-seen-ttt-sid", if has_ttt_sid { "1" } else { "0" })
+            .body(full_body(r#"{"ok":true}"#))
+            .unwrap()
+    })
+    .await;
+
+    let (custom_addr, _hc) = spawn_mock_upstream(|req| async move {
+        let sticky = req
+            .headers()
+            .get("x-upstream-sticky")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let has_cline = req.headers().contains_key("x-cline-task-id");
+        let _ = req.into_body().collect().await;
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-seen-sticky", sticky)
+            .header("x-seen-cline", if has_cline { "1" } else { "0" })
+            .body(full_body(r#"{"ok":true}"#))
+            .unwrap()
+    })
+    .await;
+
+    let (responses_addr, _hr) = spawn_mock_upstream(|req| async move {
+        let sid_hdr = req
+            .headers()
+            .get("session_id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = req.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        let cache_key = parsed
+            .get("prompt_cache_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-seen-session-id", sid_hdr)
+            .header("x-seen-cache-key", cache_key)
+            .body(full_body(
+                r#"{"id":"resp_1","model":"gpt-5-codex","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}"#,
+            ))
+            .unwrap()
+    })
+    .await;
+
+    let cfg = GatewayConfig {
+        server: ServerConfig::default(),
+        pool: PoolConfig::default(),
+        telemetry: TelemetryConfig::default(),
+        oauth_storage: OAuthStorageConfig::default(),
+        routing: Default::default(),
+        upstreams: vec![
+            UpstreamConfig {
+                name: "plain-up".into(),
+                base_url: format!("http://{plain_addr}"),
+                protocol: ProtocolFamily::OpenAi,
+                protocol_endpoints: HashMap::new(),
+                auth: UpstreamAuthConfig::ApiKey {
+                    keys: vec!["sk-plain".into()],
+                    header_name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+                models: vec!["plain-model".into()],
+                model_mapping: HashMap::new(),
+                extra_headers: HashMap::new(),
+                protocol_headers: HashMap::new(),
+                weight: 1,
+                default_cooldown_secs: 10,
+                max_retries: 0,
+                owner_user_id: None,
+                proxy: None,
+                quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
+            },
+            UpstreamConfig {
+                name: "custom-mapped-up".into(),
+                base_url: format!("http://{custom_addr}"),
+                protocol: ProtocolFamily::OpenAi,
+                protocol_endpoints: HashMap::new(),
+                auth: UpstreamAuthConfig::ApiKey {
+                    keys: vec!["sk-custom".into()],
+                    header_name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+                models: vec!["mapped-model".into()],
+                model_mapping: HashMap::new(),
+                extra_headers: HashMap::new(),
+                protocol_headers: HashMap::new(),
+                weight: 1,
+                default_cooldown_secs: 10,
+                max_retries: 0,
+                owner_user_id: None,
+                proxy: None,
+                quota: None,
+                session_header_out: Some("x-upstream-sticky".into()),
+                strip_other_session_headers: true,
+                prompt_cache_mode: Default::default(),
+            },
+            UpstreamConfig {
+                name: "codex-responses-up".into(),
+                base_url: format!("http://{responses_addr}"),
+                protocol: ProtocolFamily::OpenAiResponses,
+                protocol_endpoints: HashMap::new(),
+                auth: UpstreamAuthConfig::ApiKey {
+                    keys: vec!["sk-codex".into()],
+                    header_name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+                models: vec!["gpt-5-codex".into()],
+                model_mapping: HashMap::new(),
+                extra_headers: HashMap::new(),
+                protocol_headers: HashMap::new(),
+                weight: 1,
+                default_cooldown_secs: 10,
+                max_retries: 0,
+                owner_user_id: None,
+                proxy: None,
+                quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
+            },
+        ],
+    };
+
+    let (gw_addr, _tap_rx, _gw) = spawn_gateway(cfg, None).await;
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+
+    // 1. Private `x-ttt-session-id` header is always stripped before reaching plain upstreams.
+    let resp1 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-ttt-session-id", "internal-ttt-sid-99")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"model":"plain-model","messages":[{"role":"user","content":"hi"}]}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    assert_eq!(resp1.headers().get("x-seen-ttt-sid").unwrap().to_str().unwrap(), "0");
+
+    // 2. Custom `session_header_out` + `strip_other_session_headers`:
+    //    maps `x-cline-task-id` -> `x-upstream-sticky` and strips `x-cline-task-id`.
+    let resp2 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-cline-task-id", "cline-task-4242")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"model":"mapped-model","messages":[{"role":"user","content":"hi"}]}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    assert_eq!(
+        resp2.headers().get("x-seen-sticky").unwrap().to_str().unwrap(),
+        "cline-task-4242"
+    );
+    assert_eq!(resp2.headers().get("x-seen-cline").unwrap().to_str().unwrap(), "0");
+
+    // 3. Headless multi-turn prefix fingerprint maps to stable `ttt-pfx-...` outbound header.
+    let t1 = br#"{"model":"mapped-model","messages":[{"role":"system","content":"You are a careful Rust engineer reviewing code for safety."},{"role":"user","content":"Review this lock-free queue implementation for ABA bugs."}]}"#;
+    let t2 = br#"{"model":"mapped-model","messages":[{"role":"system","content":"You are a careful Rust engineer reviewing code for safety."},{"role":"user","content":"Review this lock-free queue implementation for ABA bugs."},{"role":"assistant","content":"Looks safe with epoch reclamation."},{"role":"user","content":"What about memory ordering?"}]}"#;
+    let r_pfx1 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(t1)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let r_pfx2 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(t2)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let pfx_sid1 = r_pfx1.headers().get("x-seen-sticky").unwrap().to_str().unwrap().to_string();
+    let pfx_sid2 = r_pfx2.headers().get("x-seen-sticky").unwrap().to_str().unwrap().to_string();
+    assert!(pfx_sid1.starts_with("ttt-pfx-"));
+    assert_eq!(pfx_sid1, pfx_sid2);
+
+    // 4. Claude Code `/v1/messages` -> OpenAiResponses upstream automatically injects BOTH
+    //    `session_id` HTTP header AND `prompt_cache_key` in translated JSON body.
+    let resp4 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/messages"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"model":"gpt-5-codex","max_tokens":64,"metadata":{"user_id":"user_1_account_2_session_cc-abc123"},"messages":[{"role":"user","content":"hi"}]}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp4.status(), StatusCode::OK);
+    assert_eq!(
+        resp4.headers().get("x-seen-session-id").unwrap().to_str().unwrap(),
+        "session_cc-abc123"
+    );
+    assert_eq!(
+        resp4.headers().get("x-seen-cache-key").unwrap().to_str().unwrap(),
+        "session_cc-abc123"
+    );
+}
+
+#[tokio::test]
+async fn e2e_provider_builtin_cache_profiles() {
+    use ttt_core::PromptCacheMode;
+
+    let (grok_addr, _hg) = spawn_mock_upstream(|req| async move {
+        let conv = req
+            .headers()
+            .get("x-grok-conv-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let _ = req.into_body().collect().await;
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-seen-grok-conv", conv)
+            .body(full_body(r#"{"ok":true}"#))
+            .unwrap()
+    })
+    .await;
+
+    let (or_addr, _ho) = spawn_mock_upstream(|req| async move {
+        let sid = req
+            .headers()
+            .get("x-session-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let _ = req.into_body().collect().await;
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-seen-or-sid", sid)
+            .body(full_body(r#"{"ok":true}"#))
+            .unwrap()
+    })
+    .await;
+
+    let (strict_addr, _hs) = spawn_mock_upstream(|req| async move {
+        let body = req.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        let has_key = parsed.get("prompt_cache_key").is_some();
+        let has_ret = parsed.get("prompt_cache_retention").is_some();
+        let model = parsed
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-seen-cache-key", if has_key { "1" } else { "0" })
+            .header("x-seen-cache-ret", if has_ret { "1" } else { "0" })
+            .header("x-seen-model", model)
+            .body(full_body(r#"{"ok":true}"#))
+            .unwrap()
+    })
+    .await;
+
+    let (opencode_addr, _hoc) = spawn_mock_upstream(|req| async move {
+        let sid = req
+            .headers()
+            .get("x-opencode-session")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let _ = req.into_body().collect().await;
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-seen-oc-sid", sid)
+            .body(full_body(r#"{"ok":true}"#))
+            .unwrap()
+    })
+    .await;
+
+    let mut strict_map = HashMap::new();
+    strict_map.insert("deepseek-alias".to_string(), "deepseek-chat".to_string());
+
+    let cfg = GatewayConfig {
+        server: ServerConfig::default(),
+        pool: PoolConfig::default(),
+        telemetry: TelemetryConfig::default(),
+        oauth_storage: OAuthStorageConfig::default(),
+        routing: Default::default(),
+        upstreams: vec![
+            UpstreamConfig {
+                name: "xai-grok".into(),
+                base_url: format!("http://{grok_addr}"),
+                protocol: ProtocolFamily::OpenAi,
+                protocol_endpoints: HashMap::new(),
+                auth: UpstreamAuthConfig::ApiKey {
+                    keys: vec!["sk-xai".into()],
+                    header_name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+                models: vec!["grok-4".into()],
+                model_mapping: HashMap::new(),
+                extra_headers: HashMap::new(),
+                protocol_headers: HashMap::new(),
+                weight: 1,
+                default_cooldown_secs: 10,
+                max_retries: 0,
+                owner_user_id: None,
+                proxy: None,
+                quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: PromptCacheMode::XaiGrok,
+            },
+            UpstreamConfig {
+                name: "openrouter".into(),
+                base_url: format!("http://{or_addr}"),
+                protocol: ProtocolFamily::OpenAi,
+                protocol_endpoints: HashMap::new(),
+                auth: UpstreamAuthConfig::ApiKey {
+                    keys: vec!["sk-or".into()],
+                    header_name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+                models: vec!["openai/gpt-4o".into()],
+                model_mapping: HashMap::new(),
+                extra_headers: HashMap::new(),
+                protocol_headers: HashMap::new(),
+                weight: 1,
+                default_cooldown_secs: 10,
+                max_retries: 0,
+                owner_user_id: None,
+                proxy: None,
+                quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: PromptCacheMode::OpenRouter,
+            },
+            UpstreamConfig {
+                name: "strict-deepseek".into(),
+                base_url: format!("http://{strict_addr}"),
+                protocol: ProtocolFamily::OpenAi,
+                protocol_endpoints: HashMap::new(),
+                auth: UpstreamAuthConfig::ApiKey {
+                    keys: vec!["sk-ds".into()],
+                    header_name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+                models: vec!["deepseek-alias".into()],
+                model_mapping: strict_map,
+                extra_headers: HashMap::new(),
+                protocol_headers: HashMap::new(),
+                weight: 1,
+                default_cooldown_secs: 10,
+                max_retries: 0,
+                owner_user_id: None,
+                proxy: None,
+                quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: PromptCacheMode::StripOpenAiCacheFields,
+            },
+            UpstreamConfig {
+                name: "opencode-go".into(),
+                base_url: format!("http://{opencode_addr}"),
+                protocol: ProtocolFamily::OpenAi,
+                protocol_endpoints: HashMap::from([
+                    (ProtocolFamily::OpenAi, format!("http://{opencode_addr}/v1/chat/completions")),
+                    (ProtocolFamily::OpenAiResponses, format!("http://{opencode_addr}/v1/responses")),
+                    (ProtocolFamily::Anthropic, format!("http://{opencode_addr}/v1/messages")),
+                ]),
+                auth: UpstreamAuthConfig::ApiKey {
+                    keys: vec!["sk-oc".into()],
+                    header_name: "authorization".into(),
+                    prefix: Some("Bearer ".into()),
+                },
+                models: vec!["kimi-k3".into()],
+                model_mapping: HashMap::new(),
+                extra_headers: HashMap::new(),
+                protocol_headers: HashMap::new(),
+                weight: 1,
+                default_cooldown_secs: 10,
+                max_retries: 0,
+                owner_user_id: None,
+                proxy: None,
+                quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: PromptCacheMode::OpenCode,
+            },
+        ],
+    };
+
+    let (gw_addr, _tap_rx, _gw) = spawn_gateway(cfg, None).await;
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+
+    // 1. XaiGrok profile maps incoming `x-session-id` -> `x-grok-conv-id`.
+    let r1 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-session-id", "grok-thread-101")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"model":"grok-4","messages":[{"role":"user","content":"hi"}]}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    assert_eq!(
+        r1.headers().get("x-seen-grok-conv").unwrap().to_str().unwrap(),
+        "grok-thread-101"
+    );
+
+    // 2. OpenRouter profile maps OpenRouter body `session_id` -> `x-session-id` header.
+    let r2 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"model":"openai/gpt-4o","session_id":"or-body-sess-88","messages":[{"role":"user","content":"hi"}]}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    assert_eq!(
+        r2.headers().get("x-seen-or-sid").unwrap().to_str().unwrap(),
+        "or-body-sess-88"
+    );
+
+    // 3. StripOpenAiCacheFields still uses `prompt_cache_key` for gateway routing affinity
+    //    while stripping `prompt_cache_key` & `prompt_cache_retention` AND preserving `model_mapping`.
+    let r3 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"model":"deepseek-alias","prompt_cache_key":"sdk-cache-key-55","prompt_cache_retention":"24h","messages":[{"role":"user","content":"hi"}]}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), StatusCode::OK);
+    assert_eq!(
+        r3.headers().get("x-ttt-affinity-source").unwrap().to_str().unwrap(),
+        "body:prompt_cache_key"
+    );
+    assert_eq!(r3.headers().get("x-seen-cache-key").unwrap().to_str().unwrap(), "0");
+    assert_eq!(r3.headers().get("x-seen-cache-ret").unwrap().to_str().unwrap(), "0");
+    assert_eq!(r3.headers().get("x-seen-model").unwrap().to_str().unwrap(), "deepseek-chat");
+
+    // 4. OpenCode Go: Claude Code `/v1/messages` -> `x-opencode-session: session_...`
+    let r4 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/messages"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"model":"kimi-k3","max_tokens":64,"metadata":{"user_id":"user_1_account_2_session_oc-55"},"messages":[{"role":"user","content":"hi"}]}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r4.status(), StatusCode::OK);
+    assert_eq!(
+        r4.headers().get("x-seen-oc-sid").unwrap().to_str().unwrap(),
+        "session_oc-55"
+    );
+
+    // 5. OpenCode Go: short stateless request without session header gets `ses_ttt-req-...` fallback
+    let r5 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"model":"kimi-k3","messages":[{"role":"user","content":"hi"}]}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r5.status(), StatusCode::OK);
+    assert!(
+        r5.headers()
+            .get("x-seen-oc-sid")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("ses_ttt-req-")
+    );
+
+    // 6. OpenCode Go: explicit incoming `x-opencode-session` is preserved intact
+    let r6 = client
+        .request(
+            Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-opencode-session", "ses_client_owned_999")
+                .body(Full::new(Bytes::from_static(
+                    br#"{"model":"kimi-k3","messages":[{"role":"user","content":"hi"}]}"#,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r6.status(), StatusCode::OK);
+    assert_eq!(
+        r6.headers().get("x-seen-oc-sid").unwrap().to_str().unwrap(),
+        "ses_client_owned_999"
     );
 }

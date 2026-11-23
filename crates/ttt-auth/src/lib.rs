@@ -117,15 +117,30 @@ impl AuthProvider {
     /// Lock-free acquisition of an upstream credential.
     #[inline]
     pub fn acquire(&self) -> (CredentialHandle, Credential) {
+        self.acquire_with_affinity(None)
+    }
+
+    /// Lock-free acquisition of an upstream credential with optional affinity pinning.
+    #[inline]
+    pub fn acquire_with_affinity(&self, affinity_hash: Option<u64>) -> (CredentialHandle, Credential) {
         match self {
             Self::ApiKey(pool) => {
-                let (idx, cred) = pool.acquire();
+                let (idx, cred) = pool.acquire_with_affinity(affinity_hash);
                 (CredentialHandle::ApiKeySlot(idx), cred)
             }
             Self::OAuth(mgr) => {
                 let (generation, cred) = mgr.acquire();
                 (CredentialHandle::OAuthGeneration(generation), cred)
             }
+        }
+    }
+
+    /// Number of credential slots available on this provider.
+    #[inline]
+    pub fn key_count(&self) -> usize {
+        match self {
+            Self::ApiKey(pool) => pool.len(),
+            Self::OAuth(_) => 1,
         }
     }
 

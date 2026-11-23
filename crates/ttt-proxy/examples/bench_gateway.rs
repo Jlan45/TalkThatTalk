@@ -123,6 +123,7 @@ async fn spawn_gateway(upstream_addr: SocketAddr) -> SocketAddr {
         pool: PoolConfig::default(),
         telemetry: TelemetryConfig::default(),
         oauth_storage: OAuthStorageConfig::default(),
+        routing: Default::default(),
         upstreams: vec![
             UpstreamConfig {
                 name: "oai-native".into(),
@@ -144,6 +145,9 @@ async fn spawn_gateway(upstream_addr: SocketAddr) -> SocketAddr {
                 owner_user_id: None,
                 proxy: None,
                 quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
                 name: "ant-cross".into(),
@@ -165,6 +169,9 @@ async fn spawn_gateway(upstream_addr: SocketAddr) -> SocketAddr {
                 owner_user_id: None,
                 proxy: None,
                 quota: None,
+                session_header_out: None,
+                strip_other_session_headers: false,
+                prompt_cache_mode: Default::default(),
             },
         ],
     };

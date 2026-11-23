@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use memchr::memmem;
+use memchr::memchr2;
 
 /// Span of the `"model"` string value inside raw JSON bytes (excluding surrounding quotes).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,47 +15,59 @@ impl ModelSpan {
     }
 }
 
-/// Fast, zero-deserialization extraction of the `"model"` field value span from a JSON object.
+/// Fast, zero-deserialization extraction of the top-level `"model"` field value span
+/// from a JSON object.
 ///
-/// Uses SIMD-accelerated `memchr::memmem` to locate `"model"` keys without parsing
-/// potentially huge `messages` arrays or base64 image payloads.
-///
-/// To avoid matching `"model"` inside user prompt text, this verifies that:
-/// 1. The byte immediately before `"model"` (ignoring ASCII whitespace) is `{` or `,`.
-/// 2. The byte immediately after `"model"` (ignoring ASCII whitespace) is `:`.
-/// 3. The value after `:` (ignoring ASCII whitespace) is a double-quoted JSON string.
+/// Tracks JSON brace/bracket nesting depth and skips over JSON string literals using
+/// SIMD-accelerated `memchr::memchr2` so `"model"` inside nested objects (such as
+/// `messages` or `extra`) is never falsely matched.
 pub fn find_model_span(raw: &[u8]) -> Option<ModelSpan> {
-    let finder = memmem::Finder::new(b"\"model\"");
-    let mut search_from = 0;
+    let mut i = skip_ws(raw, 0);
+    if raw.get(i).copied() != Some(b'{') {
+        return None;
+    }
+    i += 1;
+    let mut depth: usize = 1;
 
-    while let Some(rel) = finder.find(&raw[search_from..]) {
-        let key_start = search_from + rel;
-        let key_end = key_start + b"\"model\"".len();
-        search_from = key_end;
-
-        // 1. Check preceding non-whitespace byte is '{' or ','.
-        if !preceded_by_object_delimiter(raw, key_start) {
-            continue;
-        }
-
-        // 2. Skip whitespace and expect ':'.
-        let mut i = skip_ws(raw, key_end);
-        if raw.get(i).copied() != Some(b':') {
-            continue;
-        }
-        i = skip_ws(raw, i + 1);
-
-        // 3. Expect opening '"' of string value.
-        if raw.get(i).copied() != Some(b'"') {
-            continue;
-        }
-        let val_start = i + 1;
-
-        // 4. Scan to closing '"' respecting backslash escapes.
-        if let Some(val_end) = find_json_string_end(raw, val_start) {
-            return Some(ModelSpan {
-                value_range: val_start..val_end,
-            });
+    while i < raw.len() {
+        let b = raw[i];
+        match b {
+            b' ' | b'\t' | b'\r' | b'\n' => {
+                i += 1;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return None;
+                }
+                i += 1;
+            }
+            b'"' => {
+                let str_start = i + 1;
+                let str_end = find_json_string_end(raw, str_start)?;
+                let after_str = skip_ws(raw, str_end + 1);
+                if depth == 1 && raw.get(after_str).copied() == Some(b':') {
+                    let is_model_key = &raw[str_start..str_end] == b"model";
+                    let val_pos = skip_ws(raw, after_str + 1);
+                    if is_model_key && raw.get(val_pos).copied() == Some(b'"') {
+                        let val_start = val_pos + 1;
+                        let val_end = find_json_string_end(raw, val_start)?;
+                        return Some(ModelSpan {
+                            value_range: val_start..val_end,
+                        });
+                    }
+                    i = val_pos;
+                    continue;
+                }
+                i = after_str;
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
 
@@ -75,29 +87,15 @@ fn skip_ws(raw: &[u8], mut idx: usize) -> usize {
 }
 
 #[inline]
-fn preceded_by_object_delimiter(raw: &[u8], mut idx: usize) -> bool {
-    while idx > 0 {
-        idx -= 1;
-        let b = raw[idx];
-        if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
-            continue;
-        }
-        return matches!(b, b'{' | b',');
-    }
-    false
-}
-
-#[inline]
 fn find_json_string_end(raw: &[u8], mut idx: usize) -> Option<usize> {
-    while let Some(&b) = raw.get(idx) {
-        if b == b'\\' {
-            idx += 2;
-            continue;
+    while idx < raw.len() {
+        let rel = memchr2(b'"', b'\\', &raw[idx..])?;
+        let pos = idx + rel;
+        if raw[pos] == b'"' {
+            return Some(pos);
         }
-        if b == b'"' {
-            return Some(idx);
-        }
-        idx += 1;
+        // Skip escaped byte.
+        idx = pos + 2;
     }
     None
 }
@@ -125,6 +123,13 @@ mod tests {
         let body = br#"{"messages":[{"role":"user","content":"talk about \"model\" here"}],"model":"gemini-2.5-pro"}"#;
         let span = find_model_span(body).unwrap();
         assert_eq!(span.as_str(body), Some("gemini-2.5-pro"));
+    }
+
+    #[test]
+    fn ignores_nested_model_keys_at_deeper_depth() {
+        let body = br#"{"extra":{"model":"wrong-nested"},"messages":[{"model":"also-wrong"}],"model":"right-top"}"#;
+        let span = find_model_span(body).unwrap();
+        assert_eq!(span.as_str(body), Some("right-top"));
     }
 
     #[test]

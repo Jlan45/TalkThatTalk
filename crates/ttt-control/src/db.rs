@@ -1289,6 +1289,9 @@ mod tests {
             owner_user_id: None,
             proxy: None,
             quota: None,
+            session_header_out: None,
+            strip_other_session_headers: false,
+            prompt_cache_mode: Default::default(),
         };
         db.upsert_upstream(&up).unwrap();
         let list = db.list_upstreams().unwrap();

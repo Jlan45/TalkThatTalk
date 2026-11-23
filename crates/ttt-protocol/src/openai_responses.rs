@@ -11,6 +11,16 @@ pub fn openai_to_responses_request(
     raw_body: &[u8],
     model_override: Option<&str>,
 ) -> Result<TranslatedRequest, GatewayError> {
+    openai_to_responses_request_with_session(raw_body, model_override, None)
+}
+
+/// Same as `openai_to_responses_request`, propagating/injecting `prompt_cache_key`
+/// from the request body or `session_hint`.
+pub fn openai_to_responses_request_with_session(
+    raw_body: &[u8],
+    model_override: Option<&str>,
+    session_hint: Option<&str>,
+) -> Result<TranslatedRequest, GatewayError> {
     let req: Value = serde_json::from_slice(raw_body)
         .map_err(|e| GatewayError::InvalidRequest(format!("invalid OpenAI JSON body: {e}")))?;
 
@@ -146,6 +156,16 @@ pub fn openai_to_responses_request(
         out["reasoning"] = json!({ "effort": effort });
     }
 
+    let cache_key = req
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| session_hint.map(str::trim).filter(|s| !s.is_empty()));
+    if let Some(key) = cache_key {
+        out["prompt_cache_key"] = Value::String(key.to_string());
+    }
+
     let body = serde_json::to_vec(&out)
         .map_err(|e| GatewayError::Internal(format!("serialize Responses request failed: {e}")))?;
 
@@ -163,6 +183,16 @@ pub fn openai_to_responses_request(
 pub fn anthropic_to_responses_request(
     raw_body: &[u8],
     model_override: Option<&str>,
+) -> Result<TranslatedRequest, GatewayError> {
+    anthropic_to_responses_request_with_session(raw_body, model_override, None)
+}
+
+/// Same as `anthropic_to_responses_request`, propagating `metadata.user_id` (or `session_hint`)
+/// into `prompt_cache_key`.
+pub fn anthropic_to_responses_request_with_session(
+    raw_body: &[u8],
+    model_override: Option<&str>,
+    session_hint: Option<&str>,
 ) -> Result<TranslatedRequest, GatewayError> {
     let req: Value = serde_json::from_slice(raw_body)
         .map_err(|e| GatewayError::InvalidRequest(format!("invalid Anthropic JSON body: {e}")))?;
@@ -293,6 +323,24 @@ pub fn anthropic_to_responses_request(
         if !converted.is_empty() {
             out["tools"] = Value::Array(converted);
         }
+    }
+
+    let claude_session = req
+        .pointer("/metadata/user_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|uid| {
+            if let Some(pos) = uid.find("_session_") {
+                &uid[pos + 1..]
+            } else {
+                uid
+            }
+        });
+    let cache_key = claude_session
+        .or_else(|| session_hint.map(str::trim).filter(|s| !s.is_empty()));
+    if let Some(key) = cache_key {
+        out["prompt_cache_key"] = Value::String(key.to_string());
     }
 
     let body = serde_json::to_vec(&out)

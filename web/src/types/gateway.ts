@@ -1,5 +1,13 @@
 export type ProtocolFamily = "openai" | "openai_responses" | "anthropic" | "gemini" | "antigravity";
 export type OAuthPreset = "codex" | "claude_code" | "antigravity" | "custom";
+export type PromptCacheMode =
+  | "auto"
+  | "open_ai"
+  | "strip_open_ai_cache_fields"
+  | "xai_grok"
+  | "open_router"
+  | "opencode"
+  | "passthrough";
 export type UserRole = "admin" | "user";
 export type ProxyProtocol =
   | "http"
@@ -97,6 +105,9 @@ export interface UpstreamView {
   quota_config?: QuotaMonitorConfig | null;
   can_probe_quota: boolean;
   quota?: QuotaSnapshot | null;
+  session_header_out?: string | null;
+  strip_other_session_headers?: boolean;
+  prompt_cache_mode?: PromptCacheMode;
 }
 
 export type QuotaProbeKind = "auto" | "claude_code" | "codex" | "antigravity" | "opencode_go" | "custom_http";

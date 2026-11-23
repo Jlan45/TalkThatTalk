@@ -103,16 +103,23 @@ pub struct QuotaMonitor {
 
 impl QuotaMonitor {
     pub fn new(db: Arc<GatewayDb>, engine: Arc<ProxyEngine>) -> Self {
-        let mut initial = db.list_quota_snapshots().unwrap_or_default();
-        initial.retain(|_, snap| {
-            snap.probe != QuotaProbeKind::Antigravity
+        let initial = db.list_quota_snapshots().unwrap_or_default();
+        let mut initial_filtered = HashMap::with_capacity(initial.len());
+        for (name, snap) in initial {
+            if snap.probe != QuotaProbeKind::Antigravity
                 || snap.status == QuotaStatus::Error
                 || !snap.available_models.is_empty()
-        });
+            {
+                engine
+                    .router()
+                    .set_quota_exhausted(&name, snap.status == QuotaStatus::Exhausted);
+                initial_filtered.insert(name, snap);
+            }
+        }
         Self {
             db,
             engine,
-            snapshots: RwLock::new(initial),
+            snapshots: RwLock::new(initial_filtered),
             refresh_locks: Mutex::new(HashMap::new()),
         }
     }
@@ -128,6 +135,7 @@ impl QuotaMonitor {
         if let Ok(mut g) = self.snapshots.write() {
             g.remove(name);
         }
+        self.engine.router().set_quota_exhausted(name, false);
         let _ = self.db.delete_quota_snapshot(name);
     }
 
@@ -143,6 +151,9 @@ impl QuotaMonitor {
         let _guard = lock.lock().await;
 
         let snap = probe_upstream(&self.engine, cfg).await;
+        self.engine
+            .router()
+            .set_quota_exhausted(&cfg.name, snap.status == QuotaStatus::Exhausted);
         if let Ok(mut g) = self.snapshots.write() {
             g.insert(cfg.name.clone(), snap.clone());
         }

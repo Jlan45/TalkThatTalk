@@ -26,3 +26,13 @@ db_path = "data/talkthattalk.db"
 store_path = "data/oauth-tokens.enc"
 # Base64-encoded 32-byte master key env var (auto-generates a 0600 local key if unset).
 master_key_env = "TTT_MASTER_KEY"
+
+# [routing]
+# affinity_enabled = true
+# session_headers = []
+# prefix_fallback_enabled = true
+# prefix_max_bytes = 4096
+# prefix_min_bytes = 64
+# sticky_failover_ttl_secs = 300
+# failure_cooldown_base_secs = 3
+# quota_aware = true

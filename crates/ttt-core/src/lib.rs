@@ -5,9 +5,9 @@ pub mod types;
 pub use config::{
     ANTIGRAVITY_USER_AGENT,
     ClashProxyOptions, ClientKeyConfig, GatewayConfig, OAuthPreset, OAuthStorageConfig, PoolConfig,
-    ProtocolFamily,
+    PromptCacheMode, ProtocolFamily,
     ProxyConfig, ProxyProtocol, QuotaDimension, QuotaMonitorConfig, QuotaProbeKind,
-    QuotaSnapshot, QuotaStatus, ServerConfig, TelemetryConfig, TokenRequestFormat,
+    QuotaSnapshot, QuotaStatus, RoutingConfig, ServerConfig, TelemetryConfig, TokenRequestFormat,
     UpstreamAuthConfig, UpstreamConfig,
 };
 pub use error::GatewayError;

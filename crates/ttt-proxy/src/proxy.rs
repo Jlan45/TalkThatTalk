@@ -12,24 +12,28 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use ttt_auth::{CredentialHandle, TokenStore};
 use ttt_core::{
-    ClientKeyConfig, GatewayConfig, GatewayError, ProtocolFamily, ProxyConfig,
+    ClientKeyConfig, GatewayConfig, GatewayError, PromptCacheMode, ProtocolFamily, ProxyConfig,
     RequestId, TapEvent,
 };
 use ttt_protocol::openai_antigravity::openai_to_antigravity_project_request;
 use ttt_protocol::{
-    create_sse_translator, detect_ingress_protocol, needs_translation, translate_request,
-    translate_response_json,
+    create_sse_translator, detect_ingress_protocol, needs_translation,
+    translate_request_with_session, translate_response_json,
 };
 
+use crate::affinity::{AffinityContext, AffinityExtractor};
 use crate::body::{ProxyBody, SegmentedBody};
 use crate::clash_manager::ClashProxyManager;
 use crate::client::{build_upstream_client, UpstreamHttpClient};
 use crate::model_extract::{find_model_span, ModelSpan};
+pub use crate::router::AccessPolicy;
 use crate::router::{ParsedEndpoint, Router, UpstreamNode};
 
 static HEADER_X_TTT_MODEL: HeaderName = HeaderName::from_static("x-ttt-model");
+static HEADER_X_TTT_SESSION_ID: HeaderName = HeaderName::from_static("x-ttt-session-id");
 static HEADER_X_TTT_REQUEST_ID: HeaderName = HeaderName::from_static("x-ttt-request-id");
 static HEADER_X_TTT_UPSTREAM: HeaderName = HeaderName::from_static("x-ttt-upstream");
+static HEADER_X_TTT_AFFINITY_SOURCE: HeaderName = HeaderName::from_static("x-ttt-affinity-source");
 static HEADER_X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
 static HEADER_X_ACCEL_BUFFERING: HeaderName = HeaderName::from_static("x-accel-buffering");
 
@@ -37,52 +41,6 @@ static HEADER_X_ACCEL_BUFFERING: HeaderName = HeaderName::from_static("x-accel-b
 struct CompiledClientKey {
     enabled: bool,
     policy: AccessPolicy,
-}
-
-#[derive(Debug, Clone)]
-pub struct AccessPolicy {
-    owner_user_id: Option<i64>,
-    allowed_upstreams: Option<HashSet<String>>,
-    allowed_models: Option<HashSet<String>>,
-}
-
-impl AccessPolicy {
-    pub fn new(
-        owner_user_id: Option<i64>,
-        allowed_upstreams: Option<Vec<String>>,
-        allowed_models: Option<Vec<String>>,
-    ) -> Self {
-        Self {
-            owner_user_id,
-            allowed_upstreams: allowed_upstreams.map(|names| names.into_iter().collect()),
-            allowed_models: allowed_models.map(|names| names.into_iter().collect()),
-        }
-    }
-
-    #[inline]
-    fn allows_model(&self, model: Option<&str>) -> bool {
-        self.allowed_models
-            .as_ref()
-            .is_none_or(|allowed| model.is_some_and(|model| allowed.contains(model)))
-    }
-
-    #[inline]
-    fn allows_upstream(&self, upstream_name: &str) -> bool {
-        self.allowed_upstreams
-            .as_ref()
-            .is_none_or(|allowed| allowed.contains(upstream_name))
-    }
-
-    /// Enforce owner isolation + user-level global upstream allowlist.
-    /// - Private upstreams (`owner_user_id = Some(uid)`) are ONLY routable by keys owned by `uid`.
-    /// - Global upstreams (`owner_user_id = None`) are subject to `restrict_upstreams` / `allowed_upstreams`.
-    #[inline]
-    fn can_access_node(&self, node: &UpstreamNode) -> bool {
-        if let Some(node_owner) = node.owner_user_id {
-            return self.owner_user_id == Some(node_owner);
-        }
-        self.allows_upstream(&node.name)
-    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -98,6 +56,7 @@ pub struct ProxyEngine {
     client: UpstreamHttpClient,
     clash_manager: ClashProxyManager,
     router: Router,
+    affinity_extractor: AffinityExtractor,
     client_keys: ArcSwap<HashMap<String, CompiledClientKey>>,
     max_inspect_body_bytes: usize,
     tap_tx: Option<mpsc::Sender<TapEvent>>,
@@ -110,13 +69,15 @@ impl ProxyEngine {
         token_store: Option<Arc<dyn TokenStore>>,
     ) -> Result<Self, GatewayError> {
         let client = build_upstream_client(&cfg.pool)?;
-        let router = Router::new(&cfg.upstreams, token_store)?;
+        let router = Router::with_config(&cfg.upstreams, token_store, cfg.routing.clone())?;
+        let affinity_extractor = AffinityExtractor::from_config(&cfg.routing);
         let compiled = compile_client_keys(&cfg.server.effective_client_keys());
 
         Ok(Self {
             client,
             clash_manager: ClashProxyManager::new(cfg.pool.clone())?,
             router,
+            affinity_extractor,
             client_keys: ArcSwap::from_pointee(compiled),
             max_inspect_body_bytes: cfg.server.max_inspect_body_bytes,
             tap_tx,
@@ -279,18 +240,10 @@ impl ProxyEngine {
                 .into_iter()
                 .filter(|m| {
                     if let Some(pol) = &active_policy {
-                        if !pol.allows_model(Some(m)) {
-                            return false;
-                        }
-                        self.router
-                            .select_candidates(Some(m), None)
-                            .iter()
-                            .any(|n| pol.can_access_node(n))
+                        pol.allows_model(Some(m))
+                            && self.router.has_accessible_node(m, Some(pol))
                     } else {
-                        self.router
-                            .select_candidates(Some(m), None)
-                            .iter()
-                            .any(|n| n.owner_user_id.is_none())
+                        self.router.has_accessible_node(m, None)
                     }
                 })
                 .collect();
@@ -405,20 +358,28 @@ impl ProxyEngine {
         req_id: RequestId,
         started_at: Instant,
     ) -> Result<Response<ProxyBody>, GatewayError> {
-        let mut candidates = self.router.select_candidates(model, ingress_proto);
-        if let Some(pol) = policy {
-            let had_any = !candidates.is_empty();
-            candidates.retain(|n| pol.can_access_node(n));
-            if candidates.is_empty() && had_any {
-                return Err(GatewayError::Forbidden(format!(
-                    "API key is not permitted to access any upstream for model '{}'",
-                    model.unwrap_or("<default>")
-                )));
-            }
+        let affinity = if self.router.needs_affinity_extraction(model, policy) {
+            self.affinity_extractor.extract_headers_only(
+                incoming_headers,
+                policy.and_then(|p| p.owner_user_id),
+                model,
+            )
         } else {
-            candidates.retain(|n| n.owner_user_id.is_none());
+            None
+        };
+        let affinity_hash = affinity.as_ref().map(|a| a.hash);
+        let affinity_source = affinity.as_ref().map(|a| a.source.as_str());
+
+        let plan = self
+            .router
+            .plan_route(model, ingress_proto, policy, affinity_hash);
+        if plan.blocked_by_policy {
+            return Err(GatewayError::Forbidden(format!(
+                "API key is not permitted to access any upstream for model '{}'",
+                model.unwrap_or("<default>")
+            )));
         }
-        let node = candidates.first().ok_or_else(|| {
+        let node = plan.candidates.first().ok_or_else(|| {
             GatewayError::NoRoute(model.unwrap_or("<default>").to_string())
         })?;
 
@@ -440,18 +401,37 @@ impl ProxyEngine {
             path_and_query,
             ProxyBody::incoming(body),
             None,
+            affinity.as_ref(),
+            req_id,
         )?;
 
-        let upstream_resp = self.send_upstream_request(node, upstream_req).await?;
+        let upstream_resp = match self.send_upstream_request(node, upstream_req).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                node.record_transient_failure(self.router.routing_config().failure_cooldown_base_secs);
+                return Err(err);
+            }
+        };
 
-        if upstream_resp.status() == StatusCode::TOO_MANY_REQUESTS {
+        let status = upstream_resp.status();
+        if status == StatusCode::TOO_MANY_REQUESTS {
             let cooldown = parse_retry_after(upstream_resp.headers())
                 .unwrap_or(node.default_cooldown_secs);
             node.auth.on_rate_limited(cred_handle, cooldown);
             node.mark_cooldown(cooldown);
+        } else if is_retryable_status(status) {
+            node.record_transient_failure(self.router.routing_config().failure_cooldown_base_secs);
+        } else {
+            node.record_success();
         }
 
-        Ok(self.wrap_upstream_response(upstream_resp, &node.name, req_id, started_at))
+        Ok(self.wrap_upstream_response(
+            upstream_resp,
+            &node.name,
+            affinity_source,
+            req_id,
+            started_at,
+        ))
     }
 
     /// Buffered lightweight-inspect path with zero-copy model rewriting, cross-protocol
@@ -470,32 +450,40 @@ impl ProxyEngine {
         req_id: RequestId,
         started_at: Instant,
     ) -> Result<Response<ProxyBody>, GatewayError> {
-        let mut candidates = self.router.select_candidates(model, ingress_proto);
-        if candidates.is_empty() {
+        let affinity: Option<AffinityContext> = if self.router.needs_affinity_extraction(model, policy) {
+            self.affinity_extractor.extract(
+                incoming_headers,
+                &raw_body,
+                ingress_proto,
+                policy.and_then(|p| p.owner_user_id),
+                model,
+            )
+        } else {
+            None
+        };
+        let affinity_hash = affinity.as_ref().map(|a| a.hash);
+        let affinity_source = affinity.as_ref().map(|a| a.source.as_str());
+
+        let plan = self
+            .router
+            .plan_route(model, ingress_proto, policy, affinity_hash);
+        if plan.blocked_by_policy {
+            return Err(GatewayError::Forbidden(format!(
+                "API key is not permitted to access any upstream for model '{}'",
+                model.unwrap_or("<default>")
+            )));
+        }
+        if plan.candidates.is_empty() {
             return Err(GatewayError::NoRoute(
                 model.unwrap_or("<default>").to_string(),
             ));
         }
-        if let Some(pol) = policy {
-            candidates.retain(|n| pol.can_access_node(n));
-            if candidates.is_empty() {
-                return Err(GatewayError::Forbidden(format!(
-                    "API key is not permitted to access any upstream for model '{}'",
-                    model.unwrap_or("<default>")
-                )));
-            }
-        } else {
-            candidates.retain(|n| n.owner_user_id.is_none());
-            if candidates.is_empty() {
-                return Err(GatewayError::NoRoute(
-                    model.unwrap_or("<default>").to_string(),
-                ));
-            }
-        }
 
+        let candidates = &plan.candidates;
         let max_attempts = candidates
-            .first()
+            .iter()
             .map(|n| n.max_retries.saturating_add(1))
+            .max()
             .unwrap_or(1)
             .min(candidates.len());
 
@@ -504,12 +492,12 @@ impl ProxyEngine {
         for (attempt, node) in candidates.iter().take(max_attempts).enumerate() {
             let has_more_attempts = attempt + 1 < max_attempts;
             self.emit_start(
-            req_id,
-            policy.and_then(|p| p.owner_user_id),
-            &node.name,
-            model,
-            path_and_query,
-        );
+                req_id,
+                policy.and_then(|p| p.owner_user_id),
+                &node.name,
+                model,
+                path_and_query,
+            );
 
             // Resolve best endpoint on this node: zero-copy native protocol if supported,
             // otherwise fall back to node's primary protocol with translation.
@@ -556,7 +544,13 @@ impl ProxyEngine {
                     let tr = if let Some(project) = project {
                         openai_to_antigravity_project_request(&raw_body, mapped, project)?
                     } else {
-                        translate_request(in_p, target_proto, &raw_body, mapped)?
+                        translate_request_with_session(
+                            in_p,
+                            target_proto,
+                            &raw_body,
+                            mapped,
+                            affinity.as_ref().map(|a| a.session_id.as_str()),
+                        )?
                     };
                     let final_bytes = if claude_code_compat {
                         ensure_claude_code_system_prompt(&tr.body).unwrap_or(tr.body)
@@ -618,16 +612,36 @@ impl ProxyEngine {
                         )
                     }
                 } else {
-                    let (body, cl) =
-                        build_rewritten_or_cloned_body(&raw_body, model_span.as_ref(), model, node);
-                    (
-                        path_and_query.to_string(),
-                        body,
-                        cl,
-                        Vec::new(),
-                        model.unwrap_or("").to_string(),
-                        false,
-                    )
+                    let mapped_model = model.and_then(|m| node.mapped_model(m));
+                    if node.strip_openai_cache_fields
+                        && let Some(cleaned) =
+                            strip_openai_cache_fields_if_present(&raw_body, mapped_model)
+                    {
+                        let len = cleaned.len() as u64;
+                        (
+                            path_and_query.to_string(),
+                            ProxyBody::full(cleaned),
+                            Some(len),
+                            Vec::new(),
+                            model.unwrap_or("").to_string(),
+                            false,
+                        )
+                    } else {
+                        let (body, cl) = build_rewritten_or_cloned_body(
+                            &raw_body,
+                            model_span.as_ref(),
+                            model,
+                            node,
+                        );
+                        (
+                            path_and_query.to_string(),
+                            body,
+                            cl,
+                            Vec::new(),
+                            model.unwrap_or("").to_string(),
+                            false,
+                        )
+                    }
                 };
 
                 if claude_code_compat {
@@ -643,6 +657,8 @@ impl ProxyEngine {
                     &target_path,
                     body,
                     content_length_override,
+                    affinity.as_ref(),
+                    req_id,
                 )?;
                 if let Some(session) = antigravity_session
                     && !matches!(cred_handle, CredentialHandle::OAuthGeneration(generation) if generation == session.generation)
@@ -717,14 +733,29 @@ impl ProxyEngine {
                                 );
                                 break;
                             }
-                        } else if is_retryable_status(status) && has_more_attempts {
-                            warn!(
-                                %req_id,
-                                upstream = %node.name,
-                                %status,
-                                "transient upstream status before first byte, retrying next candidate"
+                        } else if is_retryable_status(status) {
+                            node.record_transient_failure(
+                                self.router.routing_config().failure_cooldown_base_secs,
                             );
-                            break;
+                            if has_more_attempts {
+                                warn!(
+                                    %req_id,
+                                    upstream = %node.name,
+                                    %status,
+                                    "transient upstream status before first byte, retrying next candidate"
+                                );
+                                break;
+                            }
+                        } else if status != StatusCode::UNAUTHORIZED {
+                            node.record_success();
+                        }
+
+                        if status.is_success()
+                            && let Some(aff) = affinity.as_ref()
+                            && (plan.primary_hrw_node.as_deref() != Some(node.name.as_str())
+                                || plan.sticky_hit)
+                        {
+                            self.router.record_failover_success(aff.hash, &node.name);
                         }
 
                         if let Some(in_p) = cross_proto
@@ -737,6 +768,7 @@ impl ProxyEngine {
                                     target_proto,
                                     &effective_model,
                                     &node.name,
+                                    affinity_source,
                                     translated_is_stream,
                                     req_id,
                                     started_at,
@@ -744,9 +776,18 @@ impl ProxyEngine {
                                 .await;
                         }
 
-                        return Ok(self.wrap_upstream_response(resp, &node.name, req_id, started_at));
+                        return Ok(self.wrap_upstream_response(
+                            resp,
+                            &node.name,
+                            affinity_source,
+                            req_id,
+                            started_at,
+                        ));
                     }
                     Err(err) => {
+                        node.record_transient_failure(
+                            self.router.routing_config().failure_cooldown_base_secs,
+                        );
                         warn!(
                             %req_id,
                             upstream = %node.name,
@@ -775,6 +816,8 @@ impl ProxyEngine {
         path_and_query: &str,
         body: ProxyBody,
         content_length_override: Option<u64>,
+        affinity: Option<&AffinityContext>,
+        req_id: RequestId,
     ) -> Result<(ttt_auth::CredentialHandle, Request<ProxyBody>), GatewayError> {
         let target_uri = endpoint.build_target_uri(path_and_query)?;
         let mut builder = Request::builder().method(method).uri(target_uri);
@@ -784,6 +827,35 @@ impl ProxyEngine {
             .ok_or_else(|| GatewayError::Internal("failed to access request headers".into()))?;
 
         copy_filtered_request_headers(incoming_headers, headers);
+
+        // Outbound session header mapping & optional cleanup of heterogeneous agent headers.
+        let out_session_header = node.resolve_outbound_session_header(target_proto);
+        if node.strip_other_session_headers {
+            let to_remove: Vec<HeaderName> = headers
+                .keys()
+                .filter(|k| {
+                    self.affinity_extractor.is_session_header(k)
+                        && Some(*k) != out_session_header.as_ref()
+                })
+                .cloned()
+                .collect();
+            for k in to_remove {
+                headers.remove(&k);
+            }
+        }
+        if let Some(target_hdr) = out_session_header
+            && !headers.contains_key(&target_hdr)
+        {
+            if let Some(aff) = affinity
+                && let Ok(hv) = HeaderValue::from_str(&aff.session_id)
+            {
+                headers.insert(target_hdr, hv);
+            } else if node.effective_cache_mode == PromptCacheMode::OpenCode
+                && let Ok(hv) = HeaderValue::from_str(&format!("ses_ttt-{req_id}"))
+            {
+                headers.insert(target_hdr, hv);
+            }
+        }
 
         // Update Content-Length if zero-copy model rewrite changed payload length.
         if let Some(len) = content_length_override {
@@ -843,7 +915,7 @@ impl ProxyEngine {
             }
         }
 
-        let (cred_handle, cred) = node.auth.acquire();
+        let (cred_handle, cred) = node.auth.acquire_with_affinity(affinity.map(|a| a.hash));
         headers.insert(cred.header_name, cred.header_value);
 
         debug!(
@@ -862,6 +934,7 @@ impl ProxyEngine {
         &self,
         upstream_resp: Response<Incoming>,
         upstream_name: &str,
+        affinity_source: Option<&str>,
         req_id: RequestId,
         started_at: Instant,
     ) -> Response<ProxyBody> {
@@ -877,6 +950,9 @@ impl ProxyEngine {
             }
             if let Ok(hv) = HeaderValue::from_str(&encode_header_value(upstream_name)) {
                 headers.insert(HEADER_X_TTT_UPSTREAM.clone(), hv);
+            }
+            if let Ok(hv) = HeaderValue::from_str(affinity_source.unwrap_or("none")) {
+                headers.insert(HEADER_X_TTT_AFFINITY_SOURCE.clone(), hv);
             }
 
             // Ensure reverse proxies in front of TalkThatTalk do not buffer SSE chunks.
@@ -905,6 +981,7 @@ impl ProxyEngine {
         upstream_proto: ProtocolFamily,
         model: &str,
         upstream_name: &str,
+        affinity_source: Option<&str>,
         client_wants_stream: bool,
         req_id: RequestId,
         started_at: Instant,
@@ -925,6 +1002,9 @@ impl ProxyEngine {
             }
             if let Ok(hv) = HeaderValue::from_str(&encode_header_value(upstream_name)) {
                 headers.insert(HEADER_X_TTT_UPSTREAM.clone(), hv);
+            }
+            if let Ok(hv) = HeaderValue::from_str(affinity_source.unwrap_or("none")) {
+                headers.insert(HEADER_X_TTT_AFFINITY_SOURCE.clone(), hv);
             }
 
             if is_sse {
@@ -1080,6 +1160,28 @@ fn models_list_response(models: &[String]) -> Response<ProxyBody> {
         .unwrap()
 }
 
+fn strip_openai_cache_fields_if_present(
+    raw: &[u8],
+    mapped_model: Option<&str>,
+) -> Option<Bytes> {
+    if memchr::memmem::find(raw, b"\"prompt_cache_key\"").is_none()
+        && memchr::memmem::find(raw, b"\"prompt_cache_retention\"").is_none()
+    {
+        return None;
+    }
+    let mut val: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let obj = val.as_object_mut()?;
+    let removed_key = obj.remove("prompt_cache_key").is_some();
+    let removed_ret = obj.remove("prompt_cache_retention").is_some();
+    if !removed_key && !removed_ret {
+        return None;
+    }
+    if let Some(m) = mapped_model {
+        obj.insert("model".to_string(), serde_json::Value::String(m.to_string()));
+    }
+    serde_json::to_vec(&val).ok().map(Bytes::from)
+}
+
 fn build_rewritten_or_cloned_body(
     raw_body: &Bytes,
     model_span: Option<&ModelSpan>,
@@ -1148,6 +1250,7 @@ fn copy_filtered_request_headers(src: &HeaderMap, dst: &mut HeaderMap) {
             || *name == header::AUTHORIZATION
             || *name == HEADER_X_API_KEY
             || *name == HEADER_X_TTT_MODEL
+            || *name == HEADER_X_TTT_SESSION_ID
             || conn_tokens.contains(name.as_str())
         {
             continue;

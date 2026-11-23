@@ -3,8 +3,11 @@ pub mod error;
 pub mod types;
 
 pub use config::{
-    ClientKeyConfig, GatewayConfig, OAuthPreset, OAuthStorageConfig, PoolConfig, ProtocolFamily,
-    ProxyConfig, ProxyProtocol, ServerConfig, TelemetryConfig, TokenRequestFormat,
+    ANTIGRAVITY_USER_AGENT,
+    ClashProxyOptions, ClientKeyConfig, GatewayConfig, OAuthPreset, OAuthStorageConfig, PoolConfig,
+    ProtocolFamily,
+    ProxyConfig, ProxyProtocol, QuotaDimension, QuotaMonitorConfig, QuotaProbeKind,
+    QuotaSnapshot, QuotaStatus, ServerConfig, TelemetryConfig, TokenRequestFormat,
     UpstreamAuthConfig, UpstreamConfig,
 };
 pub use error::GatewayError;

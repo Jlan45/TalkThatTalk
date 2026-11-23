@@ -5,24 +5,25 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
-use http::{Method, Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use ttt_auth::{CredentialHandle, TokenStore};
 use ttt_core::{
-    ClientKeyConfig, GatewayConfig, GatewayError, PoolConfig, ProtocolFamily, ProxyConfig,
+    ClientKeyConfig, GatewayConfig, GatewayError, ProtocolFamily, ProxyConfig,
     RequestId, TapEvent,
 };
+use ttt_protocol::openai_antigravity::openai_to_antigravity_project_request;
 use ttt_protocol::{
     create_sse_translator, detect_ingress_protocol, needs_translation, translate_request,
     translate_response_json,
 };
 
 use crate::body::{ProxyBody, SegmentedBody};
-use crate::client::{build_proxied_client, build_upstream_client, ProxiedHttpClient, UpstreamHttpClient};
-use crate::leaf_manager::LeafProxyManager;
+use crate::clash_manager::ClashProxyManager;
+use crate::client::{build_upstream_client, UpstreamHttpClient};
 use crate::model_extract::{find_model_span, ModelSpan};
 use crate::router::{ParsedEndpoint, Router, UpstreamNode};
 
@@ -35,42 +36,41 @@ static HEADER_X_ACCEL_BUFFERING: HeaderName = HeaderName::from_static("x-accel-b
 #[derive(Debug, Clone)]
 struct CompiledClientKey {
     enabled: bool,
-    owner_user_id: Option<i64>,
-    restrict_upstreams: bool,
-    allowed_upstreams: HashSet<String>,
-    restrict_models: bool,
-    allowed_models: HashSet<String>,
+    policy: AccessPolicy,
 }
 
-impl CompiledClientKey {
-    fn from_config(cfg: &ClientKeyConfig) -> Self {
+#[derive(Debug, Clone)]
+pub struct AccessPolicy {
+    owner_user_id: Option<i64>,
+    allowed_upstreams: Option<HashSet<String>>,
+    allowed_models: Option<HashSet<String>>,
+}
+
+impl AccessPolicy {
+    pub fn new(
+        owner_user_id: Option<i64>,
+        allowed_upstreams: Option<Vec<String>>,
+        allowed_models: Option<Vec<String>>,
+    ) -> Self {
         Self {
-            enabled: cfg.enabled,
-            owner_user_id: cfg.owner_user_id,
-            restrict_upstreams: cfg.restrict_upstreams,
-            allowed_upstreams: cfg.allowed_upstreams.iter().cloned().collect(),
-            restrict_models: cfg.restrict_models,
-            allowed_models: cfg.allowed_models.iter().cloned().collect(),
+            owner_user_id,
+            allowed_upstreams: allowed_upstreams.map(|names| names.into_iter().collect()),
+            allowed_models: allowed_models.map(|names| names.into_iter().collect()),
         }
     }
 
     #[inline]
     fn allows_model(&self, model: Option<&str>) -> bool {
-        if !self.restrict_models {
-            return true;
-        }
-        match model {
-            Some(m) => self.allowed_models.contains(m),
-            None => false,
-        }
+        self.allowed_models
+            .as_ref()
+            .is_none_or(|allowed| model.is_some_and(|model| allowed.contains(model)))
     }
 
     #[inline]
     fn allows_upstream(&self, upstream_name: &str) -> bool {
-        if !self.restrict_upstreams {
-            return true;
-        }
-        self.allowed_upstreams.contains(upstream_name)
+        self.allowed_upstreams
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(upstream_name))
     }
 
     /// Enforce owner isolation + user-level global upstream allowlist.
@@ -85,12 +85,18 @@ impl CompiledClientKey {
     }
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PlaygroundChat {
+    model: String,
+    messages: Vec<serde_json::Value>,
+    #[serde(default)]
+    stream: bool,
+}
+
 /// High-performance zero-copy AI gateway data-plane engine.
 pub struct ProxyEngine {
-    pool_cfg: PoolConfig,
     client: UpstreamHttpClient,
-    leaf_manager: Arc<LeafProxyManager>,
-    proxied_clients: ArcSwap<HashMap<String, ProxiedHttpClient>>,
+    clash_manager: ClashProxyManager,
     router: Router,
     client_keys: ArcSwap<HashMap<String, CompiledClientKey>>,
     max_inspect_body_bytes: usize,
@@ -108,10 +114,8 @@ impl ProxyEngine {
         let compiled = compile_client_keys(&cfg.server.effective_client_keys());
 
         Ok(Self {
-            pool_cfg: cfg.pool.clone(),
             client,
-            leaf_manager: Arc::new(LeafProxyManager::new()),
-            proxied_clients: ArcSwap::from_pointee(HashMap::new()),
+            clash_manager: ClashProxyManager::new(cfg.pool.clone())?,
             router,
             client_keys: ArcSwap::from_pointee(compiled),
             max_inspect_body_bytes: cfg.server.max_inspect_body_bytes,
@@ -119,33 +123,23 @@ impl ProxyEngine {
         })
     }
 
-    pub fn leaf_manager(&self) -> &Arc<LeafProxyManager> {
-        &self.leaf_manager
+    pub fn clash_manager(&self) -> &ClashProxyManager {
+        &self.clash_manager
     }
 
-    /// Reload embedded `eycorsican/leaf` outbound proxies and swap per-proxy pooled clients lock-free.
+    /// Restore saved outbound proxies and their client pools.
     pub fn reload_proxies(&self, proxies: &[ProxyConfig]) -> Result<(), GatewayError> {
-        self.leaf_manager.reload(proxies)?;
-        let snapshot = self.leaf_manager.snapshot();
-        let mut next_clients = HashMap::with_capacity(snapshot.len());
-        for (name, resolved) in snapshot {
-            if let Ok(c) = build_proxied_client(&self.pool_cfg, resolved) {
-                next_clients.insert(name, c);
-            }
-        }
-        self.proxied_clients.store(Arc::new(next_clients));
-        Ok(())
+        self.clash_manager.reload(proxies)
     }
 
-    /// Send an upstream HTTP request directly or via the node's assigned embedded `leaf` proxy.
+    /// Send an upstream HTTP request directly or via its assigned proxy.
     async fn send_upstream_request(
         &self,
         node: &UpstreamNode,
         req: Request<ProxyBody>,
     ) -> Result<Response<Incoming>, GatewayError> {
         if let Some(ref proxy_name) = node.proxy {
-            let clients = self.proxied_clients.load();
-            let client = clients.get(proxy_name).ok_or_else(|| {
+            let client = self.clash_manager.get_client(proxy_name).ok_or_else(|| {
                 GatewayError::UpstreamConnect(format!(
                     "{}: configured proxy '{}' is not active or disabled",
                     node.name, proxy_name
@@ -221,12 +215,38 @@ impl ProxyEngine {
             return Ok(health_response());
         }
 
+        Ok(self.dispatch(req, None).await)
+    }
+
+    /// Called by the control plane after authenticating the console session.
+    pub async fn handle_playground(
+        &self,
+        mut req: Request<Incoming>,
+        policy: AccessPolicy,
+    ) -> Response<ProxyBody> {
+        let target = if req.method() == Method::GET {
+            "/v1/models"
+        } else {
+            "/v1/chat/completions"
+        };
+        *req.uri_mut() = Uri::from_static(target);
+        req.headers_mut().clear();
+        req.headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        self.dispatch(req, Some(policy)).await
+    }
+
+    async fn dispatch(
+        &self,
+        req: Request<Incoming>,
+        policy: Option<AccessPolicy>,
+    ) -> Response<ProxyBody> {
         let req_id = RequestId::next();
         let started_at = Instant::now();
 
-        match self.forward(req, req_id, started_at).await {
-            Ok(resp) => Ok(resp),
-            Err(err) => Ok(error_response(&err, req_id)),
+        match self.forward(req, req_id, started_at, policy).await {
+            Ok(resp) => resp,
+            Err(err) => error_response(&err, req_id),
         }
     }
 
@@ -235,16 +255,20 @@ impl ProxyEngine {
         req: Request<Incoming>,
         req_id: RequestId,
         started_at: Instant,
+        session_policy: Option<AccessPolicy>,
     ) -> Result<Response<ProxyBody>, GatewayError> {
-        // 1. Optional ingress gateway authentication & scoped policy resolution.
-        let keys_guard = self.client_keys.load();
-        let active_policy = if !keys_guard.is_empty() {
-            let policy = resolve_client_policy(&keys_guard, req.headers()).ok_or_else(|| {
-                GatewayError::Unauthorized("missing, invalid, or disabled gateway API key".into())
-            })?;
-            Some(policy)
+        let is_playground = session_policy.is_some();
+        let active_policy = if is_playground {
+            session_policy
         } else {
-            None
+            let keys = self.client_keys.load();
+            if keys.is_empty() {
+                None
+            } else {
+                Some(resolve_client_policy(&keys, req.headers()).ok_or_else(|| {
+                    GatewayError::Unauthorized("missing, invalid, or disabled gateway API key".into())
+                })?)
+            }
         };
 
         // OpenAI-compatible model discovery endpoint filtered by the active token policy.
@@ -288,11 +312,8 @@ impl ProxyEngine {
             .map(ToOwned::to_owned);
 
         // 2. Decide between pure streaming zero-copy fast path vs lightweight JSON model scan.
-        let policy_requires_model = active_policy
-            .as_ref()
-            .map(|p| p.restrict_models)
-            .unwrap_or(false);
-        let can_pure_stream = !policy_requires_model
+        let policy_requires_model = active_policy.as_ref().is_some_and(|p| p.allowed_models.is_some());
+        let can_pure_stream = !is_playground && !policy_requires_model
             && should_use_pure_stream(
                 &parts.method,
                 &parts.headers,
@@ -328,6 +349,15 @@ impl ProxyEngine {
                 GatewayError::InvalidRequest(format!("failed to read request body: {e}"))
             })?
             .to_bytes();
+        let raw_body = if is_playground {
+            let chat: PlaygroundChat = serde_json::from_slice(&raw_body)
+                .map_err(|err| GatewayError::InvalidRequest(format!("invalid Playground request: {err}")))?;
+            let encoded = serde_json::to_vec(&chat)
+                .map_err(|err| GatewayError::Internal(format!("failed to encode Playground request: {err}")))?;
+            Bytes::from(encoded)
+        } else {
+            raw_body
+        };
 
         let model_span = find_model_span(&raw_body);
         let extracted_model = model_span
@@ -370,7 +400,7 @@ impl ProxyEngine {
         path_and_query: &str,
         ingress_proto: Option<ProtocolFamily>,
         model: Option<&str>,
-        policy: Option<&CompiledClientKey>,
+        policy: Option<&AccessPolicy>,
         body: Incoming,
         req_id: RequestId,
         started_at: Instant,
@@ -434,7 +464,7 @@ impl ProxyEngine {
         path_and_query: &str,
         ingress_proto: Option<ProtocolFamily>,
         model: Option<&str>,
-        policy: Option<&CompiledClientKey>,
+        policy: Option<&AccessPolicy>,
         raw_body: Bytes,
         model_span: Option<ModelSpan>,
         req_id: RequestId,
@@ -490,6 +520,22 @@ impl ProxyEngine {
             let mut oauth_refreshed_on_node = false;
 
             loop {
+                let antigravity_session = if cross_proto == Some(ProtocolFamily::OpenAi)
+                    && target_proto == ProtocolFamily::Antigravity
+                    && let Some(mgr) = node.auth.oauth_manager()
+                {
+                    let origin = format!("{}://{}", endpoint.base_scheme, endpoint.base_authority);
+                    match mgr.antigravity_session(&origin).await {
+                        Ok(session) => Some(session),
+                        Err(err) => {
+                            last_err = Some(err);
+                            break;
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 // Fast Path (same protocol): zero-copy slice rewrite or O(1) Bytes::clone.
                 // Cross-Protocol Path (L1 framework): translate request + path + headers.
                 let claude_code_compat =
@@ -504,7 +550,14 @@ impl ProxyEngine {
                     translated_is_stream,
                 ) = if let Some(in_p) = cross_proto {
                     let mapped = model.and_then(|m| node.mapped_model(m));
-                    let tr = translate_request(in_p, target_proto, &raw_body, mapped)?;
+                    let project = antigravity_session
+                        .as_ref()
+                        .and_then(|session| session.antigravity_project_id.as_deref());
+                    let tr = if let Some(project) = project {
+                        openai_to_antigravity_project_request(&raw_body, mapped, project)?
+                    } else {
+                        translate_request(in_p, target_proto, &raw_body, mapped)?
+                    };
                     let final_bytes = if claude_code_compat {
                         ensure_claude_code_system_prompt(&tr.body).unwrap_or(tr.body)
                     } else {
@@ -591,6 +644,11 @@ impl ProxyEngine {
                     body,
                     content_length_override,
                 )?;
+                if let Some(session) = antigravity_session
+                    && !matches!(cred_handle, CredentialHandle::OAuthGeneration(generation) if generation == session.generation)
+                {
+                    continue;
+                }
 
                 if cross_proto.is_some() {
                     // Request uncompressed payload so we can parse/translate JSON or SSE cleanly.
@@ -960,14 +1018,23 @@ impl ProxyEngine {
 
 fn compile_client_keys(keys: &[ClientKeyConfig]) -> HashMap<String, CompiledClientKey> {
     keys.iter()
-        .map(|k| (k.key.clone(), CompiledClientKey::from_config(k)))
+        .map(|key| {
+            (key.key.clone(), CompiledClientKey {
+                enabled: key.enabled,
+                policy: AccessPolicy::new(
+                    key.owner_user_id,
+                    key.restrict_upstreams.then(|| key.allowed_upstreams.clone()),
+                    key.restrict_models.then(|| key.allowed_models.clone()),
+                ),
+            })
+        })
         .collect()
 }
 
 fn resolve_client_policy(
     allowed_keys: &HashMap<String, CompiledClientKey>,
     headers: &HeaderMap,
-) -> Option<CompiledClientKey> {
+) -> Option<AccessPolicy> {
     if let Some(auth) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -976,7 +1043,7 @@ fn resolve_client_policy(
         if let Some(pol) = allowed_keys.get(token)
             && pol.enabled
         {
-            return Some(pol.clone());
+            return Some(pol.policy.clone());
         }
     }
     if let Some(key) = headers
@@ -985,7 +1052,7 @@ fn resolve_client_policy(
         && let Some(pol) = allowed_keys.get(key.trim())
         && pol.enabled
     {
-        return Some(pol.clone());
+        return Some(pol.policy.clone());
     }
     None
 }

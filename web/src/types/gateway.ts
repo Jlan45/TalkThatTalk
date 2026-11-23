@@ -1,7 +1,21 @@
-export type ProtocolFamily = "openai" | "openai_responses" | "anthropic" | "gemini";
-export type OAuthPreset = "codex" | "claude_code" | "custom";
+export type ProtocolFamily = "openai" | "openai_responses" | "anthropic" | "gemini" | "antigravity";
+export type OAuthPreset = "codex" | "claude_code" | "antigravity" | "custom";
 export type UserRole = "admin" | "user";
-export type ProxyProtocol = "http" | "socks5" | "shadowsocks" | "trojan" | "vmess" | "vless";
+export type ProxyProtocol =
+  | "http"
+  | "socks5"
+  | "shadowsocks"
+  | "trojan"
+  | "vmess"
+  | "vless"
+  | "anytls"
+  | "hysteria2";
+
+export interface ProxyImportResult {
+  imported: number;
+  duplicates: number;
+  skipped: number;
+}
 
 export interface ProxyView {
   name: string;
@@ -51,6 +65,10 @@ export interface OAuthStatusView {
   expires_in_secs?: number;
   can_login_pkce: boolean;
   can_refresh: boolean;
+  client_id?: string | null;
+  redirect_uri?: string | null;
+  has_client_secret?: boolean;
+  project_id_pending?: boolean;
 }
 
 export interface UpstreamView {
@@ -76,6 +94,52 @@ export interface UpstreamView {
   scope: "global" | "private";
   can_manage: boolean;
   proxy?: string | null;
+  quota_config?: QuotaMonitorConfig | null;
+  can_probe_quota: boolean;
+  quota?: QuotaSnapshot | null;
+}
+
+export type QuotaProbeKind = "auto" | "claude_code" | "codex" | "antigravity" | "opencode_go" | "custom_http";
+export type QuotaStatus = "healthy" | "low" | "exhausted" | "error";
+
+export interface QuotaMonitorConfig {
+  enabled: boolean;
+  probe: QuotaProbeKind;
+  poll_interval_secs: number;
+  chatgpt_account_id?: string | null;
+  custom_url?: string | null;
+  custom_headers?: Record<string, string>;
+  remaining_path?: string | null;
+  used_path?: string | null;
+  total_path?: string | null;
+  scale?: number | null;
+  currency?: string | null;
+}
+
+export type QuotaDimension =
+  | {
+      kind: "window_utilization";
+      window: string;
+      used_percent: number;
+      resets_at?: number | null;
+    }
+  | {
+      kind: "monetary";
+      currency: string;
+      remaining?: number | null;
+      used?: number | null;
+      total?: number | null;
+    };
+
+export interface QuotaSnapshot {
+  upstream: string;
+  probe: QuotaProbeKind;
+  status: QuotaStatus;
+  dimensions: QuotaDimension[];
+  available_models?: string[];
+  plan_type?: string | null;
+  error?: string | null;
+  fetched_at: number;
 }
 
 export interface UpstreamStats {

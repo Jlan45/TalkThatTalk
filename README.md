@@ -1,6 +1,6 @@
 # TalkThatTalk
 
-基于 Rust 构建的高性能、零拷贝 AI 统一网关。单二进制部署（约 **14 MB**，已内嵌 Web 控制台与本地 SQLite），同时支持 **API Key** 与 **OAuth 2.0**（兼容 Codex / Claude Code）上游鉴权、跨协议互转、内置多协议代理调度（`eycorsican/leaf`）以及多用户权限管理。
+基于 Rust 构建的高性能、零拷贝 AI 统一网关。单二进制部署，内嵌 Web 控制台与本地 SQLite，同时支持 **API Key** 与 **OAuth 2.0**（兼容 Codex / Claude Code）上游鉴权、跨协议互转、Clash 多协议代理调度以及多用户权限管理。
 
 ---
 
@@ -23,8 +23,10 @@
   - 支持 Authorization Code + PKCE（RFC 7636）、Device Code（RFC 8628）与 Client Credentials。
   - `ArcSwap` 无锁读取、后台主动续期、`Singleflight` 并发去重以及 **AES-256-GCM** 加密持久化。
 
-### 4. 内置代理调度（`leaf_manager`）
-- 集成 `eycorsican/leaf` 代理引擎，在控制台独立管理代理节点（HTTP / SOCKS5 / Shadowsocks / VMess / Trojan 等）并支持按上游渠道分配独立代理与连通性测试。
+### 4. 内置代理调度（`clash_manager`）
+- 在网关进程内通过 `clash-lib` 直连 SOCKS5、Shadowsocks、Trojan、VMess、VLESS、AnyTLS 和 Hysteria2 节点。HTTP 节点使用网关的 HTTP CONNECT。[ClashRS](https://github.com/Watfaq-legacy/clash-rs/tree/v0.10.12)
+- 控制台继续使用 SQLite 中的节点配置与上游代理绑定，并提供连通性测试。旧配置中启用了 REALITY 的 Trojan 或 VMess 节点会显示为未加载。
+- 管理员可在「代理管理 → 导入订阅」输入返回 Clash YAML 的公网订阅地址。同名节点会跳过，导入结果会显示新增与跳过的数量。
 
 ### 5. 控制面与内嵌前端（`ttt-control` / `ttt-server` / `web`）
 - **单二进制内嵌前端**：`web/`（React + Vite）构建产物通过 `ttt-server/build.rs` 直接编译进 Rust 二进制，无需额外 Nginx 或 Node 运行时。
@@ -64,7 +66,7 @@
 │   ├── ttt-core/       # 配置模型、错误信封、协议类型定义
 │   ├── ttt-auth/       # ApiKeyPool、OAuthTokenManager、PKCE、AES-256-GCM 存储
 │   ├── ttt-protocol/   # OpenAI / Anthropic / Gemini / Responses 协议互转与流式改写
-│   ├── ttt-proxy/      # 零拷贝代理引擎、TapBody、SegmentedBody、Leaf 代理调度、计量
+│   ├── ttt-proxy/      # 零拷贝代理引擎、TapBody、SegmentedBody、Clash 代理调度、计量
 │   ├── ttt-control/    # SQLite 控制面、用户/权限/渠道/Key/代理/统计 API
 │   └── ttt-server/     # 主程序入口（talkthattalk）、内嵌前端资源、CLI 与优雅停机
 └── web/                # React + Vite 管理控制台源码
@@ -73,6 +75,25 @@
 ---
 
 ## 快速开始
+
+### Linux 一键安装
+
+适用于运行 systemd 的 Linux x86_64 和 ARM64 系统。发布包基于 Ubuntu 22.04 构建，已内嵌 Web 控制台。
+
+```bash
+# 安装或升级到最新发布版
+curl -fsSL https://github.com/Jlan45/TalkThatTalk/releases/latest/download/install.sh | sudo bash
+
+# 安装指定版本
+curl -fsSL https://github.com/Jlan45/TalkThatTalk/releases/download/v0.0.1/install.sh | sudo bash -s -- v0.0.1
+
+# 卸载服务，保留配置和数据
+curl -fsSL https://github.com/Jlan45/TalkThatTalk/releases/latest/download/uninstall.sh | sudo bash
+```
+
+安装后访问 `http://127.0.0.1:18080` 初始化管理员。监听地址可在 `/etc/talkthattalk/config.toml` 中修改，修改后运行 `sudo systemctl restart talkthattalk`。SQLite 数据保存在 `/var/lib/talkthattalk`。若要一并删除配置和数据，在卸载命令末尾传入 `-s -- --purge`。
+
+GitHub Actions 会在提交到 `main` 或向它发起 PR 时构建前端并运行 Rust 测试。推送 `vX.Y.Z` 标签会为两种架构编译 Release、生成 SHA-256 校验文件，并发布到 [GitHub Releases](https://github.com/Jlan45/TalkThatTalk/releases)。
 
 ### 1. 构建并启动（含内嵌前端）
 
@@ -99,6 +120,8 @@ cp config.example.toml config.toml
 # 查看 Token 状态
 ./target/release/talkthattalk auth status --config config.toml
 ```
+
+Antigravity 渠道使用运行时配置的 Google OAuth Client ID 和 Client Secret。可在控制台为单个渠道填写配套凭据，也可在服务端设置 `ANTIGRAVITY_CLIENT_ID` 和 `ANTIGRAVITY_CLIENT_SECRET`。通过安装脚本部署时，可将这两个变量写入仅管理员可读的 `/etc/talkthattalk/environment`，再重启服务。默认 Redirect URI 为 `http://localhost:51121/oauth-callback`，也可填写与 OAuth 客户端配置一致的地址。授权后网关会发现并保存账号的 Project ID，供模型请求和后续令牌刷新使用。
 
 ### 3. 运行测试与代码检查
 

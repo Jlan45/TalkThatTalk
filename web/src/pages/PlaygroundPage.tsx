@@ -1,40 +1,50 @@
 import { useEffect, useState } from "react";
+import { gatewayApi } from "../api/client";
 import { IconPlay } from "../components/Icons";
 
 interface ChatTurn {
   id: string;
   role: "user" | "assistant";
   content: string;
+  reasoning?: string;
   model?: string;
   upstream?: string;
+  firstByteMs?: number;
   ttftMs?: number;
+  firstAnswerMs?: number;
   durationMs?: number;
   streaming?: boolean;
 }
 
 export function PlaygroundPage() {
   const [models, setModels] = useState<string[]>([]);
-  const [selectedModel, setSelectedModel] = useState("gpt-4o");
-  const [clientKey, setClientKey] = useState("");
+  const [selectedModel, setSelectedModel] = useState("");
+  const [loadingModels, setLoadingModels] = useState(true);
+  const [modelError, setModelError] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<ChatTurn[]>([]);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const model = models.includes(selectedModel) ? selectedModel : models[0] ?? "";
 
   useEffect(() => {
-    fetch("/v1/models")
-      .then((r) => r.json())
-      .then((data) => {
-        const list: string[] = (data?.data ?? []).map((m: { id: string }) => m.id);
-        setModels(list);
-        if (list.length > 0) setSelectedModel(list[0]);
+    const controller = new AbortController();
+    gatewayApi.listPlaygroundModels(controller.signal)
+      .then(({ data }) => {
+        if (!controller.signal.aborted) setModels(data.map(({ id }) => id));
       })
-      .catch(() => {});
+      .catch((err) => {
+        if (!controller.signal.aborted) setModelError((err as Error).message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoadingModels(false);
+      });
+    return () => controller.abort();
   }, []);
 
   const handleSend = async () => {
     const text = prompt.trim();
-    if (!text || sending) return;
+    if (!text || sending || loadingModels || !model) return;
 
     setError(null);
     setPrompt("");
@@ -44,7 +54,7 @@ export function PlaygroundPage() {
       id: assistantId,
       role: "assistant",
       content: "",
-      model: selectedModel,
+      model,
       streaming: true,
     };
 
@@ -53,23 +63,17 @@ export function PlaygroundPage() {
     setSending(true);
 
     const startedAt = performance.now();
+    let firstByteMs: number | undefined;
     let ttftMs: number | undefined;
+    let firstAnswerMs: number | undefined;
 
     try {
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (clientKey.trim()) {
-        headers["Authorization"] = `Bearer ${clientKey.trim()}`;
-      }
-
-      const res = await fetch("/v1/chat/completions", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          model: selectedModel,
-          stream: true,
-          messages: nextHistory.map((m) => ({ role: m.role, content: m.content })),
-        }),
-      });
+      const res = await gatewayApi.streamPlaygroundChat(
+        model,
+        nextHistory
+          .filter(({ role, content }) => role !== "assistant" || content !== "")
+          .map(({ role, content }) => ({ role, content }))
+      );
 
       const rawUpstreamHeader = res.headers.get("x-ttt-upstream");
       let upstreamHeader: string | undefined;
@@ -80,52 +84,56 @@ export function PlaygroundPage() {
           upstreamHeader = rawUpstreamHeader;
         }
       }
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(`HTTP ${res.status}: ${errText}`);
-      }
-
       const reader = res.body?.getReader();
       if (!reader) throw new Error("Empty response stream");
 
       const decoder = new TextDecoder();
       let buf = "";
-      let acc = "";
+      let content = "";
+      let reasoning = "";
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
+        const elapsed = Math.round(performance.now() - startedAt);
+        let changed = false;
+        if (firstByteMs === undefined && value?.byteLength) {
+          firstByteMs = elapsed;
+          changed = true;
+        }
+        buf += decoder.decode(value, { stream: !done });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        if (done && buf) lines.push(buf);
 
-        let nl = buf.indexOf("\n");
-        while (nl !== -1) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          nl = buf.indexOf("\n");
-
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
           if (!line.startsWith("data:")) continue;
           const payload = line.slice(5).trim();
           if (payload === "[DONE]") continue;
           try {
             const parsed = JSON.parse(payload);
-            const delta = parsed?.choices?.[0]?.delta?.content;
-            if (typeof delta === "string" && delta.length > 0) {
-              if (ttftMs === undefined) {
-                ttftMs = Math.round(performance.now() - startedAt);
-              }
-              acc += delta;
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId
-                    ? { ...m, content: acc, ttftMs, upstream: upstreamHeader }
-                    : m
-                )
-              );
+            const delta = parsed?.choices?.[0]?.delta;
+            if (typeof delta?.reasoning_content === "string" && delta.reasoning_content) {
+              ttftMs ??= elapsed;
+              reasoning += delta.reasoning_content;
+              changed = true;
+            }
+            if (typeof delta?.content === "string" && delta.content) {
+              ttftMs ??= elapsed;
+              firstAnswerMs ??= elapsed;
+              content += delta.content;
+              changed = true;
             }
           } catch {
             // ignore non-JSON SSE keepalive lines
           }
         }
+
+        if (changed) {
+          const update = { content, reasoning, firstByteMs, ttftMs, firstAnswerMs, upstream: upstreamHeader };
+          setMessages((prev) => prev.map((m) => m.id === assistantId ? { ...m, ...update } : m));
+        }
+        if (done) break;
       }
 
       const durationMs = Math.round(performance.now() - startedAt);
@@ -134,8 +142,11 @@ export function PlaygroundPage() {
           m.id === assistantId
             ? {
                 ...m,
-                content: acc || "(empty response)",
+                content,
+                reasoning,
+                firstByteMs,
                 ttftMs,
+                firstAnswerMs,
                 durationMs,
                 upstream: upstreamHeader,
                 streaming: false,
@@ -156,20 +167,17 @@ export function PlaygroundPage() {
       <div className="page-header" style={{ marginBottom: 14 }}>
         <h1 className="page-title">Playground</h1>
         <div className="actions-row">
-          <input
-            className="input mono"
-            style={{ width: 220 }}
-            type="password"
-            placeholder="网关 Client Key（如已开启鉴权）"
-            value={clientKey}
-            onChange={(e) => setClientKey(e.target.value)}
-          />
           <button className="btn btn-ghost btn-sm" onClick={() => setMessages([])}>
             清空对话
           </button>
         </div>
       </div>
 
+      {modelError ? (
+        <div className="error-banner">{modelError}</div>
+      ) : !loadingModels && models.length === 0 ? (
+        <div className="muted">当前账号没有可用模型。请检查渠道和模型权限。</div>
+      ) : null}
       {error && <div className="error-banner">{error}</div>}
 
       <div className="chat-stream">
@@ -191,12 +199,24 @@ export function PlaygroundPage() {
               <div className="trace-row">
                 <span className="chip">{m.model}</span>
                 {m.upstream && <span className="chip chip-blue">{m.upstream}</span>}
-                {m.ttftMs !== undefined && <span className="chip chip-ok">TTFT {m.ttftMs} ms</span>}
-                {m.durationMs !== undefined && <span className="chip">{m.durationMs} ms</span>}
-                {m.streaming && <span className="chip chip-warn">Streaming...</span>}
+                {m.firstByteMs !== undefined && <span className="chip">首包 {m.firstByteMs} ms</span>}
+                {m.ttftMs !== undefined && <span className="chip chip-ok" title="首段推理或正文">TTFT {m.ttftMs} ms</span>}
+                {m.reasoning && m.firstAnswerMs !== undefined && m.firstAnswerMs !== m.ttftMs && (
+                  <span className="chip">首正文 {m.firstAnswerMs} ms</span>
+                )}
+                {m.durationMs !== undefined && <span className="chip">总耗时 {m.durationMs} ms</span>}
+                {m.streaming && <span className="chip chip-warn">生成中</span>}
               </div>
             )}
-            <div className="chat-bubble">{m.content || (m.streaming ? "Thinking..." : "")}</div>
+            {m.reasoning && (
+              <details className="chat-reasoning" open={m.streaming}>
+                <summary>推理过程</summary>
+                <div className="chat-reasoning-stream"><div>{m.reasoning}</div></div>
+              </details>
+            )}
+            {(m.content || !m.reasoning || !m.streaming) && (
+              <div className="chat-bubble">{m.content || (m.streaming ? "等待输出…" : "未收到正文")}</div>
+            )}
           </div>
         ))}
       </div>
@@ -217,10 +237,12 @@ export function PlaygroundPage() {
           <div className="actions-row">
             <select
               className="select mono"
-              value={selectedModel}
+              aria-label="模型"
+              value={model}
+              disabled={loadingModels || models.length === 0}
               onChange={(e) => setSelectedModel(e.target.value)}
             >
-              {models.length === 0 && <option value="gpt-4o">gpt-4o</option>}
+              {models.length === 0 && <option value="">{loadingModels ? "正在加载模型…" : "无可用模型"}</option>}
               {models.map((m) => (
                 <option key={m} value={m}>
                   {m}
@@ -229,7 +251,7 @@ export function PlaygroundPage() {
             </select>
             <span className="chip">SSE Stream</span>
           </div>
-          <button className="btn" disabled={sending || !prompt.trim()} onClick={() => void handleSend()}>
+          <button className="btn" disabled={sending || loadingModels || !model || !prompt.trim()} onClick={() => void handleSend()}>
             <IconPlay width={13} height={13} />
             {sending ? "生成中..." : "发送"}
           </button>

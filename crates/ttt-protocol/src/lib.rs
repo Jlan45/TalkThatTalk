@@ -1,4 +1,5 @@
 pub mod openai_anthropic;
+pub mod openai_antigravity;
 pub mod openai_gemini;
 pub mod openai_responses;
 pub mod stream;
@@ -54,6 +55,9 @@ pub fn translate_request(
         (ProtocolFamily::OpenAi, ProtocolFamily::Gemini) => {
             openai_gemini::openai_to_gemini_request(raw_body, model_override)
         }
+        (ProtocolFamily::OpenAi, ProtocolFamily::Antigravity) => {
+            openai_antigravity::openai_to_antigravity_request(raw_body, model_override)
+        }
         (ProtocolFamily::OpenAi, ProtocolFamily::OpenAiResponses) => {
             openai_responses::openai_to_responses_request(raw_body, model_override)
         }
@@ -84,6 +88,9 @@ pub fn translate_response_json(
         (ProtocolFamily::OpenAi, ProtocolFamily::Gemini) => {
             openai_gemini::gemini_to_openai_response(raw_body, model)
         }
+        (ProtocolFamily::OpenAi, ProtocolFamily::Antigravity) => {
+            openai_antigravity::antigravity_to_openai_response(raw_body, model)
+        }
         (ProtocolFamily::OpenAi, ProtocolFamily::OpenAiResponses) => {
             openai_responses::responses_to_openai_response(raw_body, model)
         }
@@ -110,7 +117,8 @@ pub fn create_sse_translator(
         (ProtocolFamily::OpenAi, ProtocolFamily::Anthropic) => {
             Ok(SseTranslator::anthropic_to_openai(model))
         }
-        (ProtocolFamily::OpenAi, ProtocolFamily::Gemini) => {
+        (ProtocolFamily::OpenAi, ProtocolFamily::Gemini)
+        | (ProtocolFamily::OpenAi, ProtocolFamily::Antigravity) => {
             Ok(SseTranslator::gemini_to_openai(model))
         }
         (ProtocolFamily::OpenAi, ProtocolFamily::OpenAiResponses) => {
@@ -256,6 +264,40 @@ mod tests {
             .collect();
         assert!(joined.contains("world"));
         assert!(joined.contains("total_tokens"));
+        assert!(joined.contains("[DONE]"));
+    }
+
+    #[test]
+    fn openai_to_antigravity_roundtrip() {
+        let req = br#"{"model":"gemini-2.5-pro","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+        let translated =
+            translate_request(ProtocolFamily::OpenAi, ProtocolFamily::Antigravity, req, None)
+                .unwrap();
+        assert_eq!(
+            translated.target_path_and_query,
+            "/v1internal:streamGenerateContent?alt=sse"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&translated.body).unwrap();
+        assert_eq!(parsed["model"], "gemini-2.5-pro");
+        assert_eq!(parsed["userAgent"], "antigravity");
+        assert_eq!(parsed["request"]["contents"][0]["parts"][0]["text"], "hi");
+
+        let mut tr = create_sse_translator(
+            ProtocolFamily::OpenAi,
+            ProtocolFamily::Antigravity,
+            "gemini-2.5-pro".into(),
+        )
+        .unwrap();
+        let mut out = VecDeque::new();
+        tr.on_data_line(
+            r#"{"response":{"candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}]}}"#,
+            &mut out,
+        );
+        let joined: String = out
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect();
+        assert!(joined.contains("hello"));
         assert!(joined.contains("[DONE]"));
     }
 }

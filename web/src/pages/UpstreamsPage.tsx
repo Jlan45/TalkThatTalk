@@ -17,6 +17,18 @@ function formatTtl(secs?: number): string {
   return `剩余 ${Math.floor(secs / 60)}m`;
 }
 
+function formatQuotaReset(timestamp: number | null | undefined, now: number): string {
+  if (!timestamp) return "";
+  const seconds = timestamp - now;
+  if (seconds <= 0) return "即将重置";
+  const minutes = Math.max(1, Math.floor(seconds / 60));
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  if (days) return `${days}天 ${hours % 24}小时后重置`;
+  if (hours) return `${hours}小时 ${minutes % 60}分钟后重置`;
+  return `${minutes}分钟后重置`;
+}
+
 export function UpstreamsPage({ currentUser }: Props) {
   const canCreate =
     currentUser.role === "admin" || currentUser.allow_private_upstreams !== false;
@@ -26,12 +38,14 @@ export function UpstreamsPage({ currentUser }: Props) {
   const [authFilter, setAuthFilter] = useState("all");
   const [page, setPage] = useState(1);
   const [error, setError] = useState<string | null>(null);
+  const [quotaClock, setQuotaClock] = useState(() => Math.floor(Date.now() / 1000));
   const PAGE_SIZE = 8;
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<UpstreamView | null>(null);
   const [oauthTarget, setOauthTarget] = useState<string | null>(null);
   const [expandedModels, setExpandedModels] = useState<Record<string, boolean>>({});
+  const [refreshingQuota, setRefreshingQuota] = useState<Record<string, boolean>>({});
 
   const load = async () => {
     try {
@@ -45,6 +59,11 @@ export function UpstreamsPage({ currentUser }: Props) {
 
   useEffect(() => {
     void load();
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setQuotaClock(Math.floor(Date.now() / 1000)), 30_000);
+    return () => window.clearInterval(timer);
   }, []);
 
   const filtered = useMemo(() => {
@@ -84,6 +103,18 @@ export function UpstreamsPage({ currentUser }: Props) {
       await load();
     } catch (e) {
       setError((e as Error).message);
+    }
+  };
+
+  const handleRefreshQuota = async (name: string) => {
+    setRefreshingQuota((prev) => ({ ...prev, [name]: true }));
+    try {
+      await gatewayApi.refreshUpstreamQuota(name);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setRefreshingQuota((prev) => ({ ...prev, [name]: false }));
     }
   };
 
@@ -176,6 +207,7 @@ export function UpstreamsPage({ currentUser }: Props) {
                 <th>模型</th>
                 <th>权重 / 重试</th>
                 <th>状态</th>
+                <th>额度</th>
                 <th style={{ textAlign: "right" }}>操作</th>
               </tr>
             </thead>
@@ -183,10 +215,9 @@ export function UpstreamsPage({ currentUser }: Props) {
               {paged.map((up) => {
                 const isExpanded = Boolean(expandedModels[up.name]);
                 const MAX_VISIBLE_MODELS = 2;
-                const visibleModels = isExpanded
-                  ? up.models
-                  : up.models.slice(0, MAX_VISIBLE_MODELS);
-                const hiddenCount = Math.max(0, up.models.length - MAX_VISIBLE_MODELS);
+                const catalog = up.quota?.available_models?.length ? up.quota.available_models : up.models;
+                const visibleModels = isExpanded ? catalog : catalog.slice(0, MAX_VISIBLE_MODELS);
+                const hiddenCount = Math.max(0, catalog.length - MAX_VISIBLE_MODELS);
 
                 return (
                 <tr key={up.name}>
@@ -263,7 +294,7 @@ export function UpstreamsPage({ currentUser }: Props) {
                     <div
                       className="tag-list"
                       style={{ maxWidth: isExpanded ? 320 : 240 }}
-                      title={up.models.join(", ")}
+                      title={catalog.join(", ")}
                     >
                       {visibleModels.map((m) => (
                         <span className="tag" key={m}>
@@ -294,8 +325,8 @@ export function UpstreamsPage({ currentUser }: Props) {
                       <span className="chip chip-warn">429 冷却中</span>
                     ) : up.auth_mode === "oauth" ? (
                       up.oauth?.token_present ? (
-                        <span className="chip chip-ok">
-                          已授权 {formatTtl(up.oauth.expires_in_secs)}
+                        <span className={up.oauth.project_id_pending ? "chip chip-warn" : "chip chip-ok"}>
+                          {up.oauth.project_id_pending ? "已授权，等待 Project ID" : `已授权 ${formatTtl(up.oauth.expires_in_secs)}`}
                         </span>
                       ) : (
                         <span className="chip chip-warn">未授权</span>
@@ -303,6 +334,94 @@ export function UpstreamsPage({ currentUser }: Props) {
                     ) : (
                       <span className="chip chip-ok">运行中</span>
                     )}
+                  </td>
+                  <td style={{ minWidth: 160 }}>
+                    {(() => {
+                      const canProbeQuota = up.can_probe_quota;
+                      const q = up.quota;
+                      const isRefreshing = Boolean(refreshingQuota[up.name]);
+                      const showAllWindows = q?.probe === "antigravity" || q?.probe === "opencode_go";
+                      if (!q && !canProbeQuota) {
+                        return <span className="muted">—</span>;
+                      }
+                      return (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          {q?.status === "error" ? (
+                            <span className="chip chip-warn" title={q.error || "探测失败"}>
+                              探测失败
+                            </span>
+                          ) : q && q.dimensions.length > 0 ? (
+                            <div style={showAllWindows ? { display: "grid", gap: 6, maxHeight: q.dimensions.length > 5 ? 240 : undefined, overflowY: "auto" } : undefined}>
+                              {(showAllWindows ? q.dimensions : q.dimensions.slice(0, 2)).map((dim, idx) => {
+                              if (dim.kind === "window_utilization") {
+                                const pct = Math.min(100, Math.max(0, dim.used_percent));
+                                const reset = formatQuotaReset(dim.resets_at, quotaClock);
+                                const barColor =
+                                  pct >= 95 ? "#ef4444" : pct >= 80 ? "#f59e0b" : "#10b981";
+                                return (
+                                  <div key={idx} style={{ fontSize: 12 }}>
+                                    {showAllWindows ? (
+                                      <>
+                                        <div>
+                                          <strong>{dim.window}</strong>
+                                          {reset && <span className="muted"> · {reset}</span>}
+                                        </div>
+                                        <div className="tabular">已用 {pct.toFixed(0)}%</div>
+                                      </>
+                                    ) : (
+                                      <div style={{ display: "flex", justifyContent: "space-between", gap: 6 }}>
+                                        <span><strong>{dim.window}</strong> {pct.toFixed(0)}%</span>
+                                        <span className="muted" style={{ fontSize: 11 }}>{reset}</span>
+                                      </div>
+                                    )}
+                                    <div
+                                      style={{
+                                        height: 4,
+                                        background: "var(--border)",
+                                        borderRadius: 99,
+                                        overflow: "hidden",
+                                        marginTop: 2,
+                                      }}
+                                    >
+                                      <div
+                                        style={{
+                                          width: `${pct}%`,
+                                          height: "100%",
+                                          background: barColor,
+                                        }}
+                                      />
+                                    </div>
+                                  </div>
+                                );
+                              }
+                              return (
+                                <div key={idx} className="tabular" style={{ fontSize: 12 }}>
+                                  {dim.currency}{" "}
+                                  {dim.remaining != null ? dim.remaining.toFixed(2) : "—"}
+                                  {dim.total != null ? ` / ${dim.total.toFixed(2)}` : ""}
+                                </div>
+                              );
+                              })}
+                            </div>
+                          ) : (
+                            <span className="muted" style={{ fontSize: 12 }}>
+                              待探测
+                            </span>
+                          )}
+                          {canProbeQuota && up.can_manage && (
+                            <button
+                              className="btn btn-ghost btn-sm"
+                              style={{ padding: "2px 6px", fontSize: 11, alignSelf: "flex-start" }}
+                              disabled={isRefreshing}
+                              onClick={() => void handleRefreshQuota(up.name)}
+                            >
+                              <IconRefresh width={11} height={11} />
+                              {isRefreshing ? "探测中..." : "刷新额度"}
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </td>
                   <td style={{ textAlign: "right" }}>
                     {up.can_manage ? (
@@ -348,7 +467,7 @@ export function UpstreamsPage({ currentUser }: Props) {
               })}
               {filtered.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="muted" style={{ textAlign: "center", padding: 32 }}>
+                  <td colSpan={8} className="muted" style={{ textAlign: "center", padding: 32 }}>
                     没有匹配的渠道
                   </td>
                 </tr>
@@ -394,7 +513,10 @@ export function UpstreamsPage({ currentUser }: Props) {
         <UpstreamModal
           initial={editing}
           onClose={() => setModalOpen(false)}
-          onSaved={() => void load()}
+          onSaved={(authorizeUpstream) => {
+            void load();
+            if (authorizeUpstream) setOauthTarget(authorizeUpstream);
+          }}
         />
       )}
 

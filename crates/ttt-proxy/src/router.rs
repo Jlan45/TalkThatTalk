@@ -497,6 +497,7 @@ mod tests {
             max_retries: 0,
             owner_user_id: None,
             proxy: None,
+            quota: None,
         }
     }
 

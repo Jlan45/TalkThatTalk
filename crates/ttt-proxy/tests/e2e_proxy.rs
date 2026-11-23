@@ -13,12 +13,14 @@ use hyper::service::service_fn;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use ttt_auth::{EncryptedTokenStore, TokenStore};
+use ttt_auth::{EncryptedTokenStore, OAuthHttpClient, StoredOAuthToken, TokenStore};
 use ttt_core::{
-    ClientKeyConfig, GatewayConfig, OAuthPreset, OAuthStorageConfig, PoolConfig, ProtocolFamily,
-    ServerConfig, TapEvent, TelemetryConfig, UpstreamAuthConfig, UpstreamConfig,
+    ClientKeyConfig, GatewayConfig, GatewayError, OAuthPreset, OAuthStorageConfig, PoolConfig,
+    ProtocolFamily, ProxyConfig, ServerConfig, TapEvent, TelemetryConfig, TokenRequestFormat,
+    UpstreamAuthConfig, UpstreamConfig,
 };
 use ttt_proxy::ProxyEngine;
 
@@ -28,6 +30,11 @@ async fn spawn_gateway(
 ) -> (SocketAddr, mpsc::Receiver<TapEvent>, tokio::task::JoinHandle<()>) {
     let (tap_tx, tap_rx) = mpsc::channel(256);
     let engine = Arc::new(ProxyEngine::new(&cfg, Some(tap_tx), token_store).unwrap());
+    let (addr, handle) = serve_gateway(engine).await;
+    (addr, tap_rx, handle)
+}
+
+async fn serve_gateway(engine: Arc<ProxyEngine>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -48,7 +55,7 @@ async fn spawn_gateway(
         }
     });
 
-    (addr, tap_rx, handle)
+    (addr, handle)
 }
 
 async fn spawn_mock_upstream<F, Fut>(handler: F) -> (SocketAddr, tokio::task::JoinHandle<()>)
@@ -83,6 +90,90 @@ type BoxedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infal
 
 fn full_body(data: impl Into<Bytes>) -> BoxedBody {
     Full::new(data.into()).boxed()
+}
+
+#[tokio::test]
+async fn clash_routes_named_proxy_and_preserves_it_on_failed_update() {
+    let (upstream, _upstream_task) = spawn_mock_upstream(|_| async {
+        Response::new(full_body(r#"{"proxied":true}"#))
+    })
+    .await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let socks_task = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            client.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 2]);
+            client.write_all(&[5, 2]).await.unwrap();
+
+            let mut credentials = [0; 11];
+            client.read_exact(&mut credentials).await.unwrap();
+            assert_eq!(&credentials, b"\x01\x04user\x04pass");
+            client.write_all(&[1, 0]).await.unwrap();
+
+            let expected = b"\x05\x01\x00\x03\x0froute-only.test\x00\x50";
+            let mut target = vec![0; expected.len()];
+            client.read_exact(&mut target).await.unwrap();
+            assert_eq!(target, expected);
+            let mut upstream = TcpStream::connect(upstream).await.unwrap();
+            client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            });
+        }
+    });
+
+    let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "server": { "client_api_keys": ["gateway-key"] },
+        "upstreams": [{
+            "name": "routed",
+            "base_url": "http://route-only.test",
+            "auth": { "type": "api_key", "keys": ["upstream-key"] },
+            "proxy": "named-proxy"
+        }]
+    }))
+    .unwrap();
+    let proxy: ProxyConfig = serde_json::from_value(serde_json::json!({
+        "name": "named-proxy",
+        "protocol": "socks5",
+        "server": "127.0.0.1",
+        "port": port,
+        "username": "user",
+        "password": "pass"
+    }))
+    .unwrap();
+    let engine = Arc::new(ProxyEngine::new(&cfg, None, None).unwrap());
+    engine.reload_proxies(&[proxy]).unwrap();
+    let manager = engine.clash_manager();
+    assert!(
+        manager.update("named-proxy", None, || {
+            Err(GatewayError::Internal("simulated database failure".into()))
+        })
+        .is_err()
+    );
+    assert_eq!(
+        manager.test_proxy("named-proxy", "http://route-only.test/").await.unwrap().0,
+        200
+    );
+
+    let (gw_addr, _gateway_task) = serve_gateway(Arc::clone(&engine)).await;
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+        .header(header::AUTHORIZATION, "Bearer gateway-key")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from_static(br#"{"model":"routed"}"#)))
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.into_body().collect().await.unwrap().to_bytes(),
+        br#"{"proxied":true}"#.as_slice()
+    );
+    socks_task.await.unwrap();
+    manager.update("named-proxy", None, || Ok(())).unwrap();
+    assert!(!manager.is_active("named-proxy"));
 }
 
 #[tokio::test]
@@ -195,6 +286,7 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
                 max_retries: 1,
                 owner_user_id: None,
                 proxy: None,
+        quota: None,
             },
             UpstreamConfig {
                 name: "oauth-up".into(),
@@ -228,6 +320,7 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
                 max_retries: 0,
                 owner_user_id: None,
                 proxy: None,
+        quota: None,
             },
             UpstreamConfig {
                 name: "flaky-primary".into(),
@@ -248,6 +341,7 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
                 max_retries: 1,
                 owner_user_id: None,
                 proxy: None,
+        quota: None,
             },
             UpstreamConfig {
                 name: "healthy-backup".into(),
@@ -268,6 +362,7 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
                 max_retries: 1,
                 owner_user_id: None,
                 proxy: None,
+        quota: None,
             },
         ],
     };
@@ -537,6 +632,7 @@ async fn e2e_oauth_401_singleflight_refresh_rotation_and_persistence() {
                 max_retries: 0,
                 owner_user_id: None,
                 proxy: None,
+        quota: None,
             },
             UpstreamConfig {
                 name: "codex-up".into(),
@@ -570,6 +666,7 @@ async fn e2e_oauth_401_singleflight_refresh_rotation_and_persistence() {
                 max_retries: 0,
                 owner_user_id: None,
                 proxy: None,
+        quota: None,
             },
         ],
     };
@@ -639,6 +736,179 @@ async fn e2e_oauth_401_singleflight_refresh_rotation_and_persistence() {
     );
 
     let _ = std::fs::remove_file(&tmp_store_path);
+}
+
+#[tokio::test]
+async fn antigravity_discovers_project_and_preserves_it_on_refresh() {
+    let discovery_calls = Arc::new(AtomicUsize::new(0));
+    let (upstream, _task) = spawn_mock_upstream({
+        let discovery_calls = Arc::clone(&discovery_calls);
+        move |request| {
+            let discovery_calls = Arc::clone(&discovery_calls);
+            async move {
+                let (parts, body) = request.into_parts();
+                let body = body.collect().await.unwrap().to_bytes();
+                let authorization = parts.headers.get(header::AUTHORIZATION);
+                match parts.uri.path() {
+                    "/v1internal:loadCodeAssist" => {
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(body["metadata"]["ideType"], "ANTIGRAVITY");
+                        let previous_calls = discovery_calls.fetch_add(1, Ordering::SeqCst);
+                        let response = match authorization.unwrap().to_str().unwrap() {
+                            "Bearer legacy-access" => r#"{"cloudaicompanionProject":{"id":"legacy-project"}}"#,
+                            "Bearer new-access" if previous_calls == 1 => "{}",
+                            "Bearer new-access" => r#"{"cloudaicompanionProject":"new-project"}"#,
+                            _ => panic!("unexpected discovery credential"),
+                        };
+                        Response::new(full_body(response))
+                    }
+                    "/v1internal:listCloudAICompanionProjects" => {
+                        assert_eq!(authorization.unwrap(), "Bearer new-access");
+                        Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(full_body(""))
+                            .unwrap()
+                    }
+                    "/token" => {
+                        let form = std::str::from_utf8(&body).unwrap();
+                        assert!(form.contains("client_id=test-client"));
+                        assert!(form.contains("client_secret=test-secret"));
+                        if form.contains("grant_type=authorization_code") {
+                            assert!(form.contains("code=test-code"));
+                            assert!(form.contains("code_verifier=test-verifier"));
+                            return Response::new(full_body(
+                                r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#,
+                            ));
+                        }
+                        assert!(form.contains("grant_type=refresh_token"));
+                        assert!(form.contains("refresh_token=legacy-refresh"));
+                        Response::new(full_body(
+                            r#"{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":3600}"#,
+                        ))
+                    }
+                    "/v1internal:generateContent" => {
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let expected = match authorization.unwrap().to_str().unwrap() {
+                            "Bearer legacy-access" | "Bearer rotated-access" => "legacy-project",
+                            "Bearer new-access" => "new-project",
+                            _ => panic!("unexpected model credential"),
+                        };
+                        assert_eq!(body["project"], expected);
+                        if authorization.unwrap() == "Bearer legacy-access" {
+                            return Response::builder()
+                                .status(StatusCode::UNAUTHORIZED)
+                                .body(full_body(""))
+                                .unwrap();
+                        }
+                        Response::new(full_body(
+                            r#"{"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}}"#,
+                        ))
+                    }
+                    path => panic!("unexpected upstream path {path}"),
+                }
+            }
+        }
+    })
+    .await;
+    let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "upstreams": [{
+            "name": "antigravity",
+            "base_url": format!("http://{upstream}"),
+            "protocol": "antigravity",
+            "auth": {
+                "type": "oauth",
+                "preset": "antigravity",
+                "token_url": format!("http://{upstream}/token"),
+                "client_id": "test-client",
+                "client_secret": "test-secret"
+            }
+        }]
+    }))
+    .unwrap();
+    let path = std::env::temp_dir().join(format!("ttt-e2e-antigravity-{}.enc", std::process::id()));
+    let store = Arc::new(EncryptedTokenStore::with_key(&path, [42; 32]));
+    store
+        .put(
+            "antigravity",
+            StoredOAuthToken {
+                access_token: "legacy-access".into(),
+                refresh_token: Some("legacy-refresh".into()),
+                expires_at: None,
+                token_type: None,
+                scope: None,
+                extra: HashMap::new(),
+            },
+        )
+        .unwrap();
+    let engine = Arc::new(ProxyEngine::new(&cfg, None, Some(store.clone())).unwrap());
+    let (gateway, _task) = serve_gateway(engine.clone()).await;
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let generate = || async {
+        let resp = client
+            .request(
+                Request::post(format!("http://{gateway}/v1/chat/completions"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from_static(
+                        br#"{"model":"test","messages":[{"role":"user","content":"Hello"}]}"#,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "ok");
+    };
+
+    generate().await;
+    let stored = store.get("antigravity").unwrap().unwrap();
+    assert_eq!(stored.access_token, "rotated-access");
+    assert_eq!(stored.antigravity_project_id(), Some("legacy-project"));
+    engine.router().reload(&cfg.upstreams).unwrap();
+    generate().await;
+    assert_eq!(discovery_calls.load(Ordering::SeqCst), 1);
+
+    let oauth = OAuthHttpClient::new();
+    let token = oauth
+        .exchange_code(
+            &format!("http://{upstream}/token"),
+            TokenRequestFormat::Form,
+            "test-code",
+            "test-verifier",
+            "http://localhost:51121/oauth-callback",
+            "test-client",
+            Some("test-secret"),
+            None,
+        )
+        .await
+        .unwrap();
+    let record = oauth
+        .complete_login(&cfg.upstreams[0], token)
+        .await
+        .unwrap();
+    assert_eq!(record.access_token, "new-access");
+    assert_eq!(record.antigravity_project_id(), None);
+    let node = &engine.router().all_nodes()[0];
+    node.auth
+        .oauth_manager()
+        .unwrap()
+        .install_login(record)
+        .await
+        .unwrap();
+    assert_eq!(store.get("antigravity").unwrap().unwrap().access_token, "new-access");
+    engine.router().reload(&cfg.upstreams).unwrap();
+    generate().await;
+    assert_eq!(discovery_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        store
+            .get("antigravity")
+            .unwrap()
+            .unwrap()
+            .antigravity_project_id(),
+        Some("new-project")
+    );
+    std::fs::remove_file(path).unwrap();
 }
 
 #[tokio::test]
@@ -765,6 +1035,7 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
                 max_retries: 0,
                 owner_user_id: None,
                 proxy: None,
+        quota: None,
             },
             UpstreamConfig {
                 name: "gemini-up".into(),
@@ -785,6 +1056,7 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
                 max_retries: 0,
                 owner_user_id: None,
                 proxy: None,
+        quota: None,
             },
             UpstreamConfig {
                 name: "deepseek-openai-up".into(),
@@ -805,6 +1077,7 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
                 max_retries: 0,
                 owner_user_id: None,
                 proxy: None,
+        quota: None,
             },
         ],
     };
@@ -969,6 +1242,7 @@ async fn e2e_client_key_provider_and_model_restrictions() {
                 max_retries: 0,
                 owner_user_id: None,
                 proxy: None,
+        quota: None,
             },
             UpstreamConfig {
                 name: "provider-b".into(),
@@ -989,6 +1263,7 @@ async fn e2e_client_key_provider_and_model_restrictions() {
                 max_retries: 0,
                 owner_user_id: None,
                 proxy: None,
+        quota: None,
             },
         ],
     };
@@ -1150,6 +1425,7 @@ async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
             max_retries: 0,
             owner_user_id: None,
             proxy: None,
+        quota: None,
         }],
     };
 
@@ -1303,6 +1579,7 @@ async fn e2e_claude_code_oauth_compat_mode() {
             max_retries: 0,
             owner_user_id: None,
             proxy: None,
+        quota: None,
         }],
     };
 

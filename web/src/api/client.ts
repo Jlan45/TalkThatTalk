@@ -3,6 +3,7 @@ import type {
   ClientKeysResponse,
   GatewayStatsSnapshot,
   OAuthAuthorizeResponse,
+  ProxyImportResult,
   ProxyView,
   UpsertClientKeyPayload,
   UpstreamView,
@@ -12,7 +13,7 @@ import type {
 
 const API_BASE = "/api/v1";
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function requestRaw(path: string, init?: RequestInit): Promise<Response> {
   const adminToken = localStorage.getItem("ttt_admin_token");
   const adminKey = localStorage.getItem("ttt_admin_key");
   const headers: Record<string, string> = {
@@ -44,7 +45,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const msg = errBody?.error?.message ?? `HTTP ${res.status}`;
     throw new Error(msg);
   }
-  return res.json() as Promise<T>;
+  return res;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  return (await requestRaw(path, init)).json() as Promise<T>;
 }
 
 export interface AuthStatusResponse {
@@ -152,6 +157,12 @@ export const gatewayApi = {
 
   listProxies: () => request<{ proxies: ProxyView[] }>("/proxies"),
 
+  importProxySubscription: (url: string) =>
+    request<ProxyImportResult>("/proxies/import", {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    }),
+
   createProxy: (payload: Record<string, unknown>) =>
     request<{ status: string; name: string }>("/proxies", {
       method: "POST",
@@ -199,6 +210,12 @@ export const gatewayApi = {
       method: "DELETE",
     }),
 
+  refreshUpstreamQuota: (name: string) =>
+    request<{ quota: import("../types/gateway").QuotaSnapshot }>(
+      `/upstreams/${encodeURIComponent(name)}/quota/refresh`,
+      { method: "POST" },
+    ),
+
   fetchModelsAdhoc: (payload: {
     base_url: string;
     models_path?: string;
@@ -243,6 +260,18 @@ export const gatewayApi = {
         method: "POST",
       }
     ),
+
+  listPlaygroundModels: (signal?: AbortSignal) =>
+    request<{ data: { id: string }[] }>("/playground/models", { signal }),
+
+  streamPlaygroundChat: (
+    model: string,
+    messages: { role: "user" | "assistant"; content: string }[]
+  ) =>
+    requestRaw("/playground/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model, messages, stream: true }),
+    }),
 
   listKeys: () => request<ClientKeysResponse>("/keys"),
 

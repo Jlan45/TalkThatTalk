@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,10 +10,10 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 use ttt_auth::{
-    build_authorize_url, generate_state, parse_authorization_input, OAuthHttpClient, PkceChallenge,
-    StoredOAuthToken, TokenStore,
+    OAuthHttpClient, PkceChallenge, TokenStore, build_authorize_url, generate_state,
+    parse_authorization_input,
 };
 use ttt_control::GatewayDb;
 use ttt_core::{GatewayConfig, GatewayError, OAuthPreset, UpstreamAuthConfig};
@@ -42,8 +41,6 @@ pub async fn run_auth_login(
         authorize_url,
         device_code_url,
         token_url,
-        client_id,
-        client_secret,
         scopes,
         redirect_uri,
         token_request_format,
@@ -57,6 +54,8 @@ pub async fn run_auth_login(
     };
 
     let defaults = preset.and_then(OAuthPreset::defaults);
+    let (client_id, client_secret) = upstream.auth.oauth_credentials();
+    let client_secret = UpstreamAuthConfig::oauth_client_secret(*preset, client_secret.as_deref())?;
     let format = UpstreamAuthConfig::effective_token_format(*preset, *token_request_format);
     let token_url = token_url
         .as_deref()
@@ -68,7 +67,6 @@ pub async fn run_auth_login(
         })?;
     let client_id = client_id
         .as_deref()
-        .or_else(|| defaults.map(|d| d.client_id))
         .ok_or_else(|| {
             GatewayError::Config(format!(
                 "upstream '{upstream_name}' missing oauth client_id"
@@ -133,7 +131,7 @@ pub async fn run_auth_login(
             &resolved_scopes,
             &state,
             &pkce,
-            &[],
+            preset.map_or(&[][..], OAuthPreset::authorization_params),
         )?;
 
         println!("\n=== TalkThatTalk OAuth PKCE Login ({upstream_name}) ===");
@@ -169,30 +167,27 @@ pub async fn run_auth_login(
                 &pkce.verifier,
                 redirect_uri,
                 client_id,
-                client_secret.as_deref(),
+                client_secret,
                 state_param,
             )
             .await?
     };
 
-    TokenStore::put(
-        &db,
-        acct_id,
-        StoredOAuthToken {
-            access_token: token.access_token,
-            refresh_token: token.refresh_token.clone(),
-            expires_at: token.expires_at,
-            token_type: token.token_type,
-            scope: token.scope,
-            extra: HashMap::new(),
-        },
-    )?;
+    let record = client.complete_login(upstream, token).await?;
+    let has_refresh = record.refresh_token.is_some();
+    let expires_at = record.expires_at;
+    let project_id_pending = *preset == Some(OAuthPreset::Antigravity)
+        && record.antigravity_project_id().is_none();
+    TokenStore::put(&db, acct_id, record)?;
 
     println!(
         "Successfully authenticated '{upstream_name}' (account_id='{acct_id}', refresh_token={}, expires_at={:?}).",
-        token.refresh_token.is_some(),
-        token.expires_at
+        has_refresh,
+        expires_at
     );
+    if project_id_pending {
+        println!("Antigravity Project ID 尚未发现，模型请求会重新查询。");
+    }
     Ok(())
 }
 

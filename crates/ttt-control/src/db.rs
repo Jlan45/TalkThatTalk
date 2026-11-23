@@ -11,7 +11,9 @@ use base64::Engine;
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use ttt_auth::{StoredOAuthToken, TokenStore};
-use ttt_core::{ClientKeyConfig, GatewayError, OAuthStorageConfig, ProxyConfig, UpstreamConfig};
+use ttt_core::{
+    ClientKeyConfig, GatewayError, OAuthStorageConfig, ProxyConfig, QuotaSnapshot, UpstreamConfig,
+};
 
 use crate::metrics::RequestLogEntry;
 
@@ -143,7 +145,7 @@ impl GatewayDb {
     }
 
     // =========================================================================
-    // Outbound Proxies (AES-256-GCM encrypted JSON blobs for embedded `leaf`)
+    // Outbound Proxies (AES-256-GCM encrypted JSON blobs)
     // =========================================================================
 
     pub fn list_proxies(&self) -> Result<Vec<ProxyConfig>, GatewayError> {
@@ -176,25 +178,51 @@ impl GatewayDb {
     }
 
     pub fn upsert_proxy(&self, proxy: &ProxyConfig) -> Result<(), GatewayError> {
-        let plain = serde_json::to_vec(proxy)
-            .map_err(|e| GatewayError::Internal(format!("failed to encode proxy: {e}")))?;
-        let (nonce, ct) = encrypt_bytes(&self.master_key, &plain)?;
-        let now = now_secs() as i64;
-
         let conn = self
             .conn
             .lock()
             .map_err(|_| GatewayError::Internal("db mutex poisoned".into()))?;
-        conn.execute(
+        self.write_proxy(&conn, proxy, true)
+    }
+
+    pub(crate) fn insert_proxies(&self, proxies: &[&ProxyConfig]) -> Result<(), GatewayError> {
+        if proxies.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| GatewayError::Internal("db mutex poisoned".into()))?;
+        let tx = conn.transaction().map_err(db_err)?;
+        for proxy in proxies {
+            self.write_proxy(&tx, proxy, false)?;
+        }
+        tx.commit().map_err(db_err)
+    }
+
+    fn write_proxy(
+        &self,
+        conn: &Connection,
+        proxy: &ProxyConfig,
+        overwrite: bool,
+    ) -> Result<(), GatewayError> {
+        let plain = serde_json::to_vec(proxy)
+            .map_err(|e| GatewayError::Internal(format!("failed to encode proxy: {e}")))?;
+        let (nonce, ct) = encrypt_bytes(&self.master_key, &plain)?;
+        let written = conn.execute(
             "INSERT INTO proxies (name, nonce, ciphertext, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?4)
              ON CONFLICT(name) DO UPDATE SET
                nonce = excluded.nonce,
                ciphertext = excluded.ciphertext,
-               updated_at = excluded.updated_at",
-            params![proxy.name, nonce, ct, now],
+               updated_at = excluded.updated_at
+             WHERE ?5",
+            params![proxy.name, nonce, ct, now_secs() as i64, overwrite],
         )
         .map_err(db_err)?;
+        if written == 0 {
+            return Err(GatewayError::Internal("代理名称在导入期间被占用".into()));
+        }
         Ok(())
     }
 
@@ -895,6 +923,59 @@ impl GatewayDb {
             .map_err(db_err)?;
         Ok(affected > 0)
     }
+
+    pub fn upsert_quota_snapshot(&self, snap: &QuotaSnapshot) -> Result<(), GatewayError> {
+        let json = serde_json::to_string(snap)
+            .map_err(|e| GatewayError::Internal(format!("failed to encode quota snapshot: {e}")))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| GatewayError::Internal("db mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO quota_snapshots (upstream, payload_json, fetched_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(upstream) DO UPDATE SET
+               payload_json = excluded.payload_json,
+               fetched_at = excluded.fetched_at",
+            params![snap.upstream, json, snap.fetched_at],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn list_quota_snapshots(&self) -> Result<HashMap<String, QuotaSnapshot>, GatewayError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| GatewayError::Internal("db mutex poisoned".into()))?;
+        let mut stmt = conn
+            .prepare("SELECT upstream, payload_json FROM quota_snapshots")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(db_err)?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (name, json) = row.map_err(db_err)?;
+            if let Ok(snap) = serde_json::from_str::<QuotaSnapshot>(&json) {
+                map.insert(name, snap);
+            }
+        }
+        Ok(map)
+    }
+
+    pub fn delete_quota_snapshot(&self, upstream: &str) -> Result<(), GatewayError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| GatewayError::Internal("db mutex poisoned".into()))?;
+        conn.execute(
+            "DELETE FROM quota_snapshots WHERE upstream = ?1",
+            params![upstream],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
 }
 
 /// Implement `ttt_auth::TokenStore` directly on SQLite (`oauth_tokens` table, AES-256-GCM encrypted).
@@ -1056,6 +1137,12 @@ fn init_schema(conn: &Connection) -> Result<(), GatewayError> {
              input_tokens INTEGER NOT NULL,
              output_tokens INTEGER NOT NULL,
              total_tokens INTEGER NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS quota_snapshots (
+             upstream TEXT PRIMARY KEY,
+             payload_json TEXT NOT NULL,
+             fetched_at INTEGER NOT NULL
          );",
     )
     .map_err(db_err)?;
@@ -1201,6 +1288,7 @@ mod tests {
             max_retries: 1,
             owner_user_id: None,
             proxy: None,
+            quota: None,
         };
         db.upsert_upstream(&up).unwrap();
         let list = db.list_upstreams().unwrap();

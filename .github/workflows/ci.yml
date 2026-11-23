@@ -1,0 +1,99 @@
+name: Build and release
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_TOOLCHAIN: 1.97.1
+      PNPM_VERSION: 10.24.0
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install Rust and pnpm
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          npm install --global "pnpm@$PNPM_VERSION"
+      - name: Build web console
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: Check shell scripts
+        run: bash -n scripts/install.sh && bash -n scripts/uninstall.sh
+      - name: Test workspace
+        if: github.ref_type != 'tag'
+        run: cargo +"$RUST_TOOLCHAIN" test --workspace --locked
+      - name: Package release
+        if: github.ref_type == 'tag'
+        run: |
+          cargo +"$RUST_TOOLCHAIN" build --release --locked --bin talkthattalk
+          test "$(target/release/talkthattalk --version)" = "talkthattalk ${GITHUB_REF_NAME#v}"
+          mkdir -p release
+          tar -C target/release -czf "release/talkthattalk-linux-$ARCH.tar.gz" talkthattalk
+      - uses: actions/upload-artifact@v7
+        if: github.ref_type == 'tag'
+        with:
+          name: talkthattalk-linux-${{ matrix.arch }}
+          path: release/talkthattalk-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: talkthattalk-linux-*
+          path: release
+          merge-multiple: true
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp scripts/install.sh scripts/uninstall.sh release/
+          cd release
+          sha256sum talkthattalk-linux-x86_64.tar.gz talkthattalk-linux-aarch64.tar.gz install.sh uninstall.sh > SHA256SUMS
+          assets=(talkthattalk-linux-x86_64.tar.gz talkthattalk-linux-aarch64.tar.gz install.sh uninstall.sh SHA256SUMS)
+          draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null || true)
+          if [[ "$draft" == false ]]; then
+            exit 0
+          elif [[ "$draft" == true ]]; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" --verify-tag --draft --generate-notes
+          fi
+          gh release edit "$GITHUB_REF_NAME" --draft=false

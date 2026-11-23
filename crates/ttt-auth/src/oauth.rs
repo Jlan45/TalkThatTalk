@@ -7,7 +7,7 @@ use arc_swap::ArcSwap;
 use http::header::{HeaderName, HeaderValue};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
-use ttt_core::{GatewayError, OAuthPreset, TokenRequestFormat};
+use ttt_core::{GatewayError, OAuthPreset, TokenRequestFormat, UpstreamAuthConfig};
 
 use crate::client::OAuthHttpClient;
 use crate::store::{StoredOAuthToken, TokenStore};
@@ -20,6 +20,7 @@ pub struct OAuthTokenState {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: Option<u64>,
+    pub antigravity_project_id: Option<String>,
     /// Pre-formatted header value for O(1) zero-alloc hot-path reads.
     pub header_value: HeaderValue,
 }
@@ -48,6 +49,19 @@ pub struct RefreshedToken {
     pub expires_at: Option<u64>,
     pub token_type: Option<String>,
     pub scope: Option<String>,
+}
+
+impl RefreshedToken {
+    pub(crate) fn into_stored(self) -> StoredOAuthToken {
+        StoredOAuthToken {
+            access_token: self.access_token,
+            refresh_token: self.refresh_token,
+            expires_at: self.expires_at,
+            token_type: self.token_type,
+            scope: self.scope,
+            extra: HashMap::new(),
+        }
+    }
 }
 
 /// Lock-free OAuth token manager with Singleflight refresh coalescing and encrypted persistence.
@@ -82,6 +96,10 @@ impl OAuthTokenManager {
             None => None,
         };
 
+        let antigravity_project_id = stored
+            .as_ref()
+            .and_then(StoredOAuthToken::antigravity_project_id)
+            .map(str::to_owned);
         let (access_token, refresh_token, expires_at) = match stored {
             Some(tok) => (
                 tok.access_token,
@@ -106,6 +124,7 @@ impl OAuthTokenManager {
             access_token,
             refresh_token,
             expires_at,
+            antigravity_project_id,
             header_value,
         };
 
@@ -161,49 +180,97 @@ impl OAuthTokenManager {
         }
         let guard = self.state.load();
         let has_refresh_token = guard.refresh_token.is_some();
+        if self.meta.preset == Some(OAuthPreset::Antigravity) {
+            return has_refresh_token
+                && self.meta.client_id.is_some()
+                && UpstreamAuthConfig::oauth_client_secret(
+                    self.meta.preset,
+                    self.meta.client_secret.as_deref(),
+                )
+                .is_ok();
+        }
         let has_client_creds =
             self.meta.client_id.is_some() && self.meta.client_secret.is_some();
         has_refresh_token || has_client_creds
     }
 
-    /// Atomically replace the active token in memory and persist it encrypted to disk.
-    pub fn update_token(&self, refreshed: RefreshedToken) -> Result<u64, GatewayError> {
-        let current = self.state.load();
-        let next_gen = current.generation.wrapping_add(1);
-        let header_value = build_header_value(self.prefix.as_deref(), &refreshed.access_token)?;
+    pub async fn install_login(&self, record: StoredOAuthToken) -> Result<(), GatewayError> {
+        let _guard = self.refresh_lock.lock().await;
+        self.replace_token(record, true)
+    }
 
-        let merged_refresh = refreshed
-            .refresh_token
-            .or_else(|| current.refresh_token.clone());
-
+    fn replace_token(
+        &self,
+        record: StoredOAuthToken,
+        require_persistence: bool,
+    ) -> Result<(), GatewayError> {
         let next = OAuthTokenState {
-            generation: next_gen,
-            access_token: refreshed.access_token.clone(),
-            refresh_token: merged_refresh.clone(),
-            expires_at: refreshed.expires_at,
-            header_value,
+            generation: self.state.load().generation.wrapping_add(1),
+            access_token: record.access_token.clone(),
+            refresh_token: record.refresh_token.clone(),
+            expires_at: record.expires_at,
+            antigravity_project_id: record.antigravity_project_id().map(str::to_owned),
+            header_value: build_header_value(self.prefix.as_deref(), &record.access_token)?,
         };
-        self.state.store(Arc::new(next));
-
-        if let Some(store) = &self.store {
-            let record = StoredOAuthToken {
-                access_token: refreshed.access_token,
-                refresh_token: merged_refresh,
-                expires_at: refreshed.expires_at,
-                token_type: refreshed.token_type,
-                scope: refreshed.scope,
-                extra: HashMap::new(),
-            };
-            if let Err(err) = store.put(&self.meta.account_id, record) {
-                warn!(
-                    account_id = %self.meta.account_id,
-                    error = %err,
-                    "refreshed OAuth token in memory, but failed to persist to encrypted store"
-                );
+        if let Some(store) = &self.store
+            && let Err(err) = store.put(&self.meta.account_id, record)
+        {
+            if require_persistence {
+                return Err(err);
             }
+            warn!(account_id = %self.meta.account_id, error = %err, "failed to persist refreshed OAuth token");
+        }
+        self.state.store(Arc::new(next));
+        Ok(())
+    }
+
+    pub async fn antigravity_session(
+        &self,
+        endpoint: &str,
+    ) -> Result<Arc<OAuthTokenState>, GatewayError> {
+        let current = self.current_state();
+        if current.antigravity_project_id.is_some() {
+            return Ok(current);
+        }
+        if self.needs_proactive_refresh() && self.can_refresh() {
+            self.refresh_via_http(current.generation).await?;
         }
 
-        Ok(next_gen)
+        let _guard = self.refresh_lock.lock().await;
+        let current = self.current_state();
+        if current.antigravity_project_id.is_some() {
+            return Ok(current);
+        }
+        if current.access_token.is_empty() {
+            return Err(GatewayError::Auth("请先授权 Antigravity 渠道".into()));
+        }
+        let project = self
+            .http_client
+            .discover_antigravity_project(endpoint, &current.access_token)
+            .await?;
+        if let Some(store) = &self.store {
+            let mut record =
+                store
+                    .get(&self.meta.account_id)?
+                    .unwrap_or_else(|| StoredOAuthToken {
+                        access_token: current.access_token.clone(),
+                        refresh_token: current.refresh_token.clone(),
+                        expires_at: current.expires_at,
+                        token_type: None,
+                        scope: None,
+                        extra: HashMap::new(),
+                    });
+            if record.access_token == current.access_token {
+                record.set_antigravity_project_id(project.clone());
+                store.put(&self.meta.account_id, record)?;
+            }
+        }
+        let updated = Arc::new(OAuthTokenState {
+            antigravity_project_id: Some(project),
+            ..(*current).clone()
+        });
+        self.state.store(updated.clone());
+        Ok(updated)
     }
 
     /// Perform an HTTP token refresh (either `refresh_token` or `client_credentials`)
@@ -220,6 +287,10 @@ impl OAuthTokenManager {
                     meta.account_id
                 ))
             })?;
+            let client_secret = UpstreamAuthConfig::oauth_client_secret(
+                meta.preset,
+                meta.client_secret.as_deref(),
+            )?;
 
             if let Some(rt) = maybe_rt {
                 info!(
@@ -233,12 +304,14 @@ impl OAuthTokenManager {
                         meta.token_format,
                         &rt,
                         meta.client_id.as_deref(),
-                        meta.client_secret.as_deref(),
+                        client_secret,
                         &meta.scopes,
                     )
                     .await
+            } else if meta.preset == Some(OAuthPreset::Antigravity) {
+                Err(GatewayError::Auth("Antigravity 缺少 refresh token，请重新授权".into()))
             } else if let (Some(cid), Some(secret)) =
-                (meta.client_id.as_deref(), meta.client_secret.as_deref())
+                (meta.client_id.as_deref(), client_secret)
             {
                 info!(
                     account_id = %meta.account_id,
@@ -278,8 +351,16 @@ impl OAuthTokenManager {
             });
         }
 
-        let refreshed = refresh_fn(self.meta.clone(), current.refresh_token.clone()).await?;
-        self.update_token(refreshed)?;
+        let mut record = refresh_fn(self.meta.clone(), current.refresh_token.clone())
+            .await?
+            .into_stored();
+        record.refresh_token = record
+            .refresh_token
+            .or_else(|| current.refresh_token.clone());
+        if let Some(project) = &current.antigravity_project_id {
+            record.set_antigravity_project_id(project.clone());
+        }
+        self.replace_token(record, false)?;
 
         let updated = self.state.load();
         Ok(Credential {

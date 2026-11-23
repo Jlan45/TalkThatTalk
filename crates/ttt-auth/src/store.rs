@@ -27,6 +27,16 @@ pub struct StoredOAuthToken {
     pub extra: HashMap<String, String>,
 }
 
+impl StoredOAuthToken {
+    pub fn antigravity_project_id(&self) -> Option<&str> {
+        self.extra.get("project_id").map(String::as_str)
+    }
+
+    pub(crate) fn set_antigravity_project_id(&mut self, project_id: String) {
+        self.extra.insert("project_id".into(), project_id);
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct EncryptedEnvelope {
     version: u8,

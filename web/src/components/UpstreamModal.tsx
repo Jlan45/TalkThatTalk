@@ -1,13 +1,20 @@
 import { useEffect, useMemo, useState } from "react";
 import { gatewayApi } from "../api/client";
-import type { OAuthPreset, ProtocolFamily, ProxyView, UpstreamView } from "../types/gateway";
+import type {
+  OAuthPreset,
+  ProtocolFamily,
+  ProxyView,
+  QuotaMonitorConfig,
+  QuotaProbeKind,
+  UpstreamView,
+} from "../types/gateway";
 import { IconCopy, IconExternal, IconRefresh } from "./Icons";
 import { ProviderLogo, type ProviderLogoId } from "./ProviderLogos";
 
 interface Props {
   initial?: UpstreamView | null;
   onClose: () => void;
-  onSaved: () => void;
+  onSaved: (authorizeUpstream?: string) => void;
 }
 
 type AuthMode = "api_key" | "oauth";
@@ -47,6 +54,7 @@ const ALL_PROTOCOLS: { value: ProtocolFamily; label: string; defaultEndpoint: st
   { value: "openai_responses", label: "OpenAI Responses", defaultEndpoint: "/v1/responses" },
   { value: "anthropic", label: "Anthropic Messages", defaultEndpoint: "/v1/messages" },
   { value: "gemini", label: "Google Gemini", defaultEndpoint: "/v1beta" },
+  { value: "antigravity", label: "Google Antigravity", defaultEndpoint: "/v1internal:generateContent" },
 ];
 
 const PROVIDER_CATALOG: ProviderCatalogItem[] = [
@@ -100,6 +108,35 @@ const PROVIDER_CATALOG: ProviderCatalogItem[] = [
       tokenUrl: "https://console.anthropic.com/v1/oauth/token",
       redirectUri: "https://console.anthropic.com/oauth/code/callback",
       scopes: ["org:create_api_key", "user:profile", "user:inference"],
+    },
+  },
+  {
+    id: "antigravity-oauth",
+    title: "Antigravity",
+    badge: "OAuth 2.0",
+    logo: "gemini",
+    desc: "Google Cloud Code Assist OAuth，支持 Gemini / Claude 模型与额度监控",
+    authMode: "oauth",
+    defaultName: "antigravity-oauth",
+    baseUrl: "https://daily-cloudcode-pa.googleapis.com",
+    modelsPath: "/v1internal:fetchAvailableModels",
+    protocolEndpoints: [{ protocol: "antigravity", endpoint: "/v1internal:generateContent" }],
+    headerName: "authorization",
+    headerPrefix: "Bearer ",
+    suggestedModels: [],
+    oauth: {
+      preset: "antigravity",
+      accountId: "antigravity-main",
+      authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+      tokenUrl: "https://oauth2.googleapis.com/token",
+      redirectUri: "http://localhost:51121/oauth-callback",
+      scopes: [
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "https://www.googleapis.com/auth/cclog",
+        "https://www.googleapis.com/auth/experimentsandconfigs",
+      ],
     },
   },
   {
@@ -343,6 +380,7 @@ function initialEndpoints(initial?: UpstreamView | null): EndpointRow[] {
 
 function inferDefaultModelsPath(initial?: UpstreamView | null): string {
   if (!initial) return "/v1/models";
+  if (initial.oauth?.preset === "antigravity") return "/v1internal:fetchAvailableModels";
   if (initial.oauth?.preset === "codex" || initial.base_url.includes("backend-api/codex")) {
     return "/models?client_version=1.0.0";
   }
@@ -386,6 +424,26 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
   const [name, setName] = useState(initial?.name ?? "");
   const [baseUrl, setBaseUrl] = useState(initial?.base_url ?? "https://api.openai.com");
   const [proxyName, setProxyName] = useState(initial?.proxy ?? "");
+  const [quotaEnabled, setQuotaEnabled] = useState(initial?.quota_config?.enabled ?? true);
+  const [quotaProbe, setQuotaProbe] = useState<QuotaProbeKind>(
+    initial?.quota_config?.probe ?? "auto",
+  );
+  const [quotaPollSecs, setQuotaPollSecs] = useState(
+    String(initial?.quota_config?.poll_interval_secs ?? 300),
+  );
+  const [quotaAccountId, setQuotaAccountId] = useState(
+    initial?.quota_config?.chatgpt_account_id ?? "",
+  );
+  const [quotaCustomUrl, setQuotaCustomUrl] = useState(initial?.quota_config?.custom_url ?? "");
+  const [quotaRemainingPath, setQuotaRemainingPath] = useState(
+    initial?.quota_config?.remaining_path ?? "",
+  );
+  const [quotaUsedPath, setQuotaUsedPath] = useState(initial?.quota_config?.used_path ?? "");
+  const [quotaTotalPath, setQuotaTotalPath] = useState(initial?.quota_config?.total_path ?? "");
+  const [quotaScale, setQuotaScale] = useState(
+    initial?.quota_config?.scale != null ? String(initial.quota_config.scale) : "",
+  );
+  const [quotaCurrency, setQuotaCurrency] = useState(initial?.quota_config?.currency ?? "USD");
   const [availableProxies, setAvailableProxies] = useState<ProxyView[]>([]);
   const [endpoints, setEndpoints] = useState<EndpointRow[]>(() => initialEndpoints(initial));
   const [authMode, setAuthMode] = useState<AuthMode>(initial?.auth_mode ?? "api_key");
@@ -419,8 +477,9 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
   const [accountId, setAccountId] = useState(initial?.oauth?.account_id ?? "");
   const [authorizeUrl, setAuthorizeUrl] = useState("");
   const [tokenUrl, setTokenUrl] = useState("");
-  const [clientId, setClientId] = useState("");
-  const [redirectUri, setRedirectUri] = useState("");
+  const [clientId, setClientId] = useState(initial?.oauth?.client_id ?? "");
+  const [clientSecret, setClientSecret] = useState("");
+  const [redirectUri, setRedirectUri] = useState(initial?.oauth?.redirect_uri ?? "");
   const [scopesText, setScopesText] = useState("");
   const [accessToken, setAccessToken] = useState("");
   const [refreshToken, setRefreshToken] = useState("");
@@ -435,8 +494,14 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const isOfficialOAuth =
-    authMode === "oauth" && (preset === "codex" || preset === "claude_code");
+  const isAntigravity = authMode === "oauth" && preset === "antigravity";
+  const authorizeAntigravity = isAntigravity && (
+    !initial?.oauth?.token_present ||
+    Boolean(clientSecret.trim()) ||
+    clientId.trim() !== (initial.oauth.client_id ?? "") ||
+    redirectUri.trim() !== (initial.oauth.redirect_uri ?? "")
+  );
+  const isOfficialOAuth = authMode === "oauth" && (preset === "codex" || preset === "claude_code");
 
   const fetchOfficialAuthUrl = async (targetPreset: "codex" | "claude_code") => {
     setLoadingAuthUrl(true);
@@ -460,7 +525,11 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
   }, []);
 
   useEffect(() => {
-    if (step === 2 && isOfficialOAuth && (preset === "codex" || preset === "claude_code")) {
+    if (
+      step === 2 &&
+      isOfficialOAuth &&
+      (preset === "codex" || preset === "claude_code")
+    ) {
       setOfficialCallbackInput("");
       void fetchOfficialAuthUrl(preset);
     }
@@ -520,6 +589,8 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
     if (item.oauth) {
       setPreset(item.oauth.preset);
       setAccountId(item.oauth.accountId);
+      setClientId("");
+      setClientSecret("");
       setAuthorizeUrl(item.oauth.authorizeUrl);
       setTokenUrl(item.oauth.tokenUrl);
       setRedirectUri(item.oauth.redirectUri);
@@ -542,6 +613,10 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
   const handleFetchModels = async () => {
     setError(null);
     setFetchInfo(null);
+    if (isAntigravity && !initial?.oauth?.token_present) {
+      setError("请先保存并授权 Antigravity 渠道，再获取模型");
+      return;
+    }
     setFetchingModels(true);
     try {
       const firstKey = apiKeys.map((k) => k.trim()).find(Boolean);
@@ -579,7 +654,9 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
 
       setFetchedModels(res.models);
       if (res.models.length > 0) {
-        setSelectedModels((prev) => Array.from(new Set([...prev.filter((m) => m !== "*"), ...res.models])));
+        setSelectedModels((prev) => isAntigravity
+          ? res.models
+          : Array.from(new Set([...prev.filter((m) => m !== "*"), ...res.models])));
         setFetchInfo(`已从 ${res.url} 获取到 ${res.models.length} 个模型`);
       } else {
         setFetchInfo(`请求 ${res.url} 成功，但未返回模型条目`);
@@ -614,7 +691,6 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
       setError("渠道名称不能为空");
       return;
     }
-
     let model_mapping: Record<string, string> = {};
     if (mappingText.trim()) {
       try {
@@ -656,13 +732,18 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
             header_name: headerName.trim() || "authorization",
             prefix: headerPrefix ? headerPrefix : null,
           }
-        : isOfficialOAuth
+        : isOfficialOAuth || isAntigravity
           ? {
               type: "oauth",
               preset,
               account_id: accountId.trim() || name.trim(),
               header_name: "authorization",
               prefix: "Bearer ",
+              ...(isAntigravity && {
+                client_id: clientId.trim() || null,
+                client_secret: clientSecret.trim() || null,
+                redirect_uri: redirectUri.trim() || null,
+              }),
             }
           : {
               type: "oauth",
@@ -702,6 +783,23 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
 
     const [primaryProtocol] = endpointPairs[0] as [ProtocolFamily, string];
 
+    const quota: QuotaMonitorConfig | null =
+      !quotaEnabled || quotaProbe !== "auto" || quotaAccountId.trim() || quotaCustomUrl.trim()
+        ? {
+            enabled: quotaEnabled,
+            probe: quotaProbe,
+            poll_interval_secs: Math.max(60, Number(quotaPollSecs) || 300),
+            chatgpt_account_id: quotaAccountId.trim() || null,
+            custom_url: quotaCustomUrl.trim() || null,
+            custom_headers: initial?.quota_config?.custom_headers ?? {},
+            remaining_path: quotaRemainingPath.trim() || null,
+            used_path: quotaUsedPath.trim() || null,
+            total_path: quotaTotalPath.trim() || null,
+            scale: quotaScale.trim() ? Number(quotaScale) || 1 : null,
+            currency: quotaCurrency.trim() || null,
+          }
+        : null;
+
     const payload = {
       name: name.trim(),
       base_url: baseUrl.trim(),
@@ -716,6 +814,7 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
       default_cooldown_secs: 30,
       max_retries: Math.max(0, Number(maxRetries) || 0),
       proxy: proxyName.trim() || null,
+      quota,
     };
 
     setSaving(true);
@@ -733,7 +832,7 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
           officialAuthState
         );
       }
-      onSaved();
+      onSaved(authorizeAntigravity ? initial?.name ?? name.trim() : undefined);
       onClose();
     } catch (e) {
       setError((e as Error).message);
@@ -959,6 +1058,129 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
                   </div>
                 </div>
 
+                <div
+                  style={{
+                    border: "1px solid var(--border)",
+                    borderRadius: 10,
+                    padding: 12,
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 10,
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span className="form-label" style={{ margin: 0 }}>
+                      额度监控（Claude / Codex / 自定义）
+                    </span>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                      <input
+                        type="checkbox"
+                        checked={quotaEnabled}
+                        onChange={(e) => setQuotaEnabled(e.target.checked)}
+                      />
+                      启用轮询
+                    </label>
+                  </div>
+                  {quotaEnabled && (
+                    <div className="form-grid">
+                      <div className="form-field">
+                        <label className="form-label">探测模式</label>
+                        <select
+                          className="select"
+                          value={quotaProbe}
+                          onChange={(e) => setQuotaProbe(e.target.value as QuotaProbeKind)}
+                        >
+                          <option value="auto">自动识别</option>
+                          <option value="claude_code">Claude Code（/api/oauth/usage）</option>
+                          <option value="codex">Codex（/backend-api/wham/usage）</option>
+                          <option value="antigravity">Antigravity（fetchAvailableModels）</option>
+                          <option value="opencode_go">OpenCode Go</option>
+                          <option value="custom_http">自定义 HTTP JSON</option>
+                        </select>
+                      </div>
+                      <div className="form-field">
+                        <label className="form-label">轮询周期（秒，最低 60）</label>
+                        <input
+                          className="input"
+                          type="number"
+                          min={60}
+                          value={quotaPollSecs}
+                          onChange={(e) => setQuotaPollSecs(e.target.value)}
+                        />
+                      </div>
+                      {(quotaProbe === "codex" || (quotaProbe === "auto" && authMode === "oauth" && preset === "codex")) && (
+                        <div className="form-field full">
+                          <label className="form-label">ChatGPT-Account-Id（可选，默认自动从 JWT 解析）</label>
+                          <input
+                            className="input"
+                            placeholder="留空自动提取"
+                            value={quotaAccountId}
+                            onChange={(e) => setQuotaAccountId(e.target.value)}
+                          />
+                        </div>
+                      )}
+                      {quotaProbe === "custom_http" && (
+                        <>
+                          <div className="form-field full">
+                            <label className="form-label">查询 URL（支持 {"{{api_key}}"}）</label>
+                            <input
+                              className="input"
+                              placeholder="https://api.example.com/v1/usage"
+                              value={quotaCustomUrl}
+                              onChange={(e) => setQuotaCustomUrl(e.target.value)}
+                            />
+                          </div>
+                          <div className="form-field">
+                            <label className="form-label">剩余额度 JSON 路径</label>
+                            <input
+                              className="input"
+                              placeholder="data.remain_quota"
+                              value={quotaRemainingPath}
+                              onChange={(e) => setQuotaRemainingPath(e.target.value)}
+                            />
+                          </div>
+                          <div className="form-field">
+                            <label className="form-label">已用额度 JSON 路径</label>
+                            <input
+                              className="input"
+                              placeholder="data.used_quota"
+                              value={quotaUsedPath}
+                              onChange={(e) => setQuotaUsedPath(e.target.value)}
+                            />
+                          </div>
+                          <div className="form-field">
+                            <label className="form-label">总额度 JSON 路径</label>
+                            <input
+                              className="input"
+                              placeholder="data.total_quota"
+                              value={quotaTotalPath}
+                              onChange={(e) => setQuotaTotalPath(e.target.value)}
+                            />
+                          </div>
+                          <div className="form-field">
+                            <label className="form-label">换算系数 / 币种</label>
+                            <div style={{ display: "flex", gap: 6 }}>
+                              <input
+                                className="input"
+                                placeholder="1"
+                                value={quotaScale}
+                                onChange={(e) => setQuotaScale(e.target.value)}
+                              />
+                              <input
+                                className="input"
+                                style={{ width: 80 }}
+                                placeholder="USD"
+                                value={quotaCurrency}
+                                onChange={(e) => setQuotaCurrency(e.target.value)}
+                              />
+                            </div>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+
                 {!isOfficialOAuth && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                     <label className="form-label">协议端点（Endpoints）</label>
@@ -1124,6 +1346,41 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
                       />
                     </div>
                   </div>
+                ) : isAntigravity ? (
+                  <div className="form-grid">
+                    <div className="form-field">
+                      <label className="form-label" htmlFor="antigravity-client-id">Google OAuth Client ID</label>
+                      <input
+                        id="antigravity-client-id"
+                        className="input mono"
+                        value={clientId}
+                        onChange={(e) => setClientId(e.target.value)}
+                        placeholder="留空使用服务端配置"
+                      />
+                    </div>
+                    <div className="form-field">
+                      <label className="form-label" htmlFor="antigravity-client-secret">Google OAuth Client Secret</label>
+                      <input
+                        id="antigravity-client-secret"
+                        className="input mono"
+                        type="password"
+                        autoComplete="off"
+                        value={clientSecret}
+                        onChange={(e) => setClientSecret(e.target.value)}
+                        placeholder={initial?.oauth?.has_client_secret ? "已保存，留空保留" : "留空使用服务端配置"}
+                      />
+                    </div>
+                    <div className="form-field full">
+                      <label className="form-label" htmlFor="antigravity-redirect-uri">Redirect URI（可选）</label>
+                      <input
+                        id="antigravity-redirect-uri"
+                        className="input mono"
+                        value={redirectUri}
+                        onChange={(e) => setRedirectUri(e.target.value)}
+                        placeholder="http://localhost:51121/oauth-callback"
+                      />
+                    </div>
+                  </div>
                 ) : isOfficialOAuth ? (
                   <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                     <div className="form-field">
@@ -1199,6 +1456,7 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
                       >
                         <option value="codex">Codex (Form Token Endpoint)</option>
                         <option value="claude_code">Claude Code (JSON Token Endpoint)</option>
+                        <option value="antigravity">Antigravity (Google OAuth)</option>
                         <option value="custom">Custom RFC 6749</option>
                       </select>
                     </div>
@@ -1443,7 +1701,7 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
                 取消
               </button>
               <button className="btn" disabled={saving} onClick={() => void handleSubmit()}>
-                {saving ? "保存中..." : "保存"}
+                {saving ? "保存中..." : authorizeAntigravity ? "保存并授权" : "保存"}
               </button>
             </div>
           </>

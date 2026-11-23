@@ -10,10 +10,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/TalkThatTalk/TalkThatTalk"
+repository = "https://github.com/Jlan45/TalkThatTalk"
 
 [workspace.dependencies]
 # Async runtime
@@ -29,26 +29,11 @@ http-body-util = "0.1"
 hyper = { version = "1.6", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-tokio"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "=0.26.4", default-features = false }
 bytes = "1.10"
 tower-service = "0.3"
-leaf = { git = "https://github.com/eycorsican/leaf.git", default-features = false, features = [
-    "config-json",
-    "inbound-socks",
-    "outbound-direct",
-    "outbound-socks",
-    "outbound-shadowsocks",
-    "outbound-trojan",
-    "outbound-vmess",
-    "outbound-vless",
-    "outbound-tls",
-    "outbound-ws",
-    "outbound-chain",
-    "outbound-reality",
-    "ring-aead",
-    "rustls-tls",
-    "rustls-tls-ring",
-] }
+clash-lib = { git = "https://github.com/Watfaq-legacy/clash-rs.git", rev = "2f62452678211746348b97e72fee0e78b8dc1b40", default-features = false, features = ["ring", "shadowsocks"] }
 
 # Concurrency & Performance
 arc-swap = "1.7"
@@ -64,6 +49,7 @@ url = "2.5"
 # Serialization & Config
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+yaml_serde = "0.10"
 toml = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
@@ -78,6 +64,11 @@ ttt-auth = { path = "crates/ttt-auth" }
 ttt-protocol = { path = "crates/ttt-protocol" }
 ttt-proxy = { path = "crates/ttt-proxy" }
 ttt-control = { path = "crates/ttt-control" }
+
+[patch.crates-io]
+# ClashRS uses these forks for REALITY.
+rustls = { git = "https://github.com/Watfaq/rustls.git", rev = "63d10d50f2308478f366f14f9f81e378f5911e3c" }
+tokio-rustls = { git = "https://github.com/Watfaq/tokio-rustls.git", rev = "b26e3e2b7a0161d505fd12d6e545b16463f1a45f" }
 
 [profile.release]
 lto = "thin"

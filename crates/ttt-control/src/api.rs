@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,21 +18,24 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use ttt_auth::{
     build_authorize_url, generate_state, parse_authorization_input, OAuthHttpClient, PkceChallenge,
-    StoredOAuthToken, TokenStore,
+    TokenStore,
 };
 use ttt_core::{
-    ClientKeyConfig, GatewayError, OAuthPreset, ProtocolFamily, ProxyConfig, UpstreamAuthConfig,
-    UpstreamConfig,
+    ClientKeyConfig, GatewayError, OAuthPreset, ProtocolFamily, ProxyConfig, QuotaMonitorConfig,
+    QuotaSnapshot, UpstreamAuthConfig, UpstreamConfig,
 };
-use ttt_proxy::{ProxyBody, ProxyEngine};
+use ttt_proxy::{AccessPolicy, ProxyBody, ProxyEngine};
 
-use crate::db::GatewayDb;
+use crate::db::{GatewayDb, UserRecord};
 use crate::metrics::MetricsStore;
+use crate::proxy_subscription::fetch_subscription;
+use crate::quota::{QuotaMonitor, fetch_antigravity_models, resolve_probe_kind};
 
 struct PendingPkceSession {
     upstream: Option<String>,
     verifier: String,
     redirect_uri: String,
+    client_id: String,
     created_at_secs: u64,
 }
 
@@ -61,12 +64,20 @@ pub struct UpstreamView {
     pub scope: &'static str,
     pub can_manage: bool,
     pub proxy: Option<String>,
+    pub quota_config: Option<QuotaMonitorConfig>,
+    pub can_probe_quota: bool,
+    pub quota: Option<QuotaSnapshot>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TestProxyPayload {
     #[serde(default)]
     target_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImportProxyPayload {
+    url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +90,10 @@ pub struct OAuthStatusView {
     pub expires_in_secs: Option<i64>,
     pub can_login_pkce: bool,
     pub can_refresh: bool,
+    pub client_id: Option<String>,
+    pub redirect_uri: Option<String>,
+    pub has_client_secret: bool,
+    pub project_id_pending: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,9 +217,33 @@ struct CallerIdentity {
     allow_private_upstreams: bool,
     restrict_upstreams: bool,
     allowed_upstreams: Vec<String>,
+    restrict_models: bool,
+    allowed_models: Vec<String>,
 }
 
 impl CallerIdentity {
+    fn from_user(user: UserRecord) -> Self {
+        Self {
+            user_id: Some(user.id),
+            username: user.username,
+            role: user.role,
+            allow_private_upstreams: user.allow_private_upstreams,
+            restrict_upstreams: user.restrict_upstreams,
+            allowed_upstreams: user.allowed_upstreams,
+            restrict_models: user.restrict_models,
+            allowed_models: user.allowed_models,
+        }
+    }
+
+    fn into_access_policy(self) -> AccessPolicy {
+        let unrestricted = self.is_admin();
+        AccessPolicy::new(
+            self.user_id,
+            (!unrestricted && self.restrict_upstreams).then_some(self.allowed_upstreams),
+            (!unrestricted && self.restrict_models).then_some(self.allowed_models),
+        )
+    }
+
     fn is_admin(&self) -> bool {
         self.role == "admin"
     }
@@ -253,7 +292,9 @@ pub struct ControlPlane {
     db: Arc<GatewayDb>,
     engine: Arc<ProxyEngine>,
     metrics: Arc<MetricsStore>,
+    quota_monitor: Arc<QuotaMonitor>,
     pkce_sessions: Mutex<HashMap<String, PendingPkceSession>>,
+    proxy_updates: Mutex<()>,
     oauth_http: OAuthHttpClient,
 }
 
@@ -290,15 +331,19 @@ impl ControlPlane {
             && !saved_proxies.is_empty()
             && let Err(err) = engine.reload_proxies(&saved_proxies)
         {
-            tracing::warn!(error = %err, "failed to load saved proxies into embedded leaf runtime");
+            tracing::warn!(error = %err, "failed to restore Clash proxies");
         }
+        let quota_monitor = Arc::new(QuotaMonitor::new(Arc::clone(&db), Arc::clone(&engine)));
+        Arc::clone(&quota_monitor).spawn_background_loop();
         Self {
             admin_api_key: Mutex::new(effective_admin),
             sessions: Mutex::new(restored_sessions),
             db,
             engine,
             metrics,
+            quota_monitor,
             pkce_sessions: Mutex::new(HashMap::new()),
+            proxy_updates: Mutex::new(()),
             oauth_http: OAuthHttpClient::new(),
         }
     }
@@ -331,7 +376,8 @@ impl ControlPlane {
             _ => {}
         }
 
-        let caller = if self.is_auth_initialized().await {
+        let auth_initialized = self.is_auth_initialized().await;
+        let caller = if auth_initialized {
             match self.authenticate_request(req.headers()).await {
                 Some(id) => id,
                 None => {
@@ -349,12 +395,21 @@ impl ControlPlane {
                 allow_private_upstreams: true,
                 restrict_upstreams: false,
                 allowed_upstreams: Vec::new(),
+                restrict_models: false,
+                allowed_models: Vec::new(),
             }
         };
 
         let resp = match (method, path.as_str()) {
             (Method::POST, "/api/v1/auth/logout") => self.auth_logout(req.headers()).await,
             (Method::PUT, "/api/v1/auth/password") => self.auth_change_password(&caller, req).await,
+            (Method::GET, "/api/v1/playground/models")
+            | (Method::POST, "/api/v1/playground/chat/completions") => {
+                if !auth_initialized {
+                    return Ok(json_error(StatusCode::UNAUTHORIZED, "请先登录控制台"));
+                }
+                self.engine.handle_playground(req, caller.into_access_policy()).await
+            }
             (Method::GET, "/api/v1/stats") => {
                 if caller.is_admin() {
                     let snap = self.metrics.snapshot();
@@ -378,13 +433,19 @@ impl ControlPlane {
             (Method::POST, "/api/v1/keys") => self.upsert_client_key(&caller, req, true).await,
             (Method::PUT, "/api/v1/keys") => self.upsert_client_key(&caller, req, false).await,
             (Method::DELETE, "/api/v1/keys") => self.delete_client_key(&caller, req).await,
-            // Outbound proxies (embedded eycorsican/leaf)
+            // Outbound proxies
             (Method::GET, "/api/v1/proxies") => self.list_proxies(),
             (Method::POST, "/api/v1/proxies") => {
                 if !caller.is_admin() {
                     return Ok(json_error(StatusCode::FORBIDDEN, "需要管理员权限"));
                 }
                 self.create_proxy(req).await
+            }
+            (Method::POST, "/api/v1/proxies/import") => {
+                if !auth_initialized || !caller.is_admin() {
+                    return Ok(json_error(StatusCode::FORBIDDEN, "需要管理员权限"));
+                }
+                self.import_proxies(req).await
             }
             (Method::POST, p) if p.starts_with("/api/v1/proxies/") && p.ends_with("/test") => {
                 if !caller.is_admin() {
@@ -406,7 +467,7 @@ impl ControlPlane {
                     return Ok(json_error(StatusCode::FORBIDDEN, "需要管理员权限"));
                 }
                 let name = percent_decode(&p["/api/v1/proxies/".len()..]);
-                self.delete_proxy(&name)
+                self.delete_proxy(&name).await
             }
             // Admin-only routes below
             (Method::GET, "/api/v1/users") => {
@@ -462,6 +523,13 @@ impl ControlPlane {
                 let models_path = extract_query_param(req.uri().query(), "models_path")
                     .unwrap_or_else(default_models_path);
                 self.fetch_models_for_upstream(&caller, &name, &models_path).await
+            }
+            (Method::POST, p)
+                if p.starts_with("/api/v1/upstreams/") && p.ends_with("/quota/refresh") =>
+            {
+                let name =
+                    percent_decode(&p["/api/v1/upstreams/".len()..p.len() - "/quota/refresh".len()]);
+                self.refresh_upstream_quota(&caller, &name).await
             }
             (Method::PUT, p) if p.starts_with("/api/v1/upstreams/") => {
                 let name = percent_decode(&p["/api/v1/upstreams/".len()..]);
@@ -541,6 +609,7 @@ impl ControlPlane {
             .collect();
 
         let nodes = self.engine.router().all_nodes();
+        let quota_map = self.quota_monitor.snapshot_map();
         let now_ms = now_epoch_ms();
         let now_s = now_ms / 1000;
 
@@ -560,6 +629,7 @@ impl ControlPlane {
             }
             let live_node = nodes.iter().find(|n| n.name == up.name);
             let cooling_down = live_node.map(|n| n.is_cooling_down(now_ms)).unwrap_or(false);
+            let can_manage = caller.can_manage_upstream(up.owner_user_id);
 
             let (auth_mode, api_key_count, auth_header_name, auth_header_prefix, oauth_view) =
                 match &up.auth {
@@ -579,13 +649,14 @@ impl ControlPlane {
                         authorize_url,
                         redirect_uri,
                         client_id,
+                        client_secret,
                         account_id,
                         header_name,
                         prefix,
                         ..
                     } => {
                         let acct = account_id.clone().unwrap_or_else(|| up.name.clone());
-                        let (token_present, refresh_present, expires_at, can_refresh) =
+                        let (token_present, refresh_present, expires_at, can_refresh, has_project) =
                             if let Some(mgr) = live_node.and_then(|n| n.auth.oauth_manager()) {
                                 let st = mgr.current_state();
                                 (
@@ -593,9 +664,10 @@ impl ControlPlane {
                                     st.refresh_token.is_some(),
                                     st.expires_at,
                                     mgr.can_refresh(),
+                                    st.antigravity_project_id.is_some(),
                                 )
                             } else {
-                                (false, false, None, false)
+                                (false, false, None, false, false)
                             };
                         let expires_in_secs = expires_at.map(|e| (e as i64) - (now_s as i64));
                         (
@@ -615,6 +687,15 @@ impl ControlPlane {
                                         && redirect_uri.is_some()
                                         && client_id.is_some()),
                                 can_refresh,
+                                project_id_pending: *preset == Some(OAuthPreset::Antigravity)
+                                    && token_present
+                                    && !has_project,
+                                client_id: if can_manage { client_id.clone() } else { None },
+                                redirect_uri: if can_manage { redirect_uri.clone() } else { None },
+                                has_client_secret: can_manage
+                                    && client_secret
+                                        .as_deref()
+                                        .is_some_and(|secret| !secret.trim().is_empty()),
                             }),
                         )
                     }
@@ -643,8 +724,6 @@ impl ControlPlane {
             } else {
                 "global"
             };
-            let can_manage = caller.can_manage_upstream(up.owner_user_id);
-
             views.push(UpstreamView {
                 name: up.name.clone(),
                 base_url: display_base,
@@ -668,6 +747,9 @@ impl ControlPlane {
                 scope,
                 can_manage,
                 proxy: up.proxy.clone(),
+                quota_config: up.quota.clone(),
+                can_probe_quota: resolve_probe_kind(up).is_some(),
+                quota: quota_map.get(&up.name).cloned(),
             });
         }
 
@@ -762,6 +844,7 @@ impl ControlPlane {
             }
             (
                 UpstreamAuthConfig::OAuth {
+                    preset,
                     access_token,
                     refresh_token,
                     expires_at,
@@ -790,6 +873,19 @@ impl ControlPlane {
                     ..
                 },
             ) => {
+                if *preset == Some(OAuthPreset::Antigravity)
+                    && let Some(new_id) = client_id.as_deref()
+                    && Some(new_id) != old_cid.as_deref()
+                    && old_csec.as_deref().is_some_and(|secret| !secret.trim().is_empty())
+                    && client_secret
+                        .as_deref()
+                        .is_none_or(|secret| secret.trim().is_empty())
+                {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "更换 Google OAuth Client ID 时请同时填写配套的 Client Secret",
+                    );
+                }
                 if access_token.is_none() {
                     *access_token = old_at.clone();
                 }
@@ -861,23 +957,52 @@ impl ControlPlane {
         if let Err(err) = self.db.delete_upstream(name) {
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
         }
+        self.quota_monitor.remove_upstream(name);
 
         json_ok(&json!({ "status": "deleted", "name": name }))
+    }
+
+    async fn refresh_upstream_quota(
+        &self,
+        caller: &CallerIdentity,
+        name: &str,
+    ) -> Response<ProxyBody> {
+        let upstreams = match self.db.list_upstreams() {
+            Ok(v) => v,
+            Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        };
+        let Some(up) = upstreams.into_iter().find(|u| u.name == name) else {
+            return json_error(StatusCode::NOT_FOUND, &format!("upstream '{name}' not found"));
+        };
+        if !caller.is_admin() && up.owner_user_id != caller.user_id && up.owner_user_id.is_some() {
+            return json_error(StatusCode::FORBIDDEN, "无权访问该渠道额度");
+        }
+        let snap = self.quota_monitor.refresh_upstream(&up).await;
+        json_ok(&json!({ "quota": snap }))
     }
 
     async fn oauth_preset_authorize(&self, preset_str: &str) -> Response<ProxyBody> {
         let preset = match preset_str {
             "codex" => OAuthPreset::Codex,
             "claude_code" => OAuthPreset::ClaudeCode,
+            "antigravity" => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "请先保存 Antigravity 渠道的 Google OAuth 客户端凭据，再从渠道发起授权",
+                );
+            }
             _ => {
                 return json_error(
                     StatusCode::BAD_REQUEST,
-                    "unsupported official OAuth preset (expected 'codex' or 'claude_code')",
+                    "unsupported official OAuth preset (expected 'codex', 'claude_code', or 'antigravity')",
                 );
             }
         };
         let Some(defaults) = preset.defaults() else {
             return json_error(StatusCode::BAD_REQUEST, "preset has no built-in OAuth defaults");
+        };
+        let Some(client_id) = defaults.client_id else {
+            return json_error(StatusCode::BAD_REQUEST, "preset has no built-in OAuth client");
         };
 
         let scopes: Vec<String> = defaults.scopes.iter().map(|s| (*s).to_string()).collect();
@@ -885,7 +1010,7 @@ impl ControlPlane {
         let state = generate_state();
         let url = match build_authorize_url(
             defaults.authorize_url,
-            defaults.client_id,
+            client_id,
             defaults.redirect_uri,
             &scopes,
             &state,
@@ -905,6 +1030,7 @@ impl ControlPlane {
                 upstream: None,
                 verifier: pkce.verifier,
                 redirect_uri: defaults.redirect_uri.to_string(),
+                client_id: client_id.to_string(),
                 created_at_secs: now,
             },
         );
@@ -930,7 +1056,6 @@ impl ControlPlane {
         let UpstreamAuthConfig::OAuth {
             preset,
             authorize_url,
-            client_id,
             redirect_uri,
             scopes,
             ..
@@ -938,6 +1063,10 @@ impl ControlPlane {
         else {
             return json_error(StatusCode::BAD_REQUEST, "upstream is not in OAuth mode");
         };
+        let (client_id, client_secret) = up.auth.oauth_credentials();
+        if let Err(err) = UpstreamAuthConfig::oauth_client_secret(*preset, client_secret.as_deref()) {
+            return json_error(StatusCode::BAD_REQUEST, &err.to_string());
+        }
 
         let defaults = preset.and_then(OAuthPreset::defaults);
         let Some(auth_url) = authorize_url
@@ -946,10 +1075,7 @@ impl ControlPlane {
         else {
             return json_error(StatusCode::BAD_REQUEST, "upstream missing authorize_url");
         };
-        let Some(cid) = client_id
-            .as_deref()
-            .or_else(|| defaults.map(|d| d.client_id))
-        else {
+        let Some(cid) = client_id.as_deref() else {
             return json_error(StatusCode::BAD_REQUEST, "upstream missing client_id");
         };
         let Some(redir) = redirect_uri
@@ -975,7 +1101,7 @@ impl ControlPlane {
             &resolved_scopes,
             &state,
             &pkce,
-            &[],
+            preset.map_or(&[][..], OAuthPreset::authorization_params),
         ) {
             Ok(u) => u,
             Err(err) => return json_error(StatusCode::BAD_REQUEST, &err.to_string()),
@@ -990,6 +1116,7 @@ impl ControlPlane {
                 upstream: Some(upstream_name.to_string()),
                 verifier: pkce.verifier,
                 redirect_uri: redir.to_string(),
+                client_id: cid.to_string(),
                 created_at_secs: now,
             },
         );
@@ -1044,8 +1171,6 @@ impl ControlPlane {
         let UpstreamAuthConfig::OAuth {
             preset,
             token_url,
-            client_id,
-            client_secret,
             token_request_format,
             account_id,
             ..
@@ -1061,12 +1186,18 @@ impl ControlPlane {
         else {
             return json_error(StatusCode::BAD_REQUEST, "upstream missing OAuth token_url");
         };
-        let Some(cid) = client_id
-            .clone()
-            .or_else(|| defaults.map(|d| d.client_id.to_string()))
-        else {
+        let (client_id, client_secret) = up.auth.oauth_credentials();
+        let Some(cid) = client_id else {
             return json_error(StatusCode::BAD_REQUEST, "upstream missing OAuth client_id");
         };
+        if cid != session.client_id {
+            return json_error(StatusCode::BAD_REQUEST, "OAuth Client ID 已更改，请重新授权");
+        }
+        let client_secret =
+            match UpstreamAuthConfig::oauth_client_secret(*preset, client_secret.as_deref()) {
+                Ok(secret) => secret,
+                Err(err) => return json_error(StatusCode::BAD_REQUEST, &err.to_string()),
+            };
         let format = UpstreamAuthConfig::effective_token_format(*preset, *token_request_format);
         let acct_id = account_id
             .clone()
@@ -1086,7 +1217,7 @@ impl ControlPlane {
                 &session.verifier,
                 &session.redirect_uri,
                 &cid,
-                client_secret.as_deref(),
+                client_secret,
                 state_param,
             )
             .await
@@ -1095,34 +1226,34 @@ impl ControlPlane {
             Err(err) => return json_error(StatusCode::BAD_GATEWAY, &err.to_string()),
         };
 
-        let stored = StoredOAuthToken {
-            access_token: token.access_token.clone(),
-            refresh_token: token.refresh_token.clone(),
-            expires_at: token.expires_at,
-            token_type: token.token_type.clone(),
-            scope: token.scope.clone(),
-            extra: HashMap::new(),
+        let stored = match self.oauth_http.complete_login(up, token).await {
+            Ok(stored) => stored,
+            Err(err) => return json_error(StatusCode::BAD_GATEWAY, &err.to_string()),
         };
-        if let Err(err) = TokenStore::put(self.db.as_ref(), &acct_id, stored) {
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
-        }
+        let expires_at = stored.expires_at;
 
-        if let Some(node) = self
+        let node = self
             .engine
             .router()
             .all_nodes()
             .into_iter()
-            .find(|n| n.name == upstream_name)
-            && let Some(mgr) = node.auth.oauth_manager()
+            .find(|n| n.name == upstream_name);
+        let result = if let Some(mgr) = node.as_ref().and_then(|n| n.auth.oauth_manager())
+            && mgr.client_meta().account_id == acct_id
         {
-            let _ = mgr.update_token(token.clone());
+            mgr.install_login(stored).await
+        } else {
+            TokenStore::put(self.db.as_ref(), &acct_id, stored)
+        };
+        if let Err(err) = result {
+            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
         }
 
         json_ok(&json!({
             "status": "authenticated",
             "upstream": upstream_name,
             "account_id": acct_id,
-            "expires_at": token.expires_at,
+            "expires_at": expires_at,
         }))
     }
 
@@ -1205,6 +1336,22 @@ impl ControlPlane {
             return json_error(StatusCode::FORBIDDEN, "无权操作该渠道");
         }
 
+        if matches!(
+            up.auth,
+            UpstreamAuthConfig::OAuth {
+                preset: Some(OAuthPreset::Antigravity),
+                ..
+            }
+        ) && matches!(
+            models_path,
+            "/models" | "/v1/models" | "/v1internal:fetchAvailableModels"
+        ) {
+            return match fetch_antigravity_models(&self.engine, up).await {
+                Ok((url, models)) => json_ok(&json!({ "url": url, "models": models })),
+                Err(err) => json_error(StatusCode::BAD_GATEWAY, &err),
+            };
+        }
+
         let base_url = if !up.base_url.trim().is_empty() {
             up.base_url.clone()
         } else {
@@ -1271,14 +1418,7 @@ impl ControlPlane {
                     if sess.user_id > 0 {
                         match self.db.get_user_by_id(sess.user_id).ok().flatten() {
                             Some(u) if u.enabled => {
-                                return Some(CallerIdentity {
-                                    user_id: Some(u.id),
-                                    username: u.username,
-                                    role: u.role,
-                                    allow_private_upstreams: u.allow_private_upstreams,
-                                    restrict_upstreams: u.restrict_upstreams,
-                                    allowed_upstreams: u.allowed_upstreams,
-                                });
+                                return Some(CallerIdentity::from_user(u));
                             }
                             _ => {
                                 guard.remove(&tok);
@@ -1291,14 +1431,7 @@ impl ControlPlane {
                     if let Ok(Some(u)) = self.db.get_user_by_username(&sess.username)
                         && u.enabled
                     {
-                        return Some(CallerIdentity {
-                            user_id: Some(u.id),
-                            username: u.username,
-                            role: u.role,
-                            allow_private_upstreams: u.allow_private_upstreams,
-                            restrict_upstreams: u.restrict_upstreams,
-                            allowed_upstreams: u.allowed_upstreams,
-                        });
+                        return Some(CallerIdentity::from_user(u));
                     }
                 } else {
                     guard.remove(&tok);
@@ -1320,6 +1453,8 @@ impl ControlPlane {
                 allow_private_upstreams: true,
                 restrict_upstreams: false,
                 allowed_upstreams: Vec::new(),
+                restrict_models: false,
+                allowed_models: Vec::new(),
             });
         }
 
@@ -1972,7 +2107,7 @@ impl ControlPlane {
     }
 
     // =========================================================================
-    // Outbound Proxies (embedded `eycorsican/leaf`)
+    // Outbound Proxies
     // =========================================================================
 
     fn list_proxies(&self) -> Response<ProxyBody> {
@@ -1980,7 +2115,7 @@ impl ControlPlane {
             Ok(v) => v,
             Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
-        let mgr = self.engine.leaf_manager();
+        let mgr = self.engine.clash_manager();
         let items: Vec<serde_json::Value> = proxies
             .into_iter()
             .map(|p| {
@@ -2020,7 +2155,8 @@ impl ControlPlane {
         if let Err(err) = proxy.validate() {
             return json_error(StatusCode::BAD_REQUEST, &err.to_string());
         }
-        let mut list = match self.db.list_proxies() {
+        let _guard = self.proxy_updates.lock().await;
+        let list = match self.db.list_proxies() {
             Ok(v) => v,
             Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
@@ -2030,17 +2166,48 @@ impl ControlPlane {
                 &format!("代理 '{}' 已存在", proxy.name),
             );
         }
-        list.push(proxy.clone());
-        if let Err(err) = self.engine.reload_proxies(&list) {
-            return json_error(StatusCode::BAD_REQUEST, &err.to_string());
-        }
-        if let Err(err) = self.db.upsert_proxy(&proxy) {
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
+        if let Err(err) = self
+            .engine
+            .clash_manager()
+            .update(&proxy.name, Some(&proxy), || self.db.upsert_proxy(&proxy))
+        {
+            return proxy_update_error(err);
         }
         json_status(
             StatusCode::CREATED,
             &json!({ "status": "created", "name": proxy.name }),
         )
+    }
+
+    async fn import_proxies(&self, req: Request<Incoming>) -> Response<ProxyBody> {
+        let payload: ImportProxyPayload = match read_json_body(req).await {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
+        let mut subscription = match fetch_subscription(&payload.url).await {
+            Ok(subscription) => subscription,
+            Err(err) => return json_error(err.status_code(), &err.to_string()),
+        };
+
+        let _guard = self.proxy_updates.lock().await;
+        let mut names: HashSet<_> = match self.db.list_proxies() {
+            Ok(proxies) => proxies.into_iter().map(|proxy| proxy.name).collect(),
+            Err(err) => return proxy_update_error(err),
+        };
+        let found = subscription.nodes.len();
+        subscription.nodes.retain(|proxy| names.insert(proxy.name.clone()));
+        let duplicates = found - subscription.nodes.len();
+        let imported = match self.engine.clash_manager().import(&subscription.nodes, |proxies| {
+            self.db.insert_proxies(proxies)
+        }) {
+            Ok(imported) => imported,
+            Err(err) => return proxy_update_error(err),
+        };
+        json_ok(&json!({
+            "imported": imported,
+            "duplicates": duplicates,
+            "skipped": subscription.skipped + subscription.nodes.len() - imported,
+        }))
     }
 
     async fn update_proxy(&self, name: &str, req: Request<Incoming>) -> Response<ProxyBody> {
@@ -2050,11 +2217,12 @@ impl ControlPlane {
         };
         updated.name = name.to_string();
 
-        let mut list = match self.db.list_proxies() {
+        let _guard = self.proxy_updates.lock().await;
+        let list = match self.db.list_proxies() {
             Ok(v) => v,
             Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
-        let Some(pos) = list.iter().position(|p| p.name == name) else {
+        let Some(previous) = list.iter().find(|p| p.name == name) else {
             return json_error(StatusCode::NOT_FOUND, &format!("代理 '{name}' 不存在"));
         };
 
@@ -2066,36 +2234,38 @@ impl ControlPlane {
             .filter(|s| !s.is_empty())
             .is_none()
         {
-            updated.password = list[pos].password.clone();
+            updated.password = previous.password.clone();
+        }
+        if updated.protocol == previous.protocol && updated.clash_options.is_none() {
+            updated.clash_options = previous.clash_options.clone();
         }
         if let Err(err) = updated.validate() {
             return json_error(StatusCode::BAD_REQUEST, &err.to_string());
         }
 
-        list[pos] = updated.clone();
-        if let Err(err) = self.engine.reload_proxies(&list) {
-            return json_error(StatusCode::BAD_REQUEST, &err.to_string());
-        }
-        if let Err(err) = self.db.upsert_proxy(&updated) {
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
+        if let Err(err) = self
+            .engine
+            .clash_manager()
+            .update(name, Some(&updated), || self.db.upsert_proxy(&updated))
+        {
+            return proxy_update_error(err);
         }
         json_ok(&json!({ "status": "updated", "name": name }))
     }
 
-    fn delete_proxy(&self, name: &str) -> Response<ProxyBody> {
-        let mut list = match self.db.list_proxies() {
+    async fn delete_proxy(&self, name: &str) -> Response<ProxyBody> {
+        let _guard = self.proxy_updates.lock().await;
+        let list = match self.db.list_proxies() {
             Ok(v) => v,
             Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
-        let Some(pos) = list.iter().position(|p| p.name == name) else {
+        if !list.iter().any(|p| p.name == name) {
             return json_error(StatusCode::NOT_FOUND, &format!("代理 '{name}' 不存在"));
-        };
-        list.remove(pos);
-        if let Err(err) = self.engine.reload_proxies(&list) {
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
         }
-        if let Err(err) = self.db.delete_proxy(name) {
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
+        if let Err(err) = self.engine.clash_manager().update(name, None, || {
+            self.db.delete_proxy(name).map(|_| ())
+        }) {
+            return proxy_update_error(err);
         }
         json_ok(&json!({ "status": "deleted", "name": name }))
     }
@@ -2111,7 +2281,7 @@ impl ControlPlane {
             .filter(|s| !s.is_empty())
             .unwrap_or("https://www.gstatic.com/generate_204");
 
-        match self.engine.leaf_manager().test_proxy(name, target).await {
+        match self.engine.clash_manager().test_proxy(name, target).await {
             Ok((status, latency_ms)) => json_ok(&json!({
                 "ok": (200..400).contains(&status),
                 "status": status,
@@ -2124,6 +2294,14 @@ impl ControlPlane {
             })),
         }
     }
+}
+
+fn proxy_update_error(err: GatewayError) -> Response<ProxyBody> {
+    let status = match err {
+        GatewayError::Config(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    json_error(status, &err.to_string())
 }
 
 async fn fetch_upstream_models_http(

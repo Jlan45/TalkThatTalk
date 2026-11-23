@@ -1,6 +1,6 @@
 /target
-Cargo.lock
 config.toml
+!/.cargo/config.toml
 *.local.toml
 .ttt-tokens.enc*
 data/

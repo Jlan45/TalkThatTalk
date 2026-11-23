@@ -784,6 +784,30 @@ pre,
   color: var(--text);
 }
 
+.chat-reasoning {
+  box-sizing: border-box;
+  width: min(82%, 720px);
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.chat-reasoning summary {
+  cursor: pointer;
+}
+
+.chat-reasoning-stream {
+  display: flex;
+  flex-direction: column-reverse;
+  max-height: 180px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  margin-top: 6px;
+  white-space: pre-wrap;
+}
+
 .trace-row {
   display: flex;
   align-items: center;

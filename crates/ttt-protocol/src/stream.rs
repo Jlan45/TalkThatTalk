@@ -200,9 +200,10 @@ impl SseTranslator {
                 sent_role,
                 sent_done,
             } => {
-                let Ok(v) = serde_json::from_str::<Value>(data) else {
+                let Ok(raw_v) = serde_json::from_str::<Value>(data) else {
                     return;
                 };
+                let v = raw_v.get("response").unwrap_or(&raw_v);
                 if !*sent_role {
                     *sent_role = true;
                     let role_chunk = json!({
@@ -219,7 +220,7 @@ impl SseTranslator {
                     out.push_back(sse_data_bytes(&role_chunk));
                 }
 
-                let text = extract_gemini_text(&v);
+                let text = extract_gemini_text(v);
                 let finish_raw = v
                     .pointer("/candidates/0/finishReason")
                     .and_then(Value::as_str);

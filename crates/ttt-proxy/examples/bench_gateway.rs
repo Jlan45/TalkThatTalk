@@ -143,6 +143,7 @@ async fn spawn_gateway(upstream_addr: SocketAddr) -> SocketAddr {
                 max_retries: 0,
                 owner_user_id: None,
                 proxy: None,
+                quota: None,
             },
             UpstreamConfig {
                 name: "ant-cross".into(),
@@ -163,6 +164,7 @@ async fn spawn_gateway(upstream_addr: SocketAddr) -> SocketAddr {
                 max_retries: 0,
                 owner_user_id: None,
                 proxy: None,
+                quota: None,
             },
         ],
     };

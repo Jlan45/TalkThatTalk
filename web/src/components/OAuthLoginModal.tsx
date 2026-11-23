@@ -69,7 +69,7 @@ export function OAuthLoginModal({ upstreamName, onClose, onSuccess }: Props) {
           {error && <div className="error-banner">{error}</div>}
           {loading ? (
             <p className="muted">正在生成 PKCE (S256) 授权链接...</p>
-          ) : (
+          ) : authUrl && (
             <>
               <div className="form-field">
                 <div className="form-label">步骤 1：打开上游授权页面并完成登录</div>

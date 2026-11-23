@@ -24,6 +24,7 @@ use ttt_core::{
 use ttt_proxy::{ProxyEngine, UsageAccumulator};
 
 enum CliCommand {
+    Version,
     Serve {
         config_path: Option<PathBuf>,
         listen_override: Option<String>,
@@ -96,6 +97,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_tracing();
 
     match parse_cli()? {
+        CliCommand::Version => {
+            println!("talkthattalk {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         CliCommand::Serve {
             config_path,
             listen_override,
@@ -345,6 +350,9 @@ async fn run_tap_worker(
 
 fn parse_cli() -> Result<CliCommand, Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.as_slice(), [arg] if arg == "--version" || arg == "-V") {
+        return Ok(CliCommand::Version);
+    }
     let env_cfg = std::env::var("TTT_CONFIG").ok().map(PathBuf::from);
 
     if args.first().map(String::as_str) == Some("auth") {

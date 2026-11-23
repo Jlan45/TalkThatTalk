@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { gatewayApi } from "../api/client";
 import { IconPlus, IconRefresh } from "../components/Icons";
+import { ProxySubscriptionModal } from "../components/ProxySubscriptionModal";
 import type { ProxyProtocol, ProxyView } from "../types/gateway";
 
 const PROTOCOLS: { value: ProxyProtocol; label: string }[] = [
@@ -10,6 +11,8 @@ const PROTOCOLS: { value: ProxyProtocol; label: string }[] = [
   { value: "trojan", label: "Trojan" },
   { value: "vmess", label: "VMess" },
   { value: "vless", label: "VLESS" },
+  { value: "anytls", label: "AnyTLS" },
+  { value: "hysteria2", label: "Hysteria2" },
 ];
 
 const SS_CIPHERS = [
@@ -165,6 +168,7 @@ export function ProxiesPage() {
   const [proxies, setProxies] = useState<ProxyView[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [testMap, setTestMap] = useState<Record<string, TestResult>>({});
+  const [subscriptionOpen, setSubscriptionOpen] = useState(false);
 
   // Modal state
   const [modalOpen, setModalOpen] = useState(false);
@@ -186,6 +190,7 @@ export function ProxiesPage() {
   const [enabled, setEnabled] = useState(true);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const requiresTls = protocol === "trojan" || protocol === "anytls" || protocol === "hysteria2";
 
   const load = async () => {
     try {
@@ -290,7 +295,7 @@ export function ProxiesPage() {
       password: password.trim() || null,
       cipher:
         protocol === "shadowsocks" || protocol === "vmess" ? cipher.trim() || null : null,
-      tls: protocol === "trojan" ? true : tls,
+      tls: requiresTls || tls,
       sni: sni.trim() || null,
       ws_path: wsPath.trim() || null,
       ws_host: wsHost.trim() || null,
@@ -360,6 +365,9 @@ export function ProxiesPage() {
           <button className="btn btn-ghost" onClick={() => void load()}>
             <IconRefresh width={14} height={14} />
             刷新
+          </button>
+          <button className="btn btn-ghost" onClick={() => setSubscriptionOpen(true)}>
+            导入订阅
           </button>
           <button className="btn" onClick={openCreate}>
             <IconPlus width={14} height={14} />
@@ -454,7 +462,7 @@ export function ProxiesPage() {
               {proxies.length === 0 && (
                 <tr>
                   <td colSpan={7} className="muted" style={{ textAlign: "center", padding: 32 }}>
-                    暂无代理节点，点击右上角「添加代理」配置（支持 SOCKS5 / HTTP / Shadowsocks / Trojan / VMess / VLESS）
+                    暂无代理节点，可添加代理或导入 Clash 订阅。
                   </td>
                 </tr>
               )}
@@ -462,6 +470,13 @@ export function ProxiesPage() {
           </table>
         </div>
       </div>
+
+      {subscriptionOpen && (
+        <ProxySubscriptionModal
+          onClose={() => setSubscriptionOpen(false)}
+          onImported={load}
+        />
+      )}
 
       {modalOpen && (
         <div className="modal-backdrop" onClick={() => setModalOpen(false)}>
@@ -620,7 +635,7 @@ export function ProxiesPage() {
                 </div>
               </div>
 
-              {showTransport && (
+              {(showTransport || requiresTls) && (
                 <div className="section-box">
                   <div className="section-box-title">
                     <span>传输与 TLS</span>
@@ -632,8 +647,8 @@ export function ProxiesPage() {
                         <label className="switch">
                           <input
                             type="checkbox"
-                            checked={protocol === "trojan" ? true : tls}
-                            disabled={protocol === "trojan"}
+                            checked={requiresTls || tls}
+                            disabled={requiresTls}
                             onChange={(e) => setTls(e.target.checked)}
                           />
                           <span className="switch-slider" />
@@ -649,24 +664,28 @@ export function ProxiesPage() {
                         placeholder="example.com"
                       />
                     </div>
-                    <div className="form-field">
-                      <label className="form-label">WebSocket Path（可选）</label>
-                      <input
-                        className="input mono"
-                        value={wsPath}
-                        onChange={(e) => setWsPath(e.target.value)}
-                        placeholder="/ws"
-                      />
-                    </div>
-                    <div className="form-field">
-                      <label className="form-label">WebSocket Host（可选）</label>
-                      <input
-                        className="input mono"
-                        value={wsHost}
-                        onChange={(e) => setWsHost(e.target.value)}
-                        placeholder="cdn.example.com"
-                      />
-                    </div>
+                    {showTransport && (
+                      <>
+                        <div className="form-field">
+                          <label className="form-label">WebSocket Path（可选）</label>
+                          <input
+                            className="input mono"
+                            value={wsPath}
+                            onChange={(e) => setWsPath(e.target.value)}
+                            placeholder="/ws"
+                          />
+                        </div>
+                        <div className="form-field">
+                          <label className="form-label">WebSocket Host（可选）</label>
+                          <input
+                            className="input mono"
+                            value={wsHost}
+                            onChange={(e) => setWsHost(e.target.value)}
+                            placeholder="cdn.example.com"
+                          />
+                        </div>
+                      </>
+                    )}
                     {protocol === "vless" && (
                       <>
                         <div className="form-field">

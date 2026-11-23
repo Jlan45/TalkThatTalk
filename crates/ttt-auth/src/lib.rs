@@ -60,8 +60,6 @@ impl AuthProvider {
                 authorize_url,
                 device_code_url,
                 token_url,
-                client_id,
-                client_secret,
                 scopes,
                 redirect_uri,
                 token_request_format,
@@ -69,8 +67,10 @@ impl AuthProvider {
                 proactive_refresh_leeway_secs,
                 header_name,
                 prefix,
+                ..
             } => {
                 let defaults = preset.and_then(|p| p.defaults());
+                let (client_id, client_secret) = cfg.oauth_credentials();
                 let token_format =
                     UpstreamAuthConfig::effective_token_format(*preset, *token_request_format);
                 let resolved_scopes = if scopes.is_empty() {
@@ -92,10 +92,8 @@ impl AuthProvider {
                         .clone()
                         .or_else(|| defaults.map(|d| d.authorize_url.to_string())),
                     device_code_url: device_code_url.clone(),
-                    client_id: client_id
-                        .clone()
-                        .or_else(|| defaults.map(|d| d.client_id.to_string())),
-                    client_secret: client_secret.clone(),
+                    client_id,
+                    client_secret,
                     scopes: resolved_scopes,
                     redirect_uri: redirect_uri
                         .clone()

@@ -1,0 +1,3 @@
+[env]
+# Upstream ClashRS uses unstable features with stable Rust.
+RUSTC_BOOTSTRAP = "clash_lib"

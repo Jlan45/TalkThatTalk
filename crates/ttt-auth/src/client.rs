@@ -1,18 +1,23 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use http::{header, Method, Request};
-use http_body_util::{BodyExt, Full};
+use http::{Method, Request, header};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use ttt_core::{GatewayError, TokenRequestFormat};
+use tracing::warn;
+use ttt_core::{
+    ANTIGRAVITY_USER_AGENT, GatewayError, OAuthPreset, ProtocolFamily, TokenRequestFormat,
+    UpstreamAuthConfig, UpstreamConfig,
+};
 use url::form_urlencoded;
 
 use crate::oauth::RefreshedToken;
+use crate::store::StoredOAuthToken;
 
 /// Raw OAuth 2.0 token response (RFC 6749 §5.1).
 #[derive(Debug, Clone, Deserialize)]
@@ -72,6 +77,148 @@ pub struct OAuthHttpClient {
 }
 
 impl OAuthHttpClient {
+    pub async fn complete_login(
+        &self,
+        upstream: &UpstreamConfig,
+        token: RefreshedToken,
+    ) -> Result<StoredOAuthToken, GatewayError> {
+        let mut record = token.into_stored();
+        if matches!(
+            &upstream.auth,
+            UpstreamAuthConfig::OAuth {
+                preset: Some(OAuthPreset::Antigravity),
+                ..
+            }
+        ) {
+            if record.refresh_token.as_deref().is_none_or(str::is_empty) {
+                return Err(GatewayError::Auth(
+                    "Antigravity 授权未返回 refresh token，请重新授权".into(),
+                ));
+            }
+            let endpoint = upstream
+                .effective_endpoints()
+                .remove(&ProtocolFamily::Antigravity)
+                .ok_or_else(|| GatewayError::Config("Antigravity 渠道缺少协议端点".into()))?;
+            match self
+                .discover_antigravity_project(&endpoint, &record.access_token)
+                .await
+            {
+                Ok(project_id) => record.set_antigravity_project_id(project_id),
+                Err(error) => warn!(upstream = %upstream.name, %error, "Antigravity authorization succeeded but project discovery needs a retry"),
+            }
+        }
+        Ok(record)
+    }
+
+    pub(crate) async fn discover_antigravity_project(
+        &self,
+        endpoint: &str,
+        access_token: &str,
+    ) -> Result<String, GatewayError> {
+        let base = url::Url::parse(endpoint)
+            .map_err(|err| GatewayError::Config(format!("Antigravity 项目发现端点无效: {err}")))?;
+        let fallback = match (base.scheme(), base.host_str(), base.port()) {
+            ("https", Some("daily-cloudcode-pa.googleapis.com"), None) => {
+                Some("https://cloudcode-pa.googleapis.com")
+            }
+            ("https", Some("cloudcode-pa.googleapis.com"), None) => {
+                Some("https://daily-cloudcode-pa.googleapis.com")
+            }
+            _ => None,
+        };
+        let discovery = self
+            .discover_antigravity_project_at(&base, access_token)
+            .await;
+        if discovery.is_err()
+            && let Some(fallback) = fallback
+        {
+            let fallback = url::Url::parse(fallback).expect("valid Google API endpoint");
+            return self
+                .discover_antigravity_project_at(&fallback, access_token)
+                .await;
+        }
+        discovery
+    }
+
+    async fn discover_antigravity_project_at(
+        &self,
+        base: &url::Url,
+        access_token: &str,
+    ) -> Result<String, GatewayError> {
+        let project = self
+            .post_antigravity_json(
+                base,
+                "/v1internal:loadCodeAssist",
+                access_token,
+                br#"{"metadata":{"ideType":"ANTIGRAVITY"}}"#,
+            )
+            .await?;
+        if let Some(id) = antigravity_project_id(&project) {
+            return Ok(id.to_owned());
+        }
+        let projects = self
+            .post_antigravity_json(
+                base,
+                "/v1internal:listCloudAICompanionProjects",
+                access_token,
+                b"{}",
+            )
+            .await?;
+        antigravity_project_id(&projects)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                GatewayError::Auth(
+                    "Antigravity 未返回项目 ID，请检查账号的 Antigravity 访问权限".into(),
+                )
+            })
+    }
+
+    async fn post_antigravity_json(
+        &self,
+        base: &url::Url,
+        path: &str,
+        access_token: &str,
+        payload: &'static [u8],
+    ) -> Result<Value, GatewayError> {
+        let url = base
+            .join(path)
+            .map_err(|err| GatewayError::Config(format!("Antigravity 项目发现端点无效: {err}")))?;
+        let mut authorization = header::HeaderValue::from_str(&format!("Bearer {access_token}"))
+            .map_err(|err| {
+                GatewayError::Auth(format!("Antigravity access token 格式无效: {err}"))
+            })?;
+        authorization.set_sensitive(true);
+        let req = Request::post(url.as_str())
+            .header(header::AUTHORIZATION, authorization)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::USER_AGENT, ANTIGRAVITY_USER_AGENT)
+            .body(Full::new(Bytes::from_static(payload)))
+            .map_err(|err| {
+                GatewayError::Auth(format!("无法构造 Antigravity 项目发现请求: {err}"))
+            })?;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let resp = self.client.request(req).await.map_err(|err| {
+                GatewayError::Auth(format!("Antigravity 项目发现请求失败: {err}"))
+            })?;
+            if !resp.status().is_success() {
+                return Err(GatewayError::Auth(format!(
+                    "Antigravity {path} 返回 HTTP {}",
+                    resp.status()
+                )));
+            }
+            let body = Limited::new(resp.into_body(), 1024 * 1024)
+                .collect()
+                .await
+                .map_err(|err| {
+                    GatewayError::Auth(format!("无法读取 Antigravity 项目响应: {err}"))
+                })?;
+            serde_json::from_slice(&body.to_bytes())
+                .map_err(|err| GatewayError::Auth(format!("无法解析 Antigravity 项目响应: {err}")))
+        })
+        .await
+        .map_err(|_| GatewayError::Auth("Antigravity 项目发现请求超时".into()))?
+    }
+
     pub fn new() -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut http = HttpConnector::new();
@@ -323,6 +470,37 @@ impl Default for OAuthHttpClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn antigravity_project_id(data: &Value) -> Option<&str> {
+    let id = [
+        "antigravityProjectId",
+        "projectId",
+        "backendProjectId",
+        "userDefinedCloudaicompanionProject",
+        "cloudaicompanionProject",
+        "project",
+    ]
+    .into_iter()
+    .filter_map(|key| data.get(key))
+    .find_map(project_id_value);
+    id.or_else(|| {
+        ["projects", "projectIds", "cloudaicompanionProjects"]
+            .into_iter()
+            .filter_map(|key| data.get(key).and_then(Value::as_array))
+            .flatten()
+            .find_map(|project| {
+                project_id_value(project).or_else(|| antigravity_project_id(project))
+            })
+    })
+}
+
+fn project_id_value(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
 }
 
 fn default_device_expires() -> u64 {

@@ -200,6 +200,9 @@ pub enum ProtocolFamily {
     /// Google Gemini (`/v1beta/models/{model}:generateContent`)
     #[serde(rename = "gemini")]
     Gemini,
+    /// Google Antigravity / Cloud Code Assist (`/v1internal:generateContent`)
+    #[serde(rename = "antigravity")]
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,12 +252,122 @@ pub struct UpstreamConfig {
     #[serde(default)]
     pub owner_user_id: Option<i64>,
 
-    /// Optional outbound proxy name (configured in SQLite `proxies` table via embedded `leaf`).
+    /// Optional outbound proxy name (configured in the SQLite `proxies` table).
     #[serde(default)]
     pub proxy: Option<String>,
+
+    /// Optional quota / usage monitoring configuration (Claude Code, Codex, or custom HTTP JSON).
+    #[serde(default)]
+    pub quota: Option<QuotaMonitorConfig>,
 }
 
-/// Supported outbound proxy protocols backed by embedded `eycorsican/leaf` (and native HTTP CONNECT).
+/// Supported quota monitoring probe types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaProbeKind {
+    /// Auto-detect based on the OAuth preset or a known API endpoint.
+    #[default]
+    Auto,
+    /// Anthropic Claude Code OAuth usage endpoint (`/api/oauth/usage`).
+    ClaudeCode,
+    /// OpenAI Codex ChatGPT usage endpoint (`/backend-api/wham/usage`).
+    Codex,
+    /// Google Antigravity available models & quota endpoint (`/v1internal:fetchAvailableModels`).
+    Antigravity,
+    /// OpenCode Go rolling, weekly, and monthly usage limits.
+    #[serde(rename = "opencode_go")]
+    OpenCodeGo,
+    /// Generic declarative HTTP JSON endpoint with dot-path extraction.
+    CustomHttp,
+}
+
+fn default_quota_poll_interval_secs() -> u64 {
+    300
+}
+
+/// Per-upstream quota monitoring configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaMonitorConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub probe: QuotaProbeKind,
+    /// Polling interval in seconds (clamped to >= 60s to avoid upstream rate limits).
+    #[serde(default = "default_quota_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Optional `ChatGPT-Account-Id` header for Codex workspace/team usage queries.
+    #[serde(default)]
+    pub chatgpt_account_id: Option<String>,
+    /// Custom HTTP probe URL (for `custom_http` mode).
+    #[serde(default)]
+    pub custom_url: Option<String>,
+    /// Custom HTTP headers (supports `{{api_key}}` placeholder).
+    #[serde(default)]
+    pub custom_headers: HashMap<String, String>,
+    /// Dot-separated JSON path for remaining amount (e.g. `data.remain_quota`).
+    #[serde(default)]
+    pub remaining_path: Option<String>,
+    /// Dot-separated JSON path for used amount.
+    #[serde(default)]
+    pub used_path: Option<String>,
+    /// Dot-separated JSON path for total amount.
+    #[serde(default)]
+    pub total_path: Option<String>,
+    /// Multiplier applied to extracted raw numbers (e.g. `0.000002` for 500k = $1).
+    #[serde(default)]
+    pub scale: Option<f64>,
+    /// Currency label for monetary probes (defaults to `USD`).
+    #[serde(default)]
+    pub currency: Option<String>,
+}
+
+/// Overall health status of an upstream's quota snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaStatus {
+    Healthy,
+    Low,
+    Exhausted,
+    Error,
+}
+
+/// Normalized quota dimension supporting both window-based (Claude/Codex) and monetary balances.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuotaDimension {
+    WindowUtilization {
+        window: String,
+        used_percent: f64,
+        resets_at: Option<i64>,
+    },
+    Monetary {
+        currency: String,
+        remaining: Option<f64>,
+        used: Option<f64>,
+        total: Option<f64>,
+    },
+}
+
+/// Latest probed quota snapshot for an upstream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaSnapshot {
+    pub upstream: String,
+    pub probe: QuotaProbeKind,
+    pub status: QuotaStatus,
+    #[serde(default)]
+    pub dimensions: Vec<QuotaDimension>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_models: Vec<String>,
+    #[serde(default)]
+    pub plan_type: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub fetched_at: i64,
+}
+
+pub const ANTIGRAVITY_USER_AGENT: &str = "antigravity/1.15.8 linux/amd64";
+
+/// Supported outbound proxy protocols backed by ClashRS and native HTTP CONNECT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyProtocol {
@@ -264,6 +377,8 @@ pub enum ProxyProtocol {
     Trojan,
     Vmess,
     Vless,
+    Anytls,
+    Hysteria2,
 }
 
 /// Declarative outbound proxy node stored encrypted in SQLite.
@@ -275,7 +390,7 @@ pub struct ProxyConfig {
     pub port: u16,
     #[serde(default)]
     pub username: Option<String>,
-    /// Password (HTTP / SOCKS5 / Shadowsocks / Trojan) or UUID (VMess / VLESS).
+    /// Password or UUID (VMess / VLESS).
     #[serde(default)]
     pub password: Option<String>,
     /// Cipher / security method (e.g. `aes-256-gcm`, `chacha20-ietf-poly1305`, `auto`).
@@ -293,8 +408,23 @@ pub struct ProxyConfig {
     pub reality_public_key: Option<String>,
     #[serde(default)]
     pub reality_short_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clash_options: Option<ClashProxyOptions>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClashProxyOptions {
+    #[serde(default)]
+    pub skip_cert_verify: bool,
+    #[serde(default)]
+    pub alter_id: u16,
+    pub flow: Option<String>,
+    pub up: Option<u64>,
+    pub down: Option<u64>,
+    pub ws_max_early_data: Option<u16>,
+    pub ws_early_data_header: Option<String>,
 }
 
 impl ProxyConfig {
@@ -315,19 +445,14 @@ impl ProxyConfig {
             )));
         }
         match self.protocol {
-            ProxyProtocol::Shadowsocks => {
+            ProxyProtocol::Shadowsocks
+            | ProxyProtocol::Trojan
+            | ProxyProtocol::Anytls
+            | ProxyProtocol::Hysteria2 => {
                 if self.password.as_deref().unwrap_or("").trim().is_empty() {
                     return Err(GatewayError::Config(format!(
-                        "shadowsocks proxy '{}' requires a password",
-                        self.name
-                    )));
-                }
-            }
-            ProxyProtocol::Trojan => {
-                if self.password.as_deref().unwrap_or("").trim().is_empty() {
-                    return Err(GatewayError::Config(format!(
-                        "trojan proxy '{}' requires a password",
-                        self.name
+                        "{:?} proxy '{}' requires a password",
+                        self.protocol, self.name
                     )));
                 }
             }
@@ -353,6 +478,8 @@ pub enum OAuthPreset {
     Codex,
     /// Anthropic Claude Code style: Authorization Code + PKCE, JSON token endpoint, supports `code#state`.
     ClaudeCode,
+    /// Google Antigravity style: Google OAuth 2.0 Authorization Code + PKCE, form-urlencoded token endpoint.
+    Antigravity,
     /// Generic RFC 6749 / 7636 / 8628 provider.
     Custom,
 }
@@ -362,27 +489,47 @@ pub enum OAuthPreset {
 pub struct OAuthPresetDefaults {
     pub authorize_url: &'static str,
     pub token_url: &'static str,
-    pub client_id: &'static str,
+    pub client_id: Option<&'static str>,
     pub redirect_uri: &'static str,
     pub scopes: &'static [&'static str],
 }
 
 impl OAuthPreset {
+    pub fn authorization_params(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Antigravity => &[("access_type", "offline"), ("prompt", "consent")],
+            _ => &[],
+        }
+    }
+
     pub fn defaults(self) -> Option<OAuthPresetDefaults> {
         match self {
             Self::Codex => Some(OAuthPresetDefaults {
                 authorize_url: "https://auth.openai.com/oauth/authorize",
                 token_url: "https://auth.openai.com/oauth/token",
-                client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+                client_id: Some("app_EMoamEEZ73f0CkXaXp7hrann"),
                 redirect_uri: "http://localhost:1455/auth/callback",
                 scopes: &["openid", "profile", "email", "offline_access"],
             }),
             Self::ClaudeCode => Some(OAuthPresetDefaults {
                 authorize_url: "https://claude.ai/oauth/authorize",
                 token_url: "https://console.anthropic.com/v1/oauth/token",
-                client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                client_id: Some("9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
                 redirect_uri: "https://console.anthropic.com/oauth/code/callback",
                 scopes: &["org:create_api_key", "user:profile", "user:inference"],
+            }),
+            Self::Antigravity => Some(OAuthPresetDefaults {
+                authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
+                token_url: "https://oauth2.googleapis.com/token",
+                client_id: None,
+                redirect_uri: "http://localhost:51121/oauth-callback",
+                scopes: &[
+                    "https://www.googleapis.com/auth/cloud-platform",
+                    "https://www.googleapis.com/auth/userinfo.email",
+                    "https://www.googleapis.com/auth/userinfo.profile",
+                    "https://www.googleapis.com/auth/cclog",
+                    "https://www.googleapis.com/auth/experimentsandconfigs",
+                ],
             }),
             Self::Custom => None,
         }
@@ -457,6 +604,60 @@ pub enum UpstreamAuthConfig {
 }
 
 impl UpstreamAuthConfig {
+    pub fn oauth_credentials(&self) -> (Option<String>, Option<String>) {
+        let Self::OAuth {
+            preset,
+            authorize_url,
+            token_url,
+            client_id,
+            client_secret,
+            ..
+        } = self
+        else {
+            return (None, None);
+        };
+        let defaults = preset.and_then(OAuthPreset::defaults);
+        if *preset == Some(OAuthPreset::Antigravity)
+            && client_secret
+                .as_deref()
+                .is_none_or(|secret| secret.trim().is_empty())
+            && let Some(defaults) = defaults
+            && authorize_url.as_deref().unwrap_or(defaults.authorize_url) == defaults.authorize_url
+            && token_url.as_deref().unwrap_or(defaults.token_url) == defaults.token_url
+        {
+            if let (Ok(id), Ok(secret)) = (
+                std::env::var("ANTIGRAVITY_CLIENT_ID"),
+                std::env::var("ANTIGRAVITY_CLIENT_SECRET"),
+            ) && !id.trim().is_empty()
+                && !secret.trim().is_empty()
+                && client_id
+                    .as_deref()
+                    .is_none_or(|explicit| explicit == id.trim())
+            {
+                return (Some(id.trim().to_owned()), Some(secret.trim().to_owned()));
+            }
+        }
+        (
+            client_id
+                .clone()
+                .or_else(|| defaults.and_then(|d| d.client_id).map(str::to_owned)),
+            client_secret.clone(),
+        )
+    }
+
+    pub fn oauth_client_secret(
+        preset: Option<OAuthPreset>,
+        secret: Option<&str>,
+    ) -> Result<Option<&str>, GatewayError> {
+        let secret = secret.map(str::trim).filter(|value| !value.is_empty());
+        if preset == Some(OAuthPreset::Antigravity) && secret.is_none() {
+            return Err(GatewayError::Config(
+                "请为 Antigravity 配置配套的 Google OAuth Client ID 和 Client Secret，或设置服务端的 ANTIGRAVITY_CLIENT_ID 和 ANTIGRAVITY_CLIENT_SECRET".into(),
+            ));
+        }
+        Ok(secret)
+    }
+
     pub fn effective_token_format(
         preset: Option<OAuthPreset>,
         explicit: Option<TokenRequestFormat>,
@@ -466,7 +667,10 @@ impl UpstreamAuthConfig {
         }
         match preset {
             Some(OAuthPreset::ClaudeCode) => TokenRequestFormat::Json,
-            Some(OAuthPreset::Codex) | Some(OAuthPreset::Custom) | None => TokenRequestFormat::Form,
+            Some(OAuthPreset::Codex)
+            | Some(OAuthPreset::Antigravity)
+            | Some(OAuthPreset::Custom)
+            | None => TokenRequestFormat::Form,
         }
     }
 }

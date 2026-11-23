@@ -51,6 +51,12 @@ struct PlaygroundChat {
     stream: bool,
 }
 
+struct RequestTelemetry {
+    req_id: RequestId,
+    started_at: Instant,
+    lifetime: Option<Arc<Instant>>,
+}
+
 /// High-performance zero-copy AI gateway data-plane engine.
 pub struct ProxyEngine {
     client: UpstreamHttpClient,
@@ -255,8 +261,7 @@ impl ProxyEngine {
             .uri
             .path_and_query()
             .map(|pq| pq.as_str())
-            .unwrap_or("/")
-            .to_string();
+            .unwrap_or("/");
 
         let header_model = parts
             .headers
@@ -275,19 +280,23 @@ impl ProxyEngine {
             );
 
         let ingress_proto = detect_ingress_protocol(parts.uri.path());
+        let telemetry = RequestTelemetry {
+            req_id,
+            started_at,
+            lifetime: self.tap_tx.as_ref().map(|_| Arc::new(started_at)),
+        };
 
         if can_pure_stream {
             return self
                 .forward_pure_stream(
                     parts.method,
                     &parts.headers,
-                    &path_and_query,
+                    path_and_query,
                     ingress_proto,
                     header_model.as_deref(),
                     active_policy.as_ref(),
                     incoming_body,
-                    req_id,
-                    started_at,
+                    telemetry,
                 )
                 .await;
         }
@@ -331,14 +340,13 @@ impl ProxyEngine {
         self.forward_buffered_with_retry(
             parts.method,
             &parts.headers,
-            &path_and_query,
+            path_and_query,
             ingress_proto,
             extracted_model.as_deref(),
             active_policy.as_ref(),
             raw_body,
             model_span,
-            req_id,
-            started_at,
+            telemetry,
         )
         .await
     }
@@ -355,9 +363,9 @@ impl ProxyEngine {
         model: Option<&str>,
         policy: Option<&AccessPolicy>,
         body: Incoming,
-        req_id: RequestId,
-        started_at: Instant,
+        telemetry: RequestTelemetry,
     ) -> Result<Response<ProxyBody>, GatewayError> {
+        let req_id = telemetry.req_id;
         let affinity = if self.router.needs_affinity_extraction(model, policy) {
             self.affinity_extractor.extract_headers_only(
                 incoming_headers,
@@ -384,7 +392,7 @@ impl ProxyEngine {
         })?;
 
         self.emit_start(
-            req_id,
+            &telemetry,
             policy.and_then(|p| p.owner_user_id),
             &node.name,
             model,
@@ -429,8 +437,8 @@ impl ProxyEngine {
             upstream_resp,
             &node.name,
             affinity_source,
-            req_id,
-            started_at,
+            path_and_query,
+            telemetry,
         ))
     }
 
@@ -447,9 +455,9 @@ impl ProxyEngine {
         policy: Option<&AccessPolicy>,
         raw_body: Bytes,
         model_span: Option<ModelSpan>,
-        req_id: RequestId,
-        started_at: Instant,
+        telemetry: RequestTelemetry,
     ) -> Result<Response<ProxyBody>, GatewayError> {
+        let req_id = telemetry.req_id;
         let affinity: Option<AffinityContext> = if self.router.needs_affinity_extraction(model, policy) {
             self.affinity_extractor.extract(
                 incoming_headers,
@@ -492,7 +500,7 @@ impl ProxyEngine {
         for (attempt, node) in candidates.iter().take(max_attempts).enumerate() {
             let has_more_attempts = attempt + 1 < max_attempts;
             self.emit_start(
-                req_id,
+                &telemetry,
                 policy.and_then(|p| p.owner_user_id),
                 &node.name,
                 model,
@@ -770,8 +778,7 @@ impl ProxyEngine {
                                     &node.name,
                                     affinity_source,
                                     translated_is_stream,
-                                    req_id,
-                                    started_at,
+                                    telemetry,
                                 )
                                 .await;
                         }
@@ -780,8 +787,8 @@ impl ProxyEngine {
                             resp,
                             &node.name,
                             affinity_source,
-                            req_id,
-                            started_at,
+                            path_and_query,
+                            telemetry,
                         ));
                     }
                     Err(err) => {
@@ -935,11 +942,15 @@ impl ProxyEngine {
         upstream_resp: Response<Incoming>,
         upstream_name: &str,
         affinity_source: Option<&str>,
-        req_id: RequestId,
-        started_at: Instant,
+        path_and_query: &str,
+        telemetry: RequestTelemetry,
     ) -> Response<ProxyBody> {
+        let RequestTelemetry { req_id, started_at, lifetime } = telemetry;
         let (parts, body) = upstream_resp.into_parts();
         let status = parts.status;
+        let is_sse = is_event_stream(&parts.headers);
+        let path = path_and_query.split('?').next().unwrap_or_default();
+        let is_stream = is_sse || (status.is_success() && path.ends_with(":streamGenerateContent"));
 
         let mut builder = Response::builder().status(status);
         if let Some(headers) = builder.headers_mut() {
@@ -956,7 +967,7 @@ impl ProxyEngine {
             }
 
             // Ensure reverse proxies in front of TalkThatTalk do not buffer SSE chunks.
-            if is_event_stream(&parts.headers) {
+            if is_sse {
                 headers.insert(
                     HEADER_X_ACCEL_BUFFERING.clone(),
                     HeaderValue::from_static("no"),
@@ -967,7 +978,9 @@ impl ProxyEngine {
             }
         }
 
-        let tapped = ProxyBody::tap(body, req_id, status, started_at, self.tap_tx.clone());
+        let tapped = ProxyBody::tap(
+            body, req_id, lifetime, status, is_stream, started_at, self.tap_tx.clone(),
+        );
         builder
             .body(tapped)
             .unwrap_or_else(|_| Response::new(ProxyBody::empty()))
@@ -983,9 +996,9 @@ impl ProxyEngine {
         upstream_name: &str,
         affinity_source: Option<&str>,
         client_wants_stream: bool,
-        req_id: RequestId,
-        started_at: Instant,
+        telemetry: RequestTelemetry,
     ) -> Result<Response<ProxyBody>, GatewayError> {
+        let RequestTelemetry { req_id, started_at, lifetime } = telemetry;
         let (parts, body) = upstream_resp.into_parts();
         let status = parts.status;
         let is_sse = is_event_stream(&parts.headers) || client_wants_stream;
@@ -1034,6 +1047,7 @@ impl ProxyEngine {
                 body,
                 translator,
                 req_id,
+                lifetime,
                 status,
                 started_at,
                 self.tap_tx.clone(),
@@ -1058,7 +1072,9 @@ impl ProxyEngine {
             });
             let _ = tx.try_send(TapEvent::ResponseEnd {
                 req_id,
+                lifetime,
                 status,
+                is_stream: false,
                 total_bytes: upstream_bytes.len() as u64,
                 ttft_ms: Some(elapsed),
                 duration_ms: elapsed,
@@ -1078,15 +1094,18 @@ impl ProxyEngine {
 
     fn emit_start(
         &self,
-        req_id: RequestId,
+        telemetry: &RequestTelemetry,
         user_id: Option<i64>,
         upstream: &str,
         model: Option<&str>,
         path: &str,
     ) {
-        if let Some(tx) = &self.tap_tx {
+        if let Some(tx) = &self.tap_tx
+            && let Some(lifetime) = &telemetry.lifetime
+        {
             let _ = tx.try_send(TapEvent::RequestStart {
-                req_id,
+                req_id: telemetry.req_id,
+                lifetime: Arc::downgrade(lifetime),
                 user_id,
                 upstream: upstream.to_string(),
                 model: model.map(ToOwned::to_owned),

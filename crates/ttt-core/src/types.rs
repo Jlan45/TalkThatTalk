@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use http::StatusCode;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -29,6 +31,7 @@ impl std::fmt::Display for RequestId {
 pub enum TapEvent {
     RequestStart {
         req_id: RequestId,
+        lifetime: Weak<Instant>,
         user_id: Option<i64>,
         upstream: String,
         model: Option<String>,
@@ -37,6 +40,7 @@ pub enum TapEvent {
     ResponseFirstByte {
         req_id: RequestId,
         status: StatusCode,
+        is_stream: bool,
         ttft_ms: u64,
     },
     ResponseChunk {
@@ -45,7 +49,10 @@ pub enum TapEvent {
     },
     ResponseEnd {
         req_id: RequestId,
+        // Keep pending metadata alive while this event is queued.
+        lifetime: Option<Arc<Instant>>,
         status: StatusCode,
+        is_stream: bool,
         total_bytes: u64,
         ttft_ms: Option<u64>,
         duration_ms: u64,

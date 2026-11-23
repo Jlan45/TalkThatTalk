@@ -1,10 +1,125 @@
 import { useEffect, useMemo, useState } from "react";
 import { gatewayApi } from "../api/client";
 import { IconRefresh } from "../components/Icons";
-import type { RequestLogEntry } from "../types/gateway";
+import type { ActiveRequest, ActiveRequestsSnapshot, RequestLogEntry } from "../types/gateway";
 
 function formatTime(ts: number): string {
   return new Date(ts * 1000).toLocaleTimeString();
+}
+
+function matchesQuery(row: ActiveRequest | RequestLogEntry, query: string): boolean {
+  return (
+    !query ||
+    row.req_id.toLowerCase().includes(query) ||
+    (row.username ?? "").toLowerCase().includes(query) ||
+    (row.user_id == null ? "" : `#${row.user_id}`).includes(query) ||
+    row.upstream.toLowerCase().includes(query) ||
+    (row.model ?? "").toLowerCase().includes(query) ||
+    row.path.toLowerCase().includes(query)
+  );
+}
+
+function ActiveRequests({ query, refresh }: { query: string; refresh: number }) {
+  const [snapshot, setSnapshot] = useState<ActiveRequestsSnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let timer: number | undefined;
+    let loading = false;
+    const poll = async () => {
+      if (loading || document.hidden) return;
+      loading = true;
+      window.clearTimeout(timer);
+      try {
+        const next = await gatewayApi.getActiveRequests(controller.signal);
+        if (controller.signal.aborted) return;
+        setSnapshot(next);
+        setError(null);
+      } catch (e) {
+        if (controller.signal.aborted) return;
+        setError((e as Error).message);
+      } finally {
+        loading = false;
+        if (!controller.signal.aborted && !document.hidden) {
+          timer = window.setTimeout(() => void poll(), 1000);
+        }
+      }
+    };
+
+    const onVisibilityChange = () => {
+      if (document.hidden) window.clearTimeout(timer);
+      else void poll();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    void poll();
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [refresh]);
+
+  const requests = snapshot?.requests ?? [];
+  const filtered = requests.filter((row) => matchesQuery(row, query));
+
+  return (
+    <section className="card card-flush" style={{ marginBottom: 16 }} aria-labelledby="active-requests-title">
+      <div className="card-header" style={{ padding: "12px 16px" }}>
+        <h2 className="card-title" id="active-requests-title">正在处理</h2>
+        {snapshot && (
+          <span className="muted">
+            {snapshot.total} 条
+            {snapshot.total > requests.length && `，显示最新 ${requests.length} 条`}
+          </span>
+        )}
+      </div>
+      {error && <div className="error-banner">实时请求刷新失败 · {error}</div>}
+      <div className="table-wrap">
+        <table className="table" aria-labelledby="active-requests-title">
+          <thead>
+            <tr>
+              <th>请求 ID</th>
+              <th>调用用户</th>
+              <th>模型</th>
+              <th>渠道</th>
+              <th>路径</th>
+              <th>状态</th>
+              <th>已耗时</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((row) => (
+              <tr key={row.req_id}>
+                <td className="mono">{row.req_id}</td>
+                <td>{row.username ?? (row.user_id == null ? "—" : `#${row.user_id}`)}</td>
+                <td>
+                  <span className="tag">{row.model ?? "—"}</span>
+                </td>
+                <td className="mono">{row.upstream}</td>
+                <td className="mono muted">{row.path}</td>
+                <td>
+                  <span className="chip chip-blue">
+                    {row.is_stream == null ? "等待响应" : row.is_stream ? "流式响应中" : "响应中"}
+                  </span>
+                </td>
+                <td className="tabular">{(row.elapsed_ms / 1000).toFixed(1)} s</td>
+              </tr>
+            ))}
+            {filtered.length === 0 && (
+              <tr>
+                <td colSpan={7} className="muted" style={{ textAlign: "center", padding: 24 }}>
+                  {snapshot
+                    ? (query ? "暂无匹配的进行中请求" : "暂无正在处理的请求")
+                    : (error ? "实时请求暂不可用" : "正在加载…")}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
 }
 
 export function LogsPage() {
@@ -12,6 +127,8 @@ export function LogsPage() {
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [error, setError] = useState<string | null>(null);
+  const [activeRefresh, setActiveRefresh] = useState(0);
+  const normalizedQuery = query.trim().toLowerCase();
 
   const load = async () => {
     try {
@@ -30,25 +147,21 @@ export function LogsPage() {
   }, []);
 
   const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
     return logs.filter((row) => {
       if (statusFilter === "ok" && (row.status < 200 || row.status >= 400)) return false;
       if (statusFilter === "err" && row.status < 400) return false;
-      if (!q) return true;
-      return (
-        row.req_id.toLowerCase().includes(q) ||
-        row.upstream.toLowerCase().includes(q) ||
-        (row.model ?? "").toLowerCase().includes(q) ||
-        row.path.toLowerCase().includes(q)
-      );
+      return matchesQuery(row, normalizedQuery);
     });
-  }, [logs, query, statusFilter]);
+  }, [logs, normalizedQuery, statusFilter]);
 
   return (
     <div>
       <div className="page-header">
         <h1 className="page-title">调用日志</h1>
-        <button className="btn btn-ghost" onClick={() => void load()}>
+        <button className="btn btn-ghost" onClick={() => {
+          void load();
+          setActiveRefresh((current) => current + 1);
+        }}>
           <IconRefresh width={14} height={14} />
           刷新
         </button>
@@ -59,11 +172,17 @@ export function LogsPage() {
       <div className="toolbar">
         <input
           className="input"
-          style={{ width: 260 }}
-          placeholder="搜索请求 ID、模型、渠道或路径..."
+          style={{ width: 300 }}
+          placeholder="搜索用户、请求 ID、模型、渠道或路径..."
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
+      </div>
+
+      <ActiveRequests query={normalizedQuery} refresh={activeRefresh} />
+
+      <div className="toolbar">
+        <h2 className="card-title">已完成</h2>
         <select
           className="select"
           value={statusFilter}
@@ -85,10 +204,12 @@ export function LogsPage() {
               <tr>
                 <th>时间</th>
                 <th>请求 ID</th>
+                <th>调用用户</th>
                 <th>模型</th>
                 <th>渠道</th>
                 <th>路径</th>
                 <th>状态</th>
+                <th>响应类型</th>
                 <th>TTFT</th>
                 <th>总耗时</th>
                 <th>Tokens (入/出/总)</th>
@@ -105,6 +226,7 @@ export function LogsPage() {
                   <tr key={row.req_id}>
                     <td className="tabular muted">{formatTime(row.timestamp_secs)}</td>
                     <td className="mono">{row.req_id}</td>
+                    <td>{row.username ?? (row.user_id == null ? "—" : `#${row.user_id}`)}</td>
                     <td>
                       <span className="tag">{row.model ?? "-"}</span>
                     </td>
@@ -118,6 +240,15 @@ export function LogsPage() {
                       >
                         {row.status}
                       </span>
+                    </td>
+                    <td>
+                      {row.is_stream == null ? (
+                        <span className="muted">未知</span>
+                      ) : row.is_stream ? (
+                        "流式"
+                      ) : (
+                        "非流式"
+                      )}
                     </td>
                     <td className="tabular">{row.ttft_ms} ms</td>
                     <td className="tabular">{row.duration_ms} ms</td>
@@ -142,7 +273,7 @@ export function LogsPage() {
               })}
               {filtered.length === 0 && (
                 <tr>
-                  <td colSpan={10} className="muted" style={{ textAlign: "center", padding: 32 }}>
+                  <td colSpan={12} className="muted" style={{ textAlign: "center", padding: 32 }}>
                     暂无匹配的调用日志
                   </td>
                 </tr>

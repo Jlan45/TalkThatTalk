@@ -1,4 +1,5 @@
 import type {
+  ActiveRequestsSnapshot,
   AuthUser,
   ClientKeysResponse,
   GatewayStatsSnapshot,
@@ -190,6 +191,9 @@ export const gatewayApi = {
     ),
 
   getStats: () => request<GatewayStatsSnapshot>("/stats"),
+
+  getActiveRequests: (signal: AbortSignal) =>
+    request<ActiveRequestsSnapshot>("/requests/active", { signal, cache: "no-store" }),
 
   listUpstreams: () => request<{ upstreams: UpstreamView[] }>("/upstreams"),
 

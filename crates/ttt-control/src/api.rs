@@ -432,6 +432,20 @@ impl ControlPlane {
                     json_ok(&snap)
                 }
             }
+            (Method::GET, "/api/v1/requests/active") => {
+                let active = if caller.is_admin() {
+                    self.metrics.active_requests(None)
+                } else if let Some(uid) = caller.user_id {
+                    self.metrics.active_requests(Some(uid))
+                } else {
+                    Default::default()
+                };
+                let mut response = json_ok(&active);
+                response
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                response
+            }
             (Method::GET, "/api/v1/keys") => self.list_client_keys(&caller),
             (Method::POST, "/api/v1/keys") => self.upsert_client_key(&caller, req, true).await,
             (Method::PUT, "/api/v1/keys") => self.upsert_client_key(&caller, req, false).await,

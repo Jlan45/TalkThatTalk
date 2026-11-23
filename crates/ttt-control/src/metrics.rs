@@ -1,23 +1,28 @@
+use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, Weak};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use ttt_core::RequestId;
 use ttt_proxy::TokenUsage;
 
 const MAX_RECENT_LOGS: usize = 100;
+const MAX_ACTIVE_REQUESTS: usize = 100;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestLogEntry {
     pub req_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     pub timestamp_secs: u64,
     pub upstream: String,
     pub model: Option<String>,
     pub path: String,
     pub status: u16,
+    pub is_stream: Option<bool>,
     pub ttft_ms: u64,
     pub duration_ms: u64,
     pub total_bytes: u64,
@@ -59,11 +64,34 @@ pub struct GatewayStatsSnapshot {
     pub recent_requests: Vec<RequestLogEntry>,
 }
 
-struct PendingMeta {
+#[derive(Default, Serialize)]
+pub struct ActiveRequestsSnapshot {
+    total: usize,
+    requests: Vec<ActiveRequest>,
+}
+
+#[derive(Serialize)]
+struct ActiveRequest {
+    req_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     user_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
     upstream: String,
     model: Option<String>,
     path: String,
+    elapsed_ms: u64,
+    is_stream: Option<bool>,
+}
+
+struct PendingMeta {
+    lifetime: Weak<Instant>,
+    user_id: Option<i64>,
+    username: Option<String>,
+    upstream: String,
+    model: Option<String>,
+    path: String,
+    is_stream: Option<bool>,
 }
 
 struct InnerMetrics {
@@ -116,10 +144,13 @@ impl MetricsStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_start(
         &self,
         req_id: RequestId,
+        lifetime: Weak<Instant>,
         user_id: Option<i64>,
+        username: Option<String>,
         upstream: String,
         model: Option<String>,
         path: String,
@@ -128,13 +159,69 @@ impl MetricsStore {
             g.pending.insert(
                 req_id,
                 PendingMeta {
+                    lifetime,
                     user_id,
+                    username,
                     upstream,
                     model,
                     path,
+                    is_stream: None,
                 },
             );
         }
+    }
+
+    pub fn record_first_byte(&self, req_id: RequestId, is_stream: bool) {
+        if let Ok(mut g) = self.inner.lock()
+            && let Some(meta) = g.pending.get_mut(&req_id)
+        {
+            meta.is_stream = Some(is_stream);
+        }
+    }
+
+    pub fn prune_inactive_requests(&self) -> Vec<RequestId> {
+        let mut inactive = Vec::new();
+        if let Ok(mut g) = self.inner.lock() {
+            g.pending.retain(|req_id, meta| {
+                let active = meta.lifetime.strong_count() > 0;
+                if !active {
+                    inactive.push(*req_id);
+                }
+                active
+            });
+        }
+        inactive
+    }
+
+    pub fn active_requests(&self, owner: Option<i64>) -> ActiveRequestsSnapshot {
+        let g = self.inner.lock().expect("metrics mutex poisoned");
+        let mut active: Vec<_> = g
+            .pending
+            .iter()
+            .filter(|(_, meta)| owner.is_none() || owner == meta.user_id)
+            .filter_map(|(id, meta)| Some((id, meta, *meta.lifetime.upgrade()?)))
+            .collect();
+        let total = active.len();
+        if total > MAX_ACTIVE_REQUESTS {
+            active.select_nth_unstable_by_key(MAX_ACTIVE_REQUESTS, |(id, _, _)| Reverse(id.0));
+            active.truncate(MAX_ACTIVE_REQUESTS);
+        }
+        active.sort_unstable_by_key(|(id, _, _)| Reverse(id.0));
+        let now = Instant::now();
+        let requests = active
+            .into_iter()
+            .map(|(id, meta, started_at)| ActiveRequest {
+                req_id: id.to_string(),
+                user_id: meta.user_id,
+                username: meta.username.clone(),
+                upstream: meta.upstream.clone(),
+                model: meta.model.clone(),
+                path: meta.path.split('?').next().unwrap_or_default().to_string(),
+                elapsed_ms: now.saturating_duration_since(started_at).as_millis() as u64,
+                is_stream: meta.is_stream,
+            })
+            .collect();
+        ActiveRequestsSnapshot { total, requests }
     }
 
     /// Preload recent logs from SQLite on startup so history survives restarts.
@@ -183,21 +270,26 @@ impl MetricsStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_end(
         &self,
         req_id: RequestId,
         status: u16,
+        is_stream: bool,
         total_bytes: u64,
         ttft_ms: Option<u64>,
         duration_ms: u64,
         usage: TokenUsage,
     ) -> Option<RequestLogEntry> {
         if let Ok(mut g) = self.inner.lock() {
-            let meta = g.pending.remove(&req_id).unwrap_or(PendingMeta {
+            let meta = g.pending.remove(&req_id).unwrap_or_else(|| PendingMeta {
+                lifetime: Weak::new(),
                 user_id: None,
+                username: None,
                 upstream: "unknown".into(),
                 model: None,
                 path: "-".into(),
+                is_stream: None,
             });
 
             g.total_requests += 1;
@@ -242,11 +334,13 @@ impl MetricsStore {
             let entry = RequestLogEntry {
                 req_id: req_id.to_string(),
                 user_id: meta.user_id,
+                username: meta.username,
                 timestamp_secs: now_secs(),
                 upstream: meta.upstream,
                 model: meta.model,
                 path: meta.path,
                 status,
+                is_stream: Some(is_stream),
                 ttft_ms: ttft_ms.unwrap_or(0),
                 duration_ms,
                 total_bytes,
@@ -404,6 +498,47 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn active_requests_follow_lifetime_and_owner() {
+        let store = MetricsStore::new();
+        let lifetime = Arc::new(Instant::now());
+        let id = RequestId::next();
+        store.record_start(
+            id,
+            Arc::downgrade(&lifetime),
+            Some(1),
+            Some("alice".into()),
+            "primary".into(),
+            Some("model".into()),
+            "/v1/messages?private=value".into(),
+        );
+        assert_eq!(store.active_requests(None).total, 1);
+        assert_eq!(store.active_requests(Some(2)).total, 0);
+        assert_eq!(store.active_requests(Some(1)).requests[0].is_stream, None);
+
+        store.record_start(
+            id,
+            Arc::downgrade(&lifetime),
+            Some(1),
+            Some("alice".into()),
+            "backup".into(),
+            Some("model".into()),
+            "/v1/messages?private=value".into(),
+        );
+        store.record_first_byte(id, true);
+        let active = store.active_requests(Some(1));
+        assert_eq!(active.total, 1);
+        assert_eq!(active.requests[0].upstream, "backup");
+        assert_eq!(active.requests[0].path, "/v1/messages");
+        assert_eq!(active.requests[0].is_stream, Some(true));
+
+        drop(lifetime);
+        assert_eq!(store.active_requests(None).total, 0);
+        assert_eq!(store.prune_inactive_requests(), vec![id]);
+        assert!(store.prune_inactive_requests().is_empty());
+    }
 
     #[test]
     fn computes_weighted_and_per_upstream_cache_hit_rates() {
@@ -411,10 +546,19 @@ mod tests {
 
         // Request 1 on up-a: 1000 input, 800 cache_read
         let id1 = RequestId::next();
-        store.record_start(id1, Some(1), "up-a".into(), Some("gpt-4o".into()), "/v1/chat/completions".into());
+        store.record_start(
+            id1,
+            Weak::new(),
+            Some(1),
+            Some("alice".into()),
+            "up-a".into(),
+            Some("gpt-4o".into()),
+            "/v1/chat/completions".into(),
+        );
         store.record_end(
             id1,
             200,
+            true,
             128,
             Some(120),
             200,
@@ -429,11 +573,20 @@ mod tests {
 
         // Request 2 on up-b: 3000 input, 0 cache_read, 3000 cache_write
         let id2 = RequestId::next();
-        store.record_start(id2, Some(1), "up-b".into(), Some("claude-sonnet-4".into()), "/v1/messages".into());
+        store.record_start(
+            id2,
+            Weak::new(),
+            Some(1),
+            Some("alice".into()),
+            "up-b".into(),
+            Some("claude-sonnet-4".into()),
+            "/v1/messages".into(),
+        );
         let e2 = store
             .record_end(
                 id2,
                 200,
+                false,
                 128,
                 Some(250),
                 400,
@@ -448,6 +601,10 @@ mod tests {
             .unwrap();
 
         let snap = store.snapshot();
+        assert_eq!(snap.recent_requests[1].user_id, Some(1));
+        assert_eq!(snap.recent_requests[1].username.as_deref(), Some("alice"));
+        assert_eq!(snap.recent_requests[1].is_stream, Some(true));
+        assert_eq!(e2.is_stream, Some(false));
         // Weighted global token hit rate: 800 / 4000 = 20.0%
         assert_eq!(snap.total_input_tokens, 4000);
         assert_eq!(snap.total_cache_read_tokens, 800);

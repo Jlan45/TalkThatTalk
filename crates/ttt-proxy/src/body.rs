@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -19,7 +20,9 @@ pin_project! {
         #[pin]
         inner: B,
         req_id: RequestId,
+        lifetime: Option<Arc<Instant>>,
         status: StatusCode,
+        is_stream: bool,
         started_at: Instant,
         ttft_ms: Option<u64>,
         total_bytes: u64,
@@ -35,7 +38,9 @@ pin_project! {
                 if let Some(tx) = this.tap_tx.take() {
                     let _ = tx.try_send(TapEvent::ResponseEnd {
                         req_id: *this.req_id,
+                        lifetime: this.lifetime.take(),
                         status: *this.status,
+                        is_stream: *this.is_stream,
                         total_bytes: *this.total_bytes,
                         ttft_ms: *this.ttft_ms,
                         duration_ms: this.started_at.elapsed().as_millis() as u64,
@@ -50,14 +55,18 @@ impl<B> TapBody<B> {
     pub fn new(
         inner: B,
         req_id: RequestId,
+        lifetime: Option<Arc<Instant>>,
         status: StatusCode,
+        is_stream: bool,
         started_at: Instant,
         tap_tx: Option<mpsc::Sender<TapEvent>>,
     ) -> Self {
         Self {
             inner,
             req_id,
+            lifetime,
             status,
+            is_stream,
             started_at,
             ttft_ms: None,
             total_bytes: 0,
@@ -93,6 +102,7 @@ where
                             let _ = tx.try_send(TapEvent::ResponseFirstByte {
                                 req_id: *this.req_id,
                                 status: *this.status,
+                                is_stream: *this.is_stream,
                                 ttft_ms: ttft,
                             });
                         }
@@ -113,7 +123,9 @@ where
                     if let Some(tx) = this.tap_tx.take() {
                         let _ = tx.try_send(TapEvent::ResponseEnd {
                             req_id: *this.req_id,
+                            lifetime: this.lifetime.take(),
                             status: *this.status,
+                            is_stream: *this.is_stream,
                             total_bytes: *this.total_bytes,
                             ttft_ms: *this.ttft_ms,
                             duration_ms: this.started_at.elapsed().as_millis() as u64,
@@ -128,7 +140,9 @@ where
                     if let Some(tx) = this.tap_tx.take() {
                         let _ = tx.try_send(TapEvent::ResponseEnd {
                             req_id: *this.req_id,
+                            lifetime: this.lifetime.take(),
                             status: *this.status,
+                            is_stream: *this.is_stream,
                             total_bytes: *this.total_bytes,
                             ttft_ms: *this.ttft_ms,
                             duration_ms: this.started_at.elapsed().as_millis() as u64,
@@ -241,12 +255,14 @@ impl ProxyBody {
     pub fn tap(
         incoming: Incoming,
         req_id: RequestId,
+        lifetime: Option<Arc<Instant>>,
         status: StatusCode,
+        is_stream: bool,
         started_at: Instant,
         tap_tx: Option<mpsc::Sender<TapEvent>>,
     ) -> Self {
         Self::Tap {
-            inner: TapBody::new(incoming, req_id, status, started_at, tap_tx),
+            inner: TapBody::new(incoming, req_id, lifetime, status, is_stream, started_at, tap_tx),
         }
     }
 
@@ -254,11 +270,12 @@ impl ProxyBody {
         incoming: Incoming,
         translator: SseTranslator,
         req_id: RequestId,
+        lifetime: Option<Arc<Instant>>,
         status: StatusCode,
         started_at: Instant,
         tap_tx: Option<mpsc::Sender<TapEvent>>,
     ) -> Self {
-        let tapped = TapBody::new(incoming, req_id, status, started_at, tap_tx);
+        let tapped = TapBody::new(incoming, req_id, lifetime, status, true, started_at, tap_tx);
         Self::Translated {
             inner: TranslatedStreamBody::new(tapped, translator),
         }

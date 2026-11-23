@@ -163,13 +163,32 @@ export interface UpstreamStats {
   cache_hit_rate: number;
 }
 
+export interface ActiveRequest {
+  req_id: string;
+  user_id?: number;
+  username?: string;
+  upstream: string;
+  model?: string | null;
+  path: string;
+  elapsed_ms: number;
+  is_stream: boolean | null;
+}
+
+export interface ActiveRequestsSnapshot {
+  total: number;
+  requests: ActiveRequest[];
+}
+
 export interface RequestLogEntry {
   req_id: string;
+  user_id?: number;
+  username?: string;
   timestamp_secs: number;
   upstream: string;
   model?: string;
   path: string;
   status: number;
+  is_stream?: boolean | null;
   ttft_ms: number;
   duration_ms: number;
   total_bytes: number;

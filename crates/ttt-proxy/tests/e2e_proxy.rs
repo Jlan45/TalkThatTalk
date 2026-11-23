@@ -480,16 +480,21 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
 
     let mut saw_first_byte = false;
     let mut saw_chunk = false;
-    let mut saw_end = false;
-    while let Ok(ev) = tap_rx.try_recv() {
-        match ev {
-            TapEvent::ResponseFirstByte { .. } => saw_first_byte = true,
-            TapEvent::ResponseChunk { .. } => saw_chunk = true,
-            TapEvent::ResponseEnd { .. } => saw_end = true,
-            _ => {}
+    let mut saw_stream_end = false;
+    let mut saw_json_end = false;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !(saw_first_byte && saw_chunk && saw_stream_end && saw_json_end) {
+            match tap_rx.recv().await.unwrap() {
+                TapEvent::ResponseFirstByte { .. } => saw_first_byte = true,
+                TapEvent::ResponseChunk { .. } => saw_chunk = true,
+                TapEvent::ResponseEnd { is_stream: true, .. } => saw_stream_end = true,
+                TapEvent::ResponseEnd { is_stream: false, .. } => saw_json_end = true,
+                _ => {}
+            }
         }
-    }
-    assert!(saw_first_byte && saw_chunk && saw_end);
+    })
+    .await
+    .expect("missing JSON or SSE tap events");
 
     // 6. Pre-first-byte retry on 503 automatically fails over to healthy backup.
     let resp = client
@@ -974,6 +979,16 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
     let (gemini_addr, _h_gem) = spawn_mock_upstream(|req| async move {
         let pq = req.uri().path_and_query().unwrap().as_str().to_string();
         if pq.contains(":streamGenerateContent") {
+            if !pq.contains("alt=sse") {
+                let chunks = vec![
+                    Ok(Frame::data(Bytes::from_static(b"[{}"))),
+                    Ok(Frame::data(Bytes::from_static(b",{}]"))),
+                ];
+                return Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(StreamBody::new(stream::iter(chunks)).boxed())
+                    .unwrap();
+            }
             let chunks = vec![
                 Ok(Frame::data(Bytes::from_static(
                     b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello from gemini\"}]}}]}\n\n",
@@ -1112,7 +1127,7 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
         ],
     };
 
-    let (gw_addr, _tap_rx, _gw) = spawn_gateway(cfg, None).await;
+    let (gw_addr, mut tap_rx, _gw) = spawn_gateway(cfg, None).await;
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
 
     // 1. OpenAI client -> Anthropic upstream (non-streaming + streaming)
@@ -1150,6 +1165,19 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
     .unwrap();
     assert!(sse.contains("hello from claude"));
     assert!(sse.contains("[DONE]"));
+
+    let stream_statuses = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut statuses = Vec::new();
+        while statuses.len() < 2 {
+            if let TapEvent::ResponseEnd { is_stream, .. } = tap_rx.recv().await.unwrap() {
+                statuses.push(is_stream);
+            }
+        }
+        statuses
+    })
+    .await
+    .expect("missing translated response tap events");
+    assert_eq!(stream_statuses, [false, true]);
 
     // 2. OpenAI client -> Gemini upstream (streaming)
     let resp = client
@@ -1191,6 +1219,35 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
     assert!(sse.contains("event: message_start"));
     assert!(sse.contains("from deepseek"));
     assert!(sse.contains("event: message_stop"));
+
+    let resp = client
+        .request(
+            Request::post(format!(
+                "http://{gw_addr}/v1beta/models/gemini-2.5-flash:streamGenerateContent"
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-ttt-model", "gemini-2.5-flash")
+            .body(Full::new(Bytes::from_static(b"{}")))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let native_req_id = resp.headers()["x-ttt-request-id"].to_str().unwrap().to_owned();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), b"[{},{}]");
+    let is_stream = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let TapEvent::ResponseEnd { req_id, is_stream, .. } = tap_rx.recv().await.unwrap()
+                && req_id.to_string() == native_req_id
+            {
+                return is_stream;
+            }
+        }
+    })
+    .await
+    .expect("missing native Gemini response tap event");
+    assert!(is_stream);
 }
 
 #[tokio::test]

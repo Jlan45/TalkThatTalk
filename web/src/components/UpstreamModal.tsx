@@ -232,6 +232,30 @@ const PROVIDER_CATALOG: ProviderCatalogItem[] = [
     },
   },
   {
+    id: "minimax-api",
+    title: "MiniMax M Plan",
+    badge: "多协议直通",
+    logo: "minimax",
+    desc: "MiniMax 中国站订阅，支持 OpenAI Chat、Responses 与 Anthropic Messages",
+    authMode: "api_key",
+    defaultName: "minimax-api",
+    baseUrl: "https://api.minimax.cn",
+    modelsPath: "/v1/models",
+    protocolEndpoints: [
+      { protocol: "openai", endpoint: "/v1/chat/completions" },
+      { protocol: "openai_responses", endpoint: "/v1/responses" },
+      { protocol: "anthropic", endpoint: "/anthropic/v1/messages" },
+    ],
+    headerName: "authorization",
+    headerPrefix: "Bearer ",
+    suggestedModels: ["MiniMax-M3.1-Flash"],
+    protocolHeaders: {
+      anthropic: {
+        "anthropic-version": "2023-06-01",
+      },
+    },
+  },
+  {
     id: "opencode-go",
     title: "OpenCode Go",
     badge: "多协议直通",

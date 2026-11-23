@@ -279,73 +279,108 @@ async fn run_tap_worker(
     db: Arc<GatewayDb>,
 ) {
     let mut active_usage: HashMap<RequestId, UsageAccumulator> = HashMap::new();
+    let mut cleanup = tokio::time::interval(Duration::from_secs(15));
+    cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    while let Some(event) = rx.recv().await {
-        match event {
-            TapEvent::RequestStart {
-                req_id,
-                user_id,
-                upstream,
-                model,
-                path,
-            } => {
-                active_usage.insert(req_id, UsageAccumulator::new());
-                metrics.record_start(req_id, user_id, upstream.clone(), model.clone(), path.clone());
-                tracing::debug!(
-                    %req_id,
-                    %upstream,
-                    model = model.as_deref().unwrap_or("-"),
-                    %path,
-                    "proxy request started"
-                );
-            }
-            TapEvent::ResponseFirstByte {
-                req_id,
-                status,
-                ttft_ms,
-            } => {
-                tracing::debug!(%req_id, %status, ttft_ms, "first response byte forwarded");
-            }
-            TapEvent::ResponseChunk { req_id, data } => {
-                if let Some(acc) = active_usage.get_mut(&req_id) {
-                    acc.push_chunk(&data);
+    const BATCH_SIZE: usize = 64;
+    let mut events = Vec::with_capacity(BATCH_SIZE);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cleanup.tick() => {
+                for req_id in metrics.prune_inactive_requests() {
+                    active_usage.remove(&req_id);
                 }
             }
-            TapEvent::ResponseEnd {
-                req_id,
-                status,
-                total_bytes,
-                ttft_ms,
-                duration_ms,
-            } => {
-                let usage = active_usage
-                    .remove(&req_id)
-                    .map(|mut acc| acc.finish())
-                    .unwrap_or_default();
-                if let Some(entry) = metrics.record_end(
+            count = rx.recv_many(&mut events, BATCH_SIZE) => {
+                if count == 0 {
+                    break;
+                }
+            }
+        }
+        for event in events.drain(..) {
+            match event {
+                TapEvent::RequestStart {
                     req_id,
-                    status.as_u16(),
+                    lifetime,
+                    user_id,
+                    upstream,
+                    model,
+                    path,
+                } => {
+                    active_usage.insert(req_id, UsageAccumulator::new());
+                    let username = user_id
+                        .and_then(|id| db.get_user_by_id(id).ok().flatten())
+                        .map(|user| user.username);
+                    tracing::debug!(
+                        %req_id,
+                        user_id,
+                        username = username.as_deref(),
+                        %upstream,
+                        model = model.as_deref().unwrap_or("-"),
+                        %path,
+                        "proxy request started"
+                    );
+                    metrics.record_start(req_id, lifetime, user_id, username, upstream, model, path);
+                }
+                TapEvent::ResponseFirstByte {
+                    req_id,
+                    status,
+                    is_stream,
+                    ttft_ms,
+                } => {
+                    metrics.record_first_byte(req_id, is_stream);
+                    tracing::debug!(%req_id, %status, ttft_ms, "first response byte forwarded");
+                }
+                TapEvent::ResponseChunk { req_id, data } => {
+                    if let Some(acc) = active_usage.get_mut(&req_id) {
+                        acc.push_chunk(&data);
+                    }
+                }
+                TapEvent::ResponseEnd {
+                    req_id,
+                    lifetime: _lifetime,
+                    status,
+                    is_stream,
                     total_bytes,
                     ttft_ms,
                     duration_ms,
-                    usage.clone(),
-                ) && let Err(err) = db.insert_request_log(&entry)
-                {
-                    tracing::debug!(error = %err, "failed to persist request log to SQLite");
+                } => {
+                    let usage = active_usage
+                        .remove(&req_id)
+                        .map(|mut acc| acc.finish())
+                        .unwrap_or_default();
+                    let entry = metrics.record_end(
+                        req_id,
+                        status.as_u16(),
+                        is_stream,
+                        total_bytes,
+                        ttft_ms,
+                        duration_ms,
+                        usage.clone(),
+                    );
+                    if let Some(entry) = &entry
+                        && let Err(err) = db.insert_request_log(entry)
+                    {
+                        tracing::debug!(error = %err, "failed to persist request log to SQLite");
+                    }
+                    info!(
+                        %req_id,
+                        %status,
+                        user_id = entry.as_ref().and_then(|entry| entry.user_id),
+                        username = entry.as_ref().and_then(|entry| entry.username.as_deref()),
+                        is_stream,
+                        total_bytes,
+                        ttft_ms = ttft_ms.unwrap_or(0),
+                        duration_ms,
+                        input_tokens = usage.input_tokens,
+                        output_tokens = usage.output_tokens,
+                        total_tokens = usage.total_tokens,
+                        cache_read_tokens = usage.cache_read_tokens,
+                        cache_write_tokens = usage.cache_write_tokens,
+                        "proxy request completed"
+                    );
                 }
-                info!(
-                    %req_id,
-                    %status,
-                    total_bytes,
-                    ttft_ms = ttft_ms.unwrap_or(0),
-                    duration_ms,
-                    input_tokens = usage.input_tokens,
-                    output_tokens = usage.output_tokens,
-                    total_tokens = usage.total_tokens,
-                    cache_read_tokens = usage.cache_read_tokens,
-                    cache_write_tokens = usage.cache_write_tokens,
-                    "proxy request completed"
-                );
             }
         }
     }

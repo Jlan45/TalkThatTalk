@@ -475,8 +475,9 @@ impl GatewayDb {
         conn.execute(
             "INSERT OR REPLACE INTO request_logs
                (req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms, duration_ms,
-                total_bytes, input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                total_bytes, input_tokens, output_tokens, total_tokens, cache_read_tokens,
+                cache_write_tokens, username, is_stream)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 entry.req_id,
                 entry.user_id,
@@ -493,6 +494,8 @@ impl GatewayDb {
                 entry.total_tokens as i64,
                 entry.cache_read_tokens as i64,
                 entry.cache_write_tokens as i64,
+                entry.username,
+                entry.is_stream,
             ],
         )
         .map_err(db_err)?;
@@ -508,33 +511,17 @@ impl GatewayDb {
             .prepare(
                 "SELECT req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms,
                         duration_ms, total_bytes, input_tokens, output_tokens, total_tokens,
-                        cache_read_tokens, cache_write_tokens
-                 FROM request_logs
-                 ORDER BY id DESC
+                        cache_read_tokens, cache_write_tokens, COALESCE(log.username, users.username),
+                        is_stream
+                 FROM request_logs AS log
+                 LEFT JOIN users ON users.id = log.user_id
+                 ORDER BY log.id DESC
                  LIMIT ?1",
             )
             .map_err(db_err)?;
 
         let rows = stmt
-            .query_map(params![limit as i64], |row| {
-                Ok(RequestLogEntry {
-                    req_id: row.get(0)?,
-                    user_id: row.get(1)?,
-                    timestamp_secs: row.get::<_, i64>(2)? as u64,
-                    upstream: row.get(3)?,
-                    model: row.get(4)?,
-                    path: row.get(5)?,
-                    status: row.get::<_, i64>(6)? as u16,
-                    ttft_ms: row.get::<_, i64>(7)? as u64,
-                    duration_ms: row.get::<_, i64>(8)? as u64,
-                    total_bytes: row.get::<_, i64>(9)? as u64,
-                    input_tokens: row.get::<_, i64>(10)? as u64,
-                    output_tokens: row.get::<_, i64>(11)? as u64,
-                    total_tokens: row.get::<_, i64>(12)? as u64,
-                    cache_read_tokens: row.get::<_, i64>(13)? as u64,
-                    cache_write_tokens: row.get::<_, i64>(14)? as u64,
-                })
-            })
+            .query_map(params![limit as i64], read_request_log)
             .map_err(db_err)?;
 
         let mut out = Vec::new();
@@ -557,34 +544,18 @@ impl GatewayDb {
             .prepare(
                 "SELECT req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms,
                         duration_ms, total_bytes, input_tokens, output_tokens, total_tokens,
-                        cache_read_tokens, cache_write_tokens
-                 FROM request_logs
-                 WHERE user_id = ?1
-                 ORDER BY id DESC
+                        cache_read_tokens, cache_write_tokens, COALESCE(log.username, users.username),
+                        is_stream
+                 FROM request_logs AS log
+                 LEFT JOIN users ON users.id = log.user_id
+                 WHERE log.user_id = ?1
+                 ORDER BY log.id DESC
                  LIMIT ?2",
             )
             .map_err(db_err)?;
 
         let rows = stmt
-            .query_map(params![user_id, limit as i64], |row| {
-                Ok(RequestLogEntry {
-                    req_id: row.get(0)?,
-                    user_id: row.get(1)?,
-                    timestamp_secs: row.get::<_, i64>(2)? as u64,
-                    upstream: row.get(3)?,
-                    model: row.get(4)?,
-                    path: row.get(5)?,
-                    status: row.get::<_, i64>(6)? as u16,
-                    ttft_ms: row.get::<_, i64>(7)? as u64,
-                    duration_ms: row.get::<_, i64>(8)? as u64,
-                    total_bytes: row.get::<_, i64>(9)? as u64,
-                    input_tokens: row.get::<_, i64>(10)? as u64,
-                    output_tokens: row.get::<_, i64>(11)? as u64,
-                    total_tokens: row.get::<_, i64>(12)? as u64,
-                    cache_read_tokens: row.get::<_, i64>(13)? as u64,
-                    cache_write_tokens: row.get::<_, i64>(14)? as u64,
-                })
-            })
+            .query_map(params![user_id, limit as i64], read_request_log)
             .map_err(db_err)?;
 
         let mut out = Vec::new();
@@ -1146,7 +1117,9 @@ fn init_schema(conn: &Connection) -> Result<(), GatewayError> {
              output_tokens INTEGER NOT NULL,
              total_tokens INTEGER NOT NULL,
              cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-             cache_write_tokens INTEGER NOT NULL DEFAULT 0
+             cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+             username TEXT,
+             is_stream INTEGER
          );
 
          CREATE TABLE IF NOT EXISTS quota_snapshots (
@@ -1188,7 +1161,31 @@ fn init_schema(conn: &Connection) -> Result<(), GatewayError> {
         "ALTER TABLE request_logs ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN username TEXT", []);
+    let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN is_stream INTEGER", []);
     Ok(())
+}
+
+fn read_request_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogEntry> {
+    Ok(RequestLogEntry {
+        req_id: row.get(0)?,
+        user_id: row.get(1)?,
+        timestamp_secs: row.get::<_, i64>(2)? as u64,
+        upstream: row.get(3)?,
+        model: row.get(4)?,
+        path: row.get(5)?,
+        status: row.get::<_, i64>(6)? as u16,
+        ttft_ms: row.get::<_, i64>(7)? as u64,
+        duration_ms: row.get::<_, i64>(8)? as u64,
+        total_bytes: row.get::<_, i64>(9)? as u64,
+        input_tokens: row.get::<_, i64>(10)? as u64,
+        output_tokens: row.get::<_, i64>(11)? as u64,
+        total_tokens: row.get::<_, i64>(12)? as u64,
+        cache_read_tokens: row.get::<_, i64>(13)? as u64,
+        cache_write_tokens: row.get::<_, i64>(14)? as u64,
+        username: row.get(15)?,
+        is_stream: row.get(16)?,
+    })
 }
 
 fn encrypt_bytes(key: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), GatewayError> {
@@ -1359,15 +1356,17 @@ mod tests {
             Some("secret-admin")
         );
 
-        // Verify request_logs persistence with cache token fields
+        // Verify request log persistence
         db.insert_request_log(&RequestLogEntry {
             req_id: "req-cache-1".into(),
             user_id: Some(7),
+            username: Some("alice".into()),
             timestamp_secs: 1_700_000_000,
             upstream: "deepseek".into(),
             model: Some("deepseek-chat".into()),
             path: "/v1/chat/completions".into(),
             status: 200,
+            is_stream: Some(true),
             ttft_ms: 95,
             duration_ms: 420,
             total_bytes: 512,
@@ -1380,7 +1379,41 @@ mod tests {
         .unwrap();
         let logs = db.load_recent_logs_for_user(7, 10).unwrap();
         assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].username.as_deref(), Some("alice"));
+        assert_eq!(logs[0].is_stream, Some(true));
         assert_eq!(logs[0].cache_read_tokens, 8_000);
         assert_eq!(logs[0].cache_write_tokens, 500);
+        assert!(db.load_recent_logs_for_user(8, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrates_logs_without_username_or_stream_status() {
+        let db = GatewayDb::open_in_memory([11u8; 32]).unwrap();
+        let user = db
+            .create_user("alice", "hash", "user", true, true, false, &[], false, &[])
+            .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "ALTER TABLE request_logs DROP COLUMN username;
+                 ALTER TABLE request_logs DROP COLUMN is_stream;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO request_logs
+                   (req_id, user_id, timestamp_secs, upstream, path, status, ttft_ms, duration_ms,
+                    total_bytes, input_tokens, output_tokens, total_tokens)
+                 VALUES ('req-legacy', ?1, 0, 'upstream', '/v1/messages', 200, 0, 0, 0, 0, 0, 0)",
+                [user.id],
+            )
+            .unwrap();
+            init_schema(&conn).unwrap();
+        }
+
+        let logs = db.load_recent_logs(10).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].user_id, Some(user.id));
+        assert_eq!(logs[0].username.as_deref(), Some("alice"));
+        assert_eq!(logs[0].is_stream, None);
     }
 }

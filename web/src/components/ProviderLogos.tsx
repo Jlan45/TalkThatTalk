@@ -3,6 +3,7 @@ import claudeCodeColor from "@lobehub/icons-static-svg/icons/claudecode-color.sv
 import codexColor from "@lobehub/icons-static-svg/icons/codex-color.svg";
 import deepseekColor from "@lobehub/icons-static-svg/icons/deepseek-color.svg";
 import geminiColor from "@lobehub/icons-static-svg/icons/gemini-color.svg";
+import minimaxColor from "@lobehub/icons-static-svg/icons/minimax-color.svg";
 import ollamaMono from "@lobehub/icons-static-svg/icons/ollama.svg";
 import openaiMono from "@lobehub/icons-static-svg/icons/openai.svg";
 import opencodeMono from "@lobehub/icons-static-svg/icons/opencode.svg";
@@ -19,6 +20,7 @@ export type ProviderLogoId =
   | "claude"
   | "claudecode"
   | "gemini"
+  | "minimax"
   | "deepseek"
   | "openrouter"
   | "qwen"
@@ -48,6 +50,9 @@ export function detectProviderLogo(opts: {
   }
   if (opts.preset === "claude_code" || n.includes("claude-code") || n.includes("claudecode")) {
     return "claudecode";
+  }
+  if (n.includes("minimax") || u.includes("api.minimax.cn") || u.includes("api.minimaxi.com")) {
+    return "minimax";
   }
   if (
     opts.protocol === "anthropic" ||
@@ -85,6 +90,7 @@ const LOGO_ASSETS: Record<
   claude: { src: claudeColor },
   claudecode: { src: claudeCodeColor },
   gemini: { src: geminiColor },
+  minimax: { src: minimaxColor },
   deepseek: { src: deepseekColor },
   openrouter: { src: openrouterColor },
   qwen: { src: qwenColor },

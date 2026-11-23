@@ -85,7 +85,7 @@
 curl -fsSL https://github.com/Jlan45/TalkThatTalk/releases/latest/download/install.sh | sudo bash
 
 # 安装指定版本
-curl -fsSL https://github.com/Jlan45/TalkThatTalk/releases/download/v0.0.3/install.sh | sudo bash -s -- v0.0.3
+curl -fsSL https://github.com/Jlan45/TalkThatTalk/releases/download/v0.0.4/install.sh | sudo bash -s -- v0.0.4
 
 # 卸载服务，保留配置和数据
 curl -fsSL https://github.com/Jlan45/TalkThatTalk/releases/latest/download/uninstall.sh | sudo bash

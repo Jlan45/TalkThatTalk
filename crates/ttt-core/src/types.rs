@@ -15,6 +15,10 @@ impl RequestId {
     pub fn next() -> Self {
         Self(NEXT_REQ_ID.fetch_add(1, Ordering::Relaxed))
     }
+
+    pub fn resume_after(latest: u64) {
+        NEXT_REQ_ID.fetch_max(latest.saturating_add(1), Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Display for RequestId {

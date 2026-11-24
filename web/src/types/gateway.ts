@@ -4,6 +4,7 @@ export type PromptCacheMode =
   | "auto"
   | "open_ai"
   | "strip_open_ai_cache_fields"
+  | "volcengine_ark"
   | "xai_grok"
   | "open_router"
   | "opencode"

@@ -16,7 +16,17 @@ use ttt_core::{
     UpstreamConfig,
 };
 
-use crate::metrics::RequestLogEntry;
+use crate::metrics::{MetricsStore, RequestLogEntry};
+
+const REQUEST_LOGS_NEWEST_FIRST: &str =
+    "SELECT req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms,
+            duration_ms, total_bytes, input_tokens, output_tokens, total_tokens,
+            cache_read_tokens, cache_write_tokens, COALESCE(log.username, users.username),
+            is_stream, ttft_measured, stream_failure
+     FROM request_logs AS log
+     LEFT JOIN users ON users.id = log.user_id
+     ORDER BY log.id DESC
+     LIMIT ?1";
 
 pub type OwnedClientKey = (ClientKeyConfig, Option<i64>, Option<String>);
 
@@ -510,18 +520,7 @@ impl GatewayDb {
             .conn
             .lock()
             .map_err(|_| GatewayError::Internal("db mutex poisoned".into()))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms,
-                        duration_ms, total_bytes, input_tokens, output_tokens, total_tokens,
-                        cache_read_tokens, cache_write_tokens, COALESCE(log.username, users.username),
-                        is_stream, ttft_measured, stream_failure
-                 FROM request_logs AS log
-                 LEFT JOIN users ON users.id = log.user_id
-                 ORDER BY log.id DESC
-                 LIMIT ?1",
-            )
-            .map_err(db_err)?;
+        let mut stmt = conn.prepare(REQUEST_LOGS_NEWEST_FIRST).map_err(db_err)?;
 
         let rows = stmt
             .query_map(params![limit as i64], read_request_log)
@@ -532,6 +531,18 @@ impl GatewayDb {
             out.push(row.map_err(db_err)?);
         }
         Ok(out)
+    }
+
+    /// Restore the global counters and return the highest persisted request identifier.
+    pub fn restore_request_metrics(&self, metrics: &MetricsStore) -> Result<u64, GatewayError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| GatewayError::Internal("db mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(REQUEST_LOGS_NEWEST_FIRST).map_err(db_err)?;
+        // A negative SQLite LIMIT streams all rows without collecting the full history.
+        let rows = stmt.query_map([-1], read_request_log).map_err(db_err)?;
+        metrics.restore_logs(rows.map(|row| row.map_err(db_err)))
     }
 
     pub fn load_recent_logs_for_user(
@@ -1306,6 +1317,46 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use ttt_core::{ProtocolFamily, UpstreamAuthConfig};
+
+    #[test]
+    fn restores_totals_and_request_sequence_beyond_the_recent_log_window() {
+        let db = GatewayDb::open_in_memory([11u8; 32]).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "WITH RECURSIVE sequence(n) AS (
+                 VALUES(1)
+                 UNION ALL
+                 SELECT n + 1 FROM sequence WHERE n < 150
+             )
+             INSERT INTO request_logs
+                 (req_id, timestamp_secs, upstream, model, path, status, ttft_ms,
+                  ttft_measured, duration_ms, total_bytes, input_tokens, output_tokens,
+                  total_tokens, cache_read_tokens, stream_failure)
+             SELECT 'req-' || CASE WHEN n = 1 THEN 900 ELSE n END,
+                    n, 'upstream', 'model', '/v1/messages', 200, 40, n = 1,
+                    50, 10, 20, 5, 25, 15, CASE WHEN n = 1 THEN 'incomplete' END
+             FROM sequence;",
+            )
+            .unwrap();
+
+        let metrics = MetricsStore::new();
+        assert_eq!(db.restore_request_metrics(&metrics).unwrap(), 900);
+        let stats = metrics.snapshot();
+        assert_eq!(stats.total_requests, 150);
+        assert_eq!(stats.success_requests, 149);
+        assert_eq!(stats.error_requests, 1);
+        assert_eq!(stats.total_tokens, 3750);
+        assert_eq!(stats.cache_hit_rate, 75.0);
+        assert_eq!(stats.ttft_sample_count, 1);
+        assert_eq!(stats.avg_ttft_ms, 40);
+        assert_eq!(stats.by_upstream["upstream"].requests, 150);
+        assert_eq!(stats.by_model["model"], 150);
+        assert_eq!(stats.recent_requests.len(), 100);
+        assert_eq!(stats.recent_requests.first().unwrap().req_id, "req-150");
+        assert_eq!(stats.recent_requests.last().unwrap().req_id, "req-51");
+    }
 
     #[test]
     fn sqlite_crud_for_encrypted_upstreams_keys_and_logs() {

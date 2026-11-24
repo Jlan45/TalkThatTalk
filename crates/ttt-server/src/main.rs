@@ -161,9 +161,7 @@ async fn run_server(
     config.server.client_api_keys.clear();
 
     let metrics = Arc::new(MetricsStore::new());
-    if let Ok(recent) = db.load_recent_logs(100) {
-        metrics.preload_logs(recent);
-    }
+    RequestId::resume_after(db.restore_request_metrics(&metrics)?);
 
     let (tap_tx, tap_rx) = mpsc::channel::<TapEvent>(config.telemetry.tap_channel_capacity);
     let tap_worker = tokio::spawn(run_tap_worker(
@@ -193,6 +191,7 @@ async fn run_server(
 
     info!(
         %listen_addr,
+        db_path = %config.oauth_storage.db_path,
         upstreams = config.upstreams.len(),
         tcp_nodelay,
         "TalkThatTalk AI gateway listening"
@@ -267,6 +266,7 @@ async fn run_server(
         }
     }
 
+    drop(control);
     drop(engine);
     let _ = tokio::time::timeout(Duration::from_secs(2), tap_worker).await;
     info!("TalkThatTalk gateway stopped");
@@ -364,7 +364,7 @@ async fn run_tap_worker(
                     if let Some(entry) = &entry
                         && let Err(err) = db.insert_request_log(entry)
                     {
-                        tracing::debug!(error = %err, "failed to persist request log to SQLite");
+                        warn!(%req_id, error = %err, "failed to persist request log to SQLite");
                     }
                     info!(
                         %req_id,

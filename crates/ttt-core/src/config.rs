@@ -268,9 +268,11 @@ pub enum PromptCacheMode {
     Auto,
     /// OpenAI / Azure OpenAI / Codex style (`session_id` header on Responses, preserves `prompt_cache_key`).
     OpenAi,
-    /// Strict OpenAI-compatible providers (DeepSeek, Volcengine Ark): strip `prompt_cache_key`
+    /// Strict OpenAI-compatible providers (such as DeepSeek): strip `prompt_cache_key`
     /// and `prompt_cache_retention` before forwarding so upstream does not return 400.
     StripOpenAiCacheFields,
+    /// Volcengine Ark: preserve the routing affinity key and strip OpenAI-specific retention.
+    VolcengineArk,
     /// xAI Grok API (`x-grok-conv-id` outbound sticky header).
     XaiGrok,
     /// OpenRouter API (`x-session-id` outbound sticky header).
@@ -348,7 +350,7 @@ pub struct UpstreamConfig {
     pub strip_other_session_headers: bool,
 
     /// Built-in provider prompt cache compatibility mode (`auto`, `open_ai`,
-    /// `strip_open_ai_cache_fields`, `xai_grok`, `open_router`, `passthrough`).
+    /// `strip_open_ai_cache_fields`, `volcengine_ark`, `xai_grok`, `open_router`, `passthrough`).
     #[serde(default)]
     pub prompt_cache_mode: PromptCacheMode,
 }

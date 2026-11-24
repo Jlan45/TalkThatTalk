@@ -1577,16 +1577,20 @@ async fn e2e_client_key_provider_and_model_restrictions() {
 
 #[tokio::test]
 async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
+    use ttt_core::PromptCacheMode;
+
     const CHAT_DELTA: &str =
         "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
     const MESSAGES_DELTA: &str = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
+    const RESPONSES_DELTA: &str = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
     const CHAT_END: &str = "data: [DONE]\n\n";
     const MESSAGES_END: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    const RESPONSES_END: &str =
+        "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
     const STREAM_ERROR: &str =
         "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"provider error\"}}\n\n";
 
-    // A single mock upstream simulating Volcengine Agent Plan serving both
-    // Anthropic (/api/plan/v1/messages) and OpenAI (/api/plan/v3/chat/completions) natively.
+    // Simulate the native Anthropic, OpenAI Chat, and OpenAI Responses endpoints of Agent Plan.
     let stream_calls = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&stream_calls);
     let (multi_addr, _hm) = spawn_mock_upstream(move |req| {
@@ -1606,6 +1610,7 @@ async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
                 counter.fetch_add(1, Ordering::SeqCst);
                 let (delta, end) = match path.as_str() {
                     "/api/plan/v3/chat/completions" => (CHAT_DELTA, CHAT_END),
+                    "/api/plan/v3/responses" => (RESPONSES_DELTA, RESPONSES_END),
                     "/api/plan/v1/messages" => (MESSAGES_DELTA, MESSAGES_END),
                     _ => panic!("unexpected Agent Plan path {path}"),
                 };
@@ -1645,6 +1650,10 @@ async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
         ProtocolFamily::OpenAi,
         format!("http://{multi_addr}/api/plan/v3/chat/completions"),
     );
+    protocol_endpoints.insert(
+        ProtocolFamily::OpenAiResponses,
+        format!("http://{multi_addr}/api/plan/v3/responses"),
+    );
 
     let mut ant_headers = HashMap::new();
     ant_headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
@@ -1676,10 +1685,10 @@ async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
             max_retries: 0,
             owner_user_id: None,
             proxy: None,
-        quota: None,
-                session_header_out: None,
-                strip_other_session_headers: false,
-                prompt_cache_mode: Default::default(),
+            quota: None,
+            session_header_out: None,
+            strip_other_session_headers: false,
+            prompt_cache_mode: PromptCacheMode::VolcengineArk,
         }],
     };
 
@@ -1744,6 +1753,31 @@ async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
         raw_oai
     );
 
+    // Ark accepts the session key on Responses, independently of OpenAI's retention field.
+    let replies = [
+        br#"{ "model": "ark-code-latest", "input": "hi", "prompt_cache_key": "session-123" }"#.as_slice(),
+        br#"{ "model": "ark-code-latest", "input": "hi", "prompt_cache_key": "session-123", "prompt_cache_retention": "24h" }"#.as_slice(),
+    ];
+    for (index, body) in replies.into_iter().enumerate() {
+        let resp = client
+            .request(
+                Request::post(format!("http://{gw_addr}/v1/responses"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from_static(body)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.headers()["x-hit-path"], "/api/plan/v3/responses");
+        let forwarded = resp.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&forwarded).unwrap();
+        assert_eq!(value["prompt_cache_key"], "session-123");
+        assert!(value.get("prompt_cache_retention").is_none());
+        if index == 0 {
+            assert_eq!(forwarded.as_ref(), body);
+        }
+    }
+
     for (path, delta, end, marker) in [
         (
             "/v1/messages",
@@ -1756,6 +1790,12 @@ async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
             CHAT_DELTA,
             CHAT_END,
             "without [DONE]",
+        ),
+        (
+            "/v1/responses",
+            RESPONSES_DELTA,
+            RESPONSES_END,
+            "before a terminal response event",
         ),
     ] {
         let mut previous_id = None;
@@ -1819,7 +1859,7 @@ async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
             .unwrap();
         }
     }
-    assert_eq!(stream_calls.load(Ordering::SeqCst), 8);
+    assert_eq!(stream_calls.load(Ordering::SeqCst), 12);
 }
 
 #[tokio::test]

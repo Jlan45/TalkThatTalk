@@ -152,7 +152,6 @@ pub struct UpstreamNode {
     pub is_claude_code_oauth: bool,
     pub is_codex_oauth: bool,
     pub effective_cache_mode: PromptCacheMode,
-    pub strip_openai_cache_fields: bool,
     pub session_header_out: Option<HeaderName>,
     pub strip_other_session_headers: bool,
     pub owner_user_id: Option<i64>,
@@ -261,8 +260,6 @@ impl UpstreamNode {
         };
         let effective_cache_mode =
             resolve_effective_cache_mode(cfg, &endpoints, is_codex_oauth);
-        let strip_openai_cache_fields =
-            effective_cache_mode == PromptCacheMode::StripOpenAiCacheFields;
 
         Ok(Self {
             name: cfg.name.clone(),
@@ -272,7 +269,6 @@ impl UpstreamNode {
             is_claude_code_oauth,
             is_codex_oauth,
             effective_cache_mode,
-            strip_openai_cache_fields,
             session_header_out,
             strip_other_session_headers: cfg.strip_other_session_headers,
             owner_user_id: cfg.owner_user_id,
@@ -339,10 +335,13 @@ impl UpstreamNode {
     pub fn needs_outbound_session_mapping(&self) -> bool {
         self.session_header_out.is_some()
             || self.strip_other_session_headers
-            || self.strip_openai_cache_fields
             || matches!(
                 self.effective_cache_mode,
-                PromptCacheMode::XaiGrok | PromptCacheMode::OpenRouter | PromptCacheMode::OpenCode
+                PromptCacheMode::XaiGrok
+                    | PromptCacheMode::OpenRouter
+                    | PromptCacheMode::OpenCode
+                    | PromptCacheMode::StripOpenAiCacheFields
+                    | PromptCacheMode::VolcengineArk
             )
             || self.is_codex_oauth
             || (self.effective_cache_mode == PromptCacheMode::OpenAi
@@ -1024,11 +1023,11 @@ fn resolve_effective_cache_mode(
         if host == "opencode.ai" || host.ends_with(".opencode.ai") {
             return PromptCacheMode::OpenCode;
         }
-        if host == "api.deepseek.com"
-            || host.ends_with(".deepseek.com")
-            || host.ends_with(".volces.com")
-            || host.ends_with(".volcengine.com")
-        {
+        let volcengine_host = host.ends_with(".volces.com") || host.ends_with(".volcengine.com");
+        if volcengine_host && (host.starts_with("ark.") || host.starts_with("ark-")) {
+            return PromptCacheMode::VolcengineArk;
+        }
+        if host == "api.deepseek.com" || host.ends_with(".deepseek.com") || volcengine_host {
             return PromptCacheMode::StripOpenAiCacheFields;
         }
         if host == "api.openai.com"
@@ -1437,7 +1436,7 @@ mod tests {
             ds_node.effective_cache_mode,
             PromptCacheMode::StripOpenAiCacheFields
         );
-        assert!(ds_node.strip_openai_cache_fields);
+        assert!(ds_node.needs_outbound_session_mapping());
 
         let ark = make_node(
             "ark",
@@ -1449,8 +1448,9 @@ mod tests {
         let ark_node = UpstreamNode::from_config(&ark, None).unwrap();
         assert_eq!(
             ark_node.effective_cache_mode,
-            PromptCacheMode::StripOpenAiCacheFields
+            PromptCacheMode::VolcengineArk
         );
+        assert!(ark_node.needs_outbound_session_mapping());
 
         // Explicit Passthrough disables auto OpenAiResponses `session_id` injection
         let mut custom_resp = make_node(

@@ -4,7 +4,7 @@ use std::sync::{Mutex, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use ttt_core::{RequestId, StreamFailure};
+use ttt_core::{GatewayError, RequestId, StreamFailure};
 use ttt_proxy::TokenUsage;
 
 const MAX_RECENT_LOGS: usize = 100;
@@ -98,8 +98,8 @@ struct PendingMeta {
     is_stream: Option<bool>,
 }
 
-struct InnerMetrics {
-    started_at_secs: u64,
+#[derive(Default)]
+struct RequestTotals {
     total_requests: u64,
     success_requests: u64,
     error_requests: u64,
@@ -114,6 +114,75 @@ struct InnerMetrics {
     usage_requests: u64,
     by_upstream: HashMap<String, UpstreamStats>,
     by_model: HashMap<String, u64>,
+}
+
+impl RequestTotals {
+    fn record(&mut self, entry: &RequestLogEntry) {
+        self.total_requests += 1;
+        if (200..400).contains(&entry.status) && entry.stream_failure.is_none() {
+            self.success_requests += 1;
+        } else {
+            self.error_requests += 1;
+        }
+        if entry.ttft_measured {
+            self.ttft_sum_ms += entry.ttft_ms;
+            self.ttft_count += 1;
+        }
+        self.total_input_tokens += entry.input_tokens;
+        self.total_output_tokens += entry.output_tokens;
+        self.total_tokens += entry.total_tokens;
+        self.total_cache_read_tokens += entry.cache_read_tokens;
+        self.total_cache_write_tokens += entry.cache_write_tokens;
+        self.usage_requests += u64::from(entry.input_tokens > 0);
+        self.cache_hit_requests += u64::from(entry.cache_read_tokens > 0);
+
+        let upstream = self.by_upstream.entry(entry.upstream.clone()).or_default();
+        upstream.requests += 1;
+        upstream.errors += u64::from(entry.status >= 400 || entry.stream_failure.is_some());
+        upstream.input_tokens += entry.input_tokens;
+        upstream.total_tokens += entry.total_tokens;
+        upstream.cache_read_tokens += entry.cache_read_tokens;
+        upstream.cache_write_tokens += entry.cache_write_tokens;
+
+        if let Some(model) = &entry.model {
+            *self.by_model.entry(model.clone()).or_insert(0) += 1;
+        }
+    }
+
+    fn snapshot(
+        &self,
+        uptime_secs: u64,
+        recent_requests: Vec<RequestLogEntry>,
+    ) -> GatewayStatsSnapshot {
+        let mut by_upstream = self.by_upstream.clone();
+        for upstream in by_upstream.values_mut() {
+            upstream.cache_hit_rate = pct_rate(upstream.cache_read_tokens, upstream.input_tokens);
+        }
+        GatewayStatsSnapshot {
+            uptime_secs,
+            total_requests: self.total_requests,
+            success_requests: self.success_requests,
+            error_requests: self.error_requests,
+            avg_ttft_ms: self.ttft_sum_ms.checked_div(self.ttft_count).unwrap_or(0),
+            ttft_sample_count: self.ttft_count,
+            total_input_tokens: self.total_input_tokens,
+            total_output_tokens: self.total_output_tokens,
+            total_tokens: self.total_tokens,
+            total_cache_read_tokens: self.total_cache_read_tokens,
+            total_cache_write_tokens: self.total_cache_write_tokens,
+            cache_hit_rate: pct_rate(self.total_cache_read_tokens, self.total_input_tokens),
+            cache_hit_requests: self.cache_hit_requests,
+            cache_request_hit_rate: pct_rate(self.cache_hit_requests, self.usage_requests),
+            by_upstream,
+            by_model: self.by_model.clone(),
+            recent_requests,
+        }
+    }
+}
+
+struct InnerMetrics {
+    started_at_secs: u64,
+    totals: RequestTotals,
     pending: HashMap<RequestId, PendingMeta>,
     recent: VecDeque<RequestLogEntry>,
 }
@@ -128,20 +197,7 @@ impl MetricsStore {
         Self {
             inner: Mutex::new(InnerMetrics {
                 started_at_secs: now_secs(),
-                total_requests: 0,
-                success_requests: 0,
-                error_requests: 0,
-                ttft_sum_ms: 0,
-                ttft_count: 0,
-                total_input_tokens: 0,
-                total_output_tokens: 0,
-                total_tokens: 0,
-                total_cache_read_tokens: 0,
-                total_cache_write_tokens: 0,
-                cache_hit_requests: 0,
-                usage_requests: 0,
-                by_upstream: HashMap::new(),
-                by_model: HashMap::new(),
+                totals: RequestTotals::default(),
                 pending: HashMap::new(),
                 recent: VecDeque::with_capacity(MAX_RECENT_LOGS),
             }),
@@ -228,52 +284,33 @@ impl MetricsStore {
         ActiveRequestsSnapshot { total, requests }
     }
 
-    /// Preload recent logs from SQLite on startup so history survives restarts.
-    pub fn preload_logs(&self, entries: Vec<RequestLogEntry>) {
-        if let Ok(mut g) = self.inner.lock() {
-            for entry in entries.into_iter().rev() {
-                g.total_requests += 1;
-                if (200..400).contains(&entry.status) && entry.stream_failure.is_none() {
-                    g.success_requests += 1;
-                } else {
-                    g.error_requests += 1;
-                }
-                if entry.ttft_measured {
-                    g.ttft_sum_ms += entry.ttft_ms;
-                    g.ttft_count += 1;
-                }
-                g.total_input_tokens += entry.input_tokens;
-                g.total_output_tokens += entry.output_tokens;
-                g.total_tokens += entry.total_tokens;
-                g.total_cache_read_tokens += entry.cache_read_tokens;
-                g.total_cache_write_tokens += entry.cache_write_tokens;
-                if entry.input_tokens > 0 {
-                    g.usage_requests += 1;
-                }
-                if entry.cache_read_tokens > 0 {
-                    g.cache_hit_requests += 1;
-                }
-
-                let up_stat = g.by_upstream.entry(entry.upstream.clone()).or_default();
-                up_stat.requests += 1;
-                if entry.status >= 400 || entry.stream_failure.is_some() {
-                    up_stat.errors += 1;
-                }
-                up_stat.input_tokens += entry.input_tokens;
-                up_stat.total_tokens += entry.total_tokens;
-                up_stat.cache_read_tokens += entry.cache_read_tokens;
-                up_stat.cache_write_tokens += entry.cache_write_tokens;
-                up_stat.cache_hit_rate = pct_rate(up_stat.cache_read_tokens, up_stat.input_tokens);
-
-                if let Some(ref m) = entry.model {
-                    *g.by_model.entry(m.clone()).or_insert(0) += 1;
-                }
-                if g.recent.len() >= MAX_RECENT_LOGS {
-                    g.recent.pop_back();
-                }
-                g.recent.push_front(entry);
+    /// Rebuild totals from persisted logs in newest-first order, keeping only recent rows in memory.
+    pub(crate) fn restore_logs(
+        &self,
+        entries: impl Iterator<Item = Result<RequestLogEntry, GatewayError>>,
+    ) -> Result<u64, GatewayError> {
+        let mut totals = RequestTotals::default();
+        let mut recent = VecDeque::with_capacity(MAX_RECENT_LOGS);
+        let mut last_request_id = 0;
+        for entry in entries {
+            let entry = entry?;
+            if let Some(id) = entry
+                .req_id
+                .strip_prefix("req-")
+                .and_then(|id| id.parse::<u64>().ok())
+            {
+                last_request_id = last_request_id.max(id);
+            }
+            totals.record(&entry);
+            if recent.len() < MAX_RECENT_LOGS {
+                recent.push_back(entry);
             }
         }
+
+        let mut inner = self.inner.lock().expect("metrics mutex poisoned");
+        inner.totals = totals;
+        inner.recent = recent;
+        Ok(last_request_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -299,45 +336,6 @@ impl MetricsStore {
                 is_stream: None,
             });
 
-            g.total_requests += 1;
-            if (200..400).contains(&status) && stream_failure.is_none() {
-                g.success_requests += 1;
-            } else {
-                g.error_requests += 1;
-            }
-
-            if let Some(ttft) = ttft_ms {
-                g.ttft_sum_ms += ttft;
-                g.ttft_count += 1;
-            }
-
-            g.total_input_tokens += usage.input_tokens;
-            g.total_output_tokens += usage.output_tokens;
-            g.total_tokens += usage.total_tokens;
-            g.total_cache_read_tokens += usage.cache_read_tokens;
-            g.total_cache_write_tokens += usage.cache_write_tokens;
-            if usage.input_tokens > 0 {
-                g.usage_requests += 1;
-            }
-            if usage.cache_read_tokens > 0 {
-                g.cache_hit_requests += 1;
-            }
-
-            let up_stat = g.by_upstream.entry(meta.upstream.clone()).or_default();
-            up_stat.requests += 1;
-            if status >= 400 || stream_failure.is_some() {
-                up_stat.errors += 1;
-            }
-            up_stat.input_tokens += usage.input_tokens;
-            up_stat.total_tokens += usage.total_tokens;
-            up_stat.cache_read_tokens += usage.cache_read_tokens;
-            up_stat.cache_write_tokens += usage.cache_write_tokens;
-            up_stat.cache_hit_rate = pct_rate(up_stat.cache_read_tokens, up_stat.input_tokens);
-
-            if let Some(ref m) = meta.model {
-                *g.by_model.entry(m.clone()).or_insert(0) += 1;
-            }
-
             let entry = RequestLogEntry {
                 req_id: req_id.to_string(),
                 user_id: meta.user_id,
@@ -360,6 +358,7 @@ impl MetricsStore {
                 cache_write_tokens: usage.cache_write_tokens,
             };
 
+            g.totals.record(&entry);
             if g.recent.len() >= MAX_RECENT_LOGS {
                 g.recent.pop_back();
             }
@@ -376,113 +375,22 @@ impl MetricsStore {
 
     /// Build an isolated stats snapshot strictly from a single user's request logs.
     pub fn snapshot_from_entries(&self, entries: Vec<RequestLogEntry>) -> GatewayStatsSnapshot {
-        let mut total_requests = 0u64;
-        let mut success_requests = 0u64;
-        let mut error_requests = 0u64;
-        let mut ttft_sum_ms = 0u64;
-        let mut ttft_count = 0u64;
-        let mut total_input_tokens = 0u64;
-        let mut total_output_tokens = 0u64;
-        let mut total_tokens = 0u64;
-        let mut total_cache_read_tokens = 0u64;
-        let mut total_cache_write_tokens = 0u64;
-        let mut cache_hit_requests = 0u64;
-        let mut usage_requests = 0u64;
-        let mut by_upstream: HashMap<String, UpstreamStats> = HashMap::new();
-        let mut by_model: HashMap<String, u64> = HashMap::new();
-
-        for e in &entries {
-            total_requests += 1;
-            if (200..400).contains(&e.status) && e.stream_failure.is_none() {
-                success_requests += 1;
-            } else {
-                error_requests += 1;
-            }
-            if e.ttft_measured {
-                ttft_sum_ms += e.ttft_ms;
-                ttft_count += 1;
-            }
-            total_input_tokens += e.input_tokens;
-            total_output_tokens += e.output_tokens;
-            total_tokens += e.total_tokens;
-            total_cache_read_tokens += e.cache_read_tokens;
-            total_cache_write_tokens += e.cache_write_tokens;
-            if e.input_tokens > 0 {
-                usage_requests += 1;
-            }
-            if e.cache_read_tokens > 0 {
-                cache_hit_requests += 1;
-            }
-
-            let up = by_upstream.entry(e.upstream.clone()).or_default();
-            up.requests += 1;
-            if e.status >= 400 || e.stream_failure.is_some() {
-                up.errors += 1;
-            }
-            up.input_tokens += e.input_tokens;
-            up.total_tokens += e.total_tokens;
-            up.cache_read_tokens += e.cache_read_tokens;
-            up.cache_write_tokens += e.cache_write_tokens;
-
-            if let Some(ref m) = e.model {
-                *by_model.entry(m.clone()).or_insert(0) += 1;
-            }
+        let mut totals = RequestTotals::default();
+        for entry in &entries {
+            totals.record(entry);
         }
-
-        for up in by_upstream.values_mut() {
-            up.cache_hit_rate = pct_rate(up.cache_read_tokens, up.input_tokens);
-        }
-
-        let avg_ttft_ms = ttft_sum_ms.checked_div(ttft_count).unwrap_or(0);
-        let cache_hit_rate = pct_rate(total_cache_read_tokens, total_input_tokens);
-        let cache_request_hit_rate = pct_rate(cache_hit_requests, usage_requests);
-        let recent_requests = entries.into_iter().take(MAX_RECENT_LOGS).collect();
-
-        GatewayStatsSnapshot {
-            uptime_secs: self.uptime_secs(),
-            total_requests,
-            success_requests,
-            error_requests,
-            avg_ttft_ms,
-            ttft_sample_count: ttft_count,
-            total_input_tokens,
-            total_output_tokens,
-            total_tokens,
-            total_cache_read_tokens,
-            total_cache_write_tokens,
-            cache_hit_rate,
-            cache_hit_requests,
-            cache_request_hit_rate,
-            by_upstream,
-            by_model,
-            recent_requests,
-        }
+        totals.snapshot(
+            self.uptime_secs(),
+            entries.into_iter().take(MAX_RECENT_LOGS).collect(),
+        )
     }
 
     pub fn snapshot(&self) -> GatewayStatsSnapshot {
         let g = self.inner.lock().expect("metrics mutex poisoned");
-        let avg_ttft_ms = g.ttft_sum_ms.checked_div(g.ttft_count).unwrap_or(0);
-        let cache_hit_rate = pct_rate(g.total_cache_read_tokens, g.total_input_tokens);
-        let cache_request_hit_rate = pct_rate(g.cache_hit_requests, g.usage_requests);
-        GatewayStatsSnapshot {
-            uptime_secs: now_secs().saturating_sub(g.started_at_secs),
-            total_requests: g.total_requests,
-            success_requests: g.success_requests,
-            error_requests: g.error_requests,
-            avg_ttft_ms,
-            ttft_sample_count: g.ttft_count,
-            total_input_tokens: g.total_input_tokens,
-            total_output_tokens: g.total_output_tokens,
-            total_tokens: g.total_tokens,
-            total_cache_read_tokens: g.total_cache_read_tokens,
-            total_cache_write_tokens: g.total_cache_write_tokens,
-            cache_hit_rate,
-            cache_hit_requests: g.cache_hit_requests,
-            cache_request_hit_rate,
-            by_upstream: g.by_upstream.clone(),
-            by_model: g.by_model.clone(),
-            recent_requests: g.recent.iter().cloned().collect(),
-        }
+        g.totals.snapshot(
+            now_secs().saturating_sub(g.started_at_secs),
+            g.recent.iter().cloned().collect(),
+        )
     }
 }
 
@@ -531,7 +439,9 @@ mod tests {
             .unwrap();
         assert_eq!(entry.status, 200);
         let reloaded = MetricsStore::new();
-        reloaded.preload_logs(vec![entry.clone()]);
+        reloaded
+            .restore_logs(std::iter::once(Ok(entry.clone())))
+            .unwrap();
         for snapshot in [
             store.snapshot(),
             store.snapshot_from_entries(vec![entry]),
@@ -565,8 +475,14 @@ mod tests {
             })
             .collect();
         let reloaded = MetricsStore::new();
-        reloaded.preload_logs(entries.clone());
-        for snapshot in [store.snapshot(), store.snapshot_from_entries(entries), reloaded.snapshot()] {
+        reloaded
+            .restore_logs(entries.iter().rev().cloned().map(Ok))
+            .unwrap();
+        for snapshot in [
+            store.snapshot(),
+            store.snapshot_from_entries(entries),
+            reloaded.snapshot(),
+        ] {
             assert_eq!(snapshot.total_requests, 3);
             assert_eq!(snapshot.ttft_sample_count, 2);
             assert_eq!(snapshot.avg_ttft_ms, 20);

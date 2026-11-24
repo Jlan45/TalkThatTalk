@@ -627,10 +627,11 @@ impl ProxyEngine {
                     }
                 } else {
                     let mapped_model = model.and_then(|m| node.mapped_model(m));
-                    if node.strip_openai_cache_fields
-                        && let Some(cleaned) =
-                            strip_openai_cache_fields_if_present(&raw_body, mapped_model)
-                    {
+                    if let Some(cleaned) = strip_openai_cache_fields_if_present(
+                        &raw_body,
+                        mapped_model,
+                        node.effective_cache_mode,
+                    ) {
                         let len = cleaned.len() as u64;
                         (
                             path_and_query.to_string(),
@@ -1255,15 +1256,21 @@ fn models_list_response(models: &[String]) -> Response<ProxyBody> {
 fn strip_openai_cache_fields_if_present(
     raw: &[u8],
     mapped_model: Option<&str>,
+    cache_mode: PromptCacheMode,
 ) -> Option<Bytes> {
-    if memchr::memmem::find(raw, b"\"prompt_cache_key\"").is_none()
-        && memchr::memmem::find(raw, b"\"prompt_cache_retention\"").is_none()
+    let strip_key = match cache_mode {
+        PromptCacheMode::StripOpenAiCacheFields => true,
+        PromptCacheMode::VolcengineArk => false,
+        _ => return None,
+    };
+    if memchr::memmem::find(raw, b"\"prompt_cache_retention\"").is_none()
+        && (!strip_key || memchr::memmem::find(raw, b"\"prompt_cache_key\"").is_none())
     {
         return None;
     }
     let mut val: serde_json::Value = serde_json::from_slice(raw).ok()?;
     let obj = val.as_object_mut()?;
-    let removed_key = obj.remove("prompt_cache_key").is_some();
+    let removed_key = strip_key && obj.remove("prompt_cache_key").is_some();
     let removed_ret = obj.remove("prompt_cache_retention").is_some();
     if !removed_key && !removed_ret {
         return None;

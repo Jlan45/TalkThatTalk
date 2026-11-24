@@ -189,6 +189,7 @@ impl SseDecoder {
 enum NativeSseState {
     Open,
     Complete,
+    ReportedIncomplete,
     Error,
     Unchecked,
 }
@@ -202,7 +203,11 @@ pub struct NativeSse {
 
 impl NativeSse {
     pub fn new(protocol: ProtocolFamily) -> Option<Self> {
-        matches!(protocol, ProtocolFamily::OpenAi | ProtocolFamily::Anthropic).then(|| Self {
+        matches!(
+            protocol,
+            ProtocolFamily::OpenAi | ProtocolFamily::OpenAiResponses | ProtocolFamily::Anthropic
+        )
+        .then(|| Self {
             protocol,
             decoder: SseDecoder::default(),
             state: NativeSseState::Open,
@@ -226,14 +231,8 @@ impl NativeSse {
                 }
                 if event == "error" || has_error_payload(data) {
                     *state = NativeSseState::Error;
-                } else if match protocol {
-                    ProtocolFamily::OpenAi => data.trim() == "[DONE]",
-                    ProtocolFamily::Anthropic => {
-                        event == "message_stop" || has_message_stop_payload(data)
-                    }
-                    _ => false,
-                } {
-                    *state = NativeSseState::Complete;
+                } else if let Some(terminal) = native_terminal(*protocol, event, data) {
+                    *state = terminal;
                 }
             });
             if decoder.line.len() + decoder.data.len() + decoder.event.len() > 1024 * 1024 {
@@ -246,8 +245,15 @@ impl NativeSse {
         }
     }
 
-    pub fn is_incomplete(&self) -> bool {
+    pub fn is_open(&self) -> bool {
         self.state == NativeSseState::Open
+    }
+
+    pub fn is_incomplete(&self) -> bool {
+        matches!(
+            self.state,
+            NativeSseState::Open | NativeSseState::ReportedIncomplete
+        )
     }
 
     pub fn has_error(&self) -> bool {
@@ -256,6 +262,9 @@ impl NativeSse {
 
     pub fn incomplete_event(&self) -> Bytes {
         match self.protocol {
+            ProtocolFamily::OpenAiResponses => Bytes::from_static(
+                b"\n\nevent: error\ndata: {\"type\":\"error\",\"code\":\"upstream_stream_incomplete\",\"message\":\"Upstream Responses stream ended before a terminal response event\",\"param\":null}\n\n",
+            ),
             ProtocolFamily::Anthropic => Bytes::from_static(
                 b"\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Upstream stream ended without message_stop\"}}\n\n",
             ),
@@ -266,16 +275,36 @@ impl NativeSse {
     }
 }
 
+fn native_terminal(protocol: ProtocolFamily, event: &str, data: &str) -> Option<NativeSseState> {
+    let has_type = |name: &str| {
+        event == name
+            || (event.is_empty()
+                && memchr::memmem::find(data.as_bytes(), name.as_bytes()).is_some()
+                && serde_json::from_str::<Value>(data).is_ok_and(|value| value["type"] == name))
+    };
+    match protocol {
+        ProtocolFamily::OpenAi if data.trim() == "[DONE]" => Some(NativeSseState::Complete),
+        ProtocolFamily::Anthropic if has_type("message_stop") => Some(NativeSseState::Complete),
+        ProtocolFamily::OpenAiResponses
+            if has_type("response.completed") || has_type("response.done") =>
+        {
+            Some(NativeSseState::Complete)
+        }
+        ProtocolFamily::OpenAiResponses if has_type("response.incomplete") => {
+            Some(NativeSseState::ReportedIncomplete)
+        }
+        ProtocolFamily::OpenAiResponses if has_type("response.failed") => {
+            Some(NativeSseState::Error)
+        }
+        _ => None,
+    }
+}
+
 fn has_error_payload(data: &str) -> bool {
     memchr::memmem::find(data.as_bytes(), b"\"error\"").is_some()
         && serde_json::from_str::<Value>(data).is_ok_and(|value| {
             value.get("error").is_some_and(|error| !error.is_null()) || value["type"] == "error"
         })
-}
-
-fn has_message_stop_payload(data: &str) -> bool {
-    memchr::memmem::find(data.as_bytes(), b"\"message_stop\"").is_some()
-        && serde_json::from_str::<Value>(data).is_ok_and(|value| value["type"] == "message_stop")
 }
 
 #[cfg(test)]
@@ -286,6 +315,10 @@ mod tests {
     fn native_streams_require_complete_terminal_events_across_frames() {
         for (protocol, terminal) in [
             (ProtocolFamily::OpenAi, "data: [DONE]\r\n\r\n"),
+            (
+                ProtocolFamily::OpenAiResponses,
+                "event: response.completed\r\ndata: {\"type\":\"response.completed\"}\r\n\r\n",
+            ),
             (
                 ProtocolFamily::Anthropic,
                 "event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
@@ -302,6 +335,25 @@ mod tests {
             sse.push(b"data: {\"error\":{\"message\":\"provider error\"}}\n\n");
             assert!(sse.has_error());
         }
+    }
+
+    #[test]
+    fn responses_distinguishes_provider_failure_and_reported_incomplete_events() {
+        let mut sse = NativeSse::new(ProtocolFamily::OpenAiResponses).unwrap();
+        sse.push(b"data: {\"type\":\"response.incomplete\"}\n\n");
+        assert!(sse.is_incomplete());
+        assert!(!sse.is_open());
+        assert!(!sse.has_error());
+
+        let mut sse = NativeSse::new(ProtocolFamily::OpenAiResponses).unwrap();
+        sse.push(b"event: response.failed\ndata: {\"type\":\"response.failed\"}\n\n");
+        assert!(sse.has_error());
+        assert!(!sse.is_open());
+
+        let mut sse = NativeSse::new(ProtocolFamily::OpenAiResponses).unwrap();
+        sse.push(b"data: {\"type\":\"response.done\"}\n\n");
+        assert!(!sse.is_incomplete());
+        assert!(!sse.has_error());
     }
 
     #[test]

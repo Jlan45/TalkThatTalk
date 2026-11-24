@@ -101,7 +101,10 @@ pin_project! {
                 return;
             }
             let mut failure = this.state.stream_end_failure();
-            if failure == Some(StreamFailure::Incomplete) && !this.inner.is_end_stream() {
+            if failure == Some(StreamFailure::Incomplete)
+                && !this.inner.is_end_stream()
+                && this.state.native_sse.as_deref().is_some_and(NativeSse::is_open)
+            {
                 failure = Some(StreamFailure::ClientDisconnected);
             }
             this.state.finish(failure);
@@ -241,9 +244,7 @@ impl<B: Body<Data = Bytes>> Body for TapBody<B> {
         };
         let failure = state.stream_end_failure();
         state.finish(failure);
-        if failure == Some(StreamFailure::Incomplete)
-            && let Some(sse) = state.native_sse.as_ref()
-        {
+        if let Some(sse) = state.native_sse.as_deref().filter(|sse| sse.is_open()) {
             return Poll::Ready(Some(Ok(Frame::data(sse.incomplete_event()))));
         }
         Poll::Ready(trailers.map(Ok))

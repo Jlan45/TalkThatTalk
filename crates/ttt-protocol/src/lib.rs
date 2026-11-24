@@ -2,11 +2,13 @@ pub mod openai_anthropic;
 pub mod openai_antigravity;
 pub mod openai_gemini;
 pub mod openai_responses;
+mod sse;
 pub mod stream;
 
 use bytes::Bytes;
 use ttt_core::{GatewayError, ProtocolFamily};
 
+pub use sse::json_response_to_sse;
 pub use stream::{SseTranslator, TranslatedStreamBody};
 
 /// Output of translating a client request into a different upstream protocol family.

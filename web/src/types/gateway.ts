@@ -190,6 +190,7 @@ export interface RequestLogEntry {
   status: number;
   is_stream?: boolean | null;
   ttft_ms: number;
+  ttft_measured?: boolean;
   duration_ms: number;
   total_bytes: number;
   input_tokens: number;
@@ -205,6 +206,7 @@ export interface GatewayStatsSnapshot {
   success_requests: number;
   error_requests: number;
   avg_ttft_ms: number;
+  ttft_sample_count?: number;
   total_input_tokens: number;
   total_output_tokens: number;
   total_tokens: number;

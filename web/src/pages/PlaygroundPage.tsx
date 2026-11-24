@@ -14,6 +14,7 @@ interface ChatTurn {
   firstAnswerMs?: number;
   durationMs?: number;
   streaming?: boolean;
+  incomplete?: boolean;
 }
 
 export function PlaygroundPage() {
@@ -66,17 +67,35 @@ export function PlaygroundPage() {
     let firstByteMs: number | undefined;
     let ttftMs: number | undefined;
     let firstAnswerMs: number | undefined;
+    let upstreamHeader: string | undefined;
+    let content = "";
+    let reasoning = "";
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const appendDelta = (delta: { content?: unknown; reasoning_content?: unknown } | undefined, elapsed: number) => {
+      let changed = false;
+      if (typeof delta?.reasoning_content === "string" && delta.reasoning_content) {
+        ttftMs ??= elapsed;
+        reasoning += delta.reasoning_content;
+        changed = true;
+      }
+      if (typeof delta?.content === "string" && delta.content) {
+        ttftMs ??= elapsed;
+        firstAnswerMs ??= elapsed;
+        content += delta.content;
+        changed = true;
+      }
+      return changed;
+    };
 
     try {
       const res = await gatewayApi.streamPlaygroundChat(
         model,
         nextHistory
-          .filter(({ role, content }) => role !== "assistant" || content !== "")
+          .filter(({ role, content, incomplete }) => role !== "assistant" || (content !== "" && !incomplete))
           .map(({ role, content }) => ({ role, content }))
       );
 
       const rawUpstreamHeader = res.headers.get("x-ttt-upstream");
-      let upstreamHeader: string | undefined;
       if (rawUpstreamHeader) {
         try {
           upstreamHeader = decodeURIComponent(rawUpstreamHeader);
@@ -84,15 +103,25 @@ export function PlaygroundPage() {
           upstreamHeader = rawUpstreamHeader;
         }
       }
-      const reader = res.body?.getReader();
-      if (!reader) throw new Error("Empty response stream");
-
       const decoder = new TextDecoder();
       let buf = "";
-      let content = "";
-      let reasoning = "";
+      let eventType = "";
+      let dataLines: string[] = [];
+      let completed = false;
+      if (res.headers.get("content-type")?.split(";")[0].trim().toLowerCase() === "application/json") {
+        const payload = await res.json();
+        if (payload?.error) throw new Error(payload.error.message ?? "上游响应失败");
+        const message = payload?.choices?.[0]?.message;
+        if (!message) throw new Error("上游未返回有效的回答");
+        firstByteMs = Math.round(performance.now() - startedAt);
+        appendDelta(message, firstByteMs);
+        completed = true;
+      } else {
+        reader = res.body?.getReader();
+        if (!reader) throw new Error("Empty response stream");
+      }
 
-      while (true) {
+      while (reader) {
         const { done, value } = await reader.read();
         const elapsed = Math.round(performance.now() - startedAt);
         let changed = false;
@@ -101,33 +130,40 @@ export function PlaygroundPage() {
           changed = true;
         }
         buf += decoder.decode(value, { stream: !done });
-        const lines = buf.split("\n");
-        buf = lines.pop() ?? "";
-        if (done && buf) lines.push(buf);
-
-        for (const rawLine of lines) {
-          const line = rawLine.trim();
-          if (!line.startsWith("data:")) continue;
-          const payload = line.slice(5).trim();
-          if (payload === "[DONE]") continue;
-          try {
-            const parsed = JSON.parse(payload);
-            const delta = parsed?.choices?.[0]?.delta;
-            if (typeof delta?.reasoning_content === "string" && delta.reasoning_content) {
-              ttftMs ??= elapsed;
-              reasoning += delta.reasoning_content;
-              changed = true;
-            }
-            if (typeof delta?.content === "string" && delta.content) {
-              ttftMs ??= elapsed;
-              firstAnswerMs ??= elapsed;
-              content += delta.content;
-              changed = true;
-            }
-          } catch {
-            // ignore non-JSON SSE keepalive lines
+        const endings = /\r\n|\r|\n/g;
+        let start = 0;
+        for (const ending of buf.matchAll(endings)) {
+          const end = ending.index;
+          if (!done && ending[0] === "\r" && end + 1 === buf.length) break;
+          const line = buf.slice(start, end);
+          start = end + ending[0].length;
+          if (line !== "") {
+            const colon = line.indexOf(":");
+            const name = colon < 0 ? line : line.slice(0, colon);
+            const field = colon < 0 ? "" : line.slice(colon + 1).replace(/^ /, "");
+            if (name === "data") dataLines.push(field);
+            else if (name === "event") eventType = field;
+            continue;
           }
+
+          const event = eventType;
+          const payload = dataLines.join("\n").trim();
+          eventType = "";
+          dataLines = [];
+          if (event === "ping" || (!payload && event !== "error")) continue;
+          if (payload === "[DONE]") {
+            completed = true;
+            break;
+          }
+          const parsed = payload ? JSON.parse(payload) : null;
+          if (event === "error" || parsed?.error) {
+            throw new Error(parsed?.error?.message ?? parsed?.message ?? "上游流式响应失败");
+          }
+          const choice = parsed?.choices?.[0];
+          if (appendDelta(choice?.delta, elapsed)) changed = true;
+          if (typeof choice?.finish_reason === "string") completed = true;
         }
+        buf = buf.slice(start);
 
         if (changed) {
           const update = { content, reasoning, firstByteMs, ttftMs, firstAnswerMs, upstream: upstreamHeader };
@@ -135,6 +171,7 @@ export function PlaygroundPage() {
         }
         if (done) break;
       }
+      if (!completed) throw new Error("流式响应提前结束，已保留收到的内容");
 
       const durationMs = Math.round(performance.now() - startedAt);
       setMessages((prev) =>
@@ -155,8 +192,15 @@ export function PlaygroundPage() {
         )
       );
     } catch (e) {
+      void reader?.cancel().catch(() => {});
       setError((e as Error).message);
-      setMessages((prev) => prev.filter((m) => m.id !== assistantId));
+      const durationMs = Math.round(performance.now() - startedAt);
+      setMessages((prev) => prev
+        .filter((m) => m.id !== assistantId || content || reasoning)
+        .map((m) => m.id === assistantId ? {
+          ...m, content, reasoning, firstByteMs, ttftMs, firstAnswerMs, durationMs,
+          upstream: upstreamHeader, streaming: false, incomplete: true,
+        } : m));
     } finally {
       setSending(false);
     }
@@ -188,7 +232,7 @@ export function PlaygroundPage() {
           >
             <div style={{ fontWeight: 600, marginBottom: 6 }}>TalkThatTalk Live Sandbox</div>
             <p className="muted">
-              在下方 Prompt Bar 选择任意模型发起流式请求，实时观测首字延迟（TTFT）与命中渠道。
+              在下方选择模型发起流式请求，查看浏览器收到首段输出的耗时和命中渠道。
             </p>
           </div>
         )}
@@ -200,12 +244,13 @@ export function PlaygroundPage() {
                 <span className="chip">{m.model}</span>
                 {m.upstream && <span className="chip chip-blue">{m.upstream}</span>}
                 {m.firstByteMs !== undefined && <span className="chip">首包 {m.firstByteMs} ms</span>}
-                {m.ttftMs !== undefined && <span className="chip chip-ok" title="首段推理或正文">TTFT {m.ttftMs} ms</span>}
+                {m.ttftMs !== undefined && <span className="chip chip-ok" title="浏览器发起请求到首段推理或正文">首段输出 {m.ttftMs} ms</span>}
                 {m.reasoning && m.firstAnswerMs !== undefined && m.firstAnswerMs !== m.ttftMs && (
                   <span className="chip">首正文 {m.firstAnswerMs} ms</span>
                 )}
                 {m.durationMs !== undefined && <span className="chip">总耗时 {m.durationMs} ms</span>}
                 {m.streaming && <span className="chip chip-warn">生成中</span>}
+                {m.incomplete && <span className="chip chip-warn">响应中断</span>}
               </div>
             )}
             {m.reasoning && (

@@ -16,11 +16,11 @@ use tokio_rustls::rustls;
 use tower_service::Service;
 use ttt_core::{GatewayError, PoolConfig};
 
-use crate::body::ProxyBody;
+use crate::body::UpstreamBody;
 use crate::clash_manager::ResolvedProxy;
 
-pub type UpstreamHttpClient = Client<HttpsConnector<HttpConnector>, ProxyBody>;
-pub type ProxiedHttpClient = Client<HttpsConnector<TunnelConnector>, ProxyBody>;
+pub type UpstreamHttpClient = Client<HttpsConnector<HttpConnector>, UpstreamBody>;
+pub type ProxiedHttpClient = Client<HttpsConnector<TunnelConnector>, UpstreamBody>;
 
 /// Build a high-performance pooled HTTP/1.1 + HTTP/2 client with rustls and TCP_NODELAY.
 pub fn build_upstream_client(cfg: &PoolConfig) -> Result<UpstreamHttpClient, GatewayError> {

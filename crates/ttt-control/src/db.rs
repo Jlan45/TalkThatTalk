@@ -476,8 +476,8 @@ impl GatewayDb {
             "INSERT OR REPLACE INTO request_logs
                (req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms, duration_ms,
                 total_bytes, input_tokens, output_tokens, total_tokens, cache_read_tokens,
-                cache_write_tokens, username, is_stream)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                cache_write_tokens, username, is_stream, ttft_measured)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 entry.req_id,
                 entry.user_id,
@@ -496,6 +496,7 @@ impl GatewayDb {
                 entry.cache_write_tokens as i64,
                 entry.username,
                 entry.is_stream,
+                entry.ttft_measured,
             ],
         )
         .map_err(db_err)?;
@@ -512,7 +513,7 @@ impl GatewayDb {
                 "SELECT req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms,
                         duration_ms, total_bytes, input_tokens, output_tokens, total_tokens,
                         cache_read_tokens, cache_write_tokens, COALESCE(log.username, users.username),
-                        is_stream
+                        is_stream, ttft_measured
                  FROM request_logs AS log
                  LEFT JOIN users ON users.id = log.user_id
                  ORDER BY log.id DESC
@@ -545,7 +546,7 @@ impl GatewayDb {
                 "SELECT req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms,
                         duration_ms, total_bytes, input_tokens, output_tokens, total_tokens,
                         cache_read_tokens, cache_write_tokens, COALESCE(log.username, users.username),
-                        is_stream
+                        is_stream, ttft_measured
                  FROM request_logs AS log
                  LEFT JOIN users ON users.id = log.user_id
                  WHERE log.user_id = ?1
@@ -1111,6 +1112,7 @@ fn init_schema(conn: &Connection) -> Result<(), GatewayError> {
              path TEXT NOT NULL,
              status INTEGER NOT NULL,
              ttft_ms INTEGER NOT NULL,
+             ttft_measured INTEGER NOT NULL DEFAULT 0,
              duration_ms INTEGER NOT NULL,
              total_bytes INTEGER NOT NULL,
              input_tokens INTEGER NOT NULL,
@@ -1163,10 +1165,18 @@ fn init_schema(conn: &Connection) -> Result<(), GatewayError> {
     );
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN username TEXT", []);
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN is_stream INTEGER", []);
+    if let Err(err) = conn.execute(
+        "ALTER TABLE request_logs ADD COLUMN ttft_measured INTEGER NOT NULL DEFAULT 0",
+        [],
+    ) && conn.prepare("SELECT ttft_measured FROM request_logs LIMIT 0").is_err()
+    {
+        return Err(db_err(err));
+    }
     Ok(())
 }
 
 fn read_request_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogEntry> {
+    let ttft_measured = row.get(17)?;
     Ok(RequestLogEntry {
         req_id: row.get(0)?,
         user_id: row.get(1)?,
@@ -1175,7 +1185,8 @@ fn read_request_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogEntry
         model: row.get(4)?,
         path: row.get(5)?,
         status: row.get::<_, i64>(6)? as u16,
-        ttft_ms: row.get::<_, i64>(7)? as u64,
+        ttft_ms: if ttft_measured { row.get::<_, i64>(7)? as u64 } else { 0 },
+        ttft_measured,
         duration_ms: row.get::<_, i64>(8)? as u64,
         total_bytes: row.get::<_, i64>(9)? as u64,
         input_tokens: row.get::<_, i64>(10)? as u64,
@@ -1368,6 +1379,7 @@ mod tests {
             status: 200,
             is_stream: Some(true),
             ttft_ms: 95,
+            ttft_measured: true,
             duration_ms: 420,
             total_bytes: 512,
             input_tokens: 10_000,
@@ -1381,13 +1393,15 @@ mod tests {
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].username.as_deref(), Some("alice"));
         assert_eq!(logs[0].is_stream, Some(true));
+        assert_eq!(logs[0].ttft_ms, 95);
+        assert!(logs[0].ttft_measured);
         assert_eq!(logs[0].cache_read_tokens, 8_000);
         assert_eq!(logs[0].cache_write_tokens, 500);
         assert!(db.load_recent_logs_for_user(8, 10).unwrap().is_empty());
     }
 
     #[test]
-    fn migrates_logs_without_username_or_stream_status() {
+    fn migrates_legacy_request_logs_without_mixing_ttft_measurements() {
         let db = GatewayDb::open_in_memory([11u8; 32]).unwrap();
         let user = db
             .create_user("alice", "hash", "user", true, true, false, &[], false, &[])
@@ -1396,14 +1410,15 @@ mod tests {
             let conn = db.conn.lock().unwrap();
             conn.execute_batch(
                 "ALTER TABLE request_logs DROP COLUMN username;
-                 ALTER TABLE request_logs DROP COLUMN is_stream;",
+                 ALTER TABLE request_logs DROP COLUMN is_stream;
+                 ALTER TABLE request_logs DROP COLUMN ttft_measured;",
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO request_logs
                    (req_id, user_id, timestamp_secs, upstream, path, status, ttft_ms, duration_ms,
                     total_bytes, input_tokens, output_tokens, total_tokens)
-                 VALUES ('req-legacy', ?1, 0, 'upstream', '/v1/messages', 200, 0, 0, 0, 0, 0, 0)",
+                 VALUES ('req-legacy', ?1, 0, 'upstream', '/v1/messages', 200, 123, 0, 0, 0, 0, 0)",
                 [user.id],
             )
             .unwrap();
@@ -1415,5 +1430,6 @@ mod tests {
         assert_eq!(logs[0].user_id, Some(user.id));
         assert_eq!(logs[0].username.as_deref(), Some("alice"));
         assert_eq!(logs[0].is_stream, None);
+        assert!(!logs[0].ttft_measured);
     }
 }

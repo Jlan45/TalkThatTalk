@@ -41,7 +41,7 @@ pub enum TapEvent {
         req_id: RequestId,
         status: StatusCode,
         is_stream: bool,
-        ttft_ms: u64,
+        ttft_ms: Option<u64>,
     },
     ResponseChunk {
         req_id: RequestId,

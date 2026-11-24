@@ -608,10 +608,10 @@ async fn send_http_json(
         .transpose()?;
     let timeout = Duration::from_secs(12);
 
-    let req: Request<ProxyBody> = req.map(|b| match b.into_inner() {
+    let req = req.map(|b| match b.into_inner() {
         Some(bytes) if !bytes.is_empty() => ProxyBody::full(bytes),
         _ => ProxyBody::empty(),
-    });
+    }.into());
     let pool = PoolConfig::default();
 
     let resp = if let Some(resolved) = proxy {

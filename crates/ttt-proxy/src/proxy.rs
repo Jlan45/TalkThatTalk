@@ -17,12 +17,12 @@ use ttt_core::{
 };
 use ttt_protocol::openai_antigravity::openai_to_antigravity_project_request;
 use ttt_protocol::{
-    create_sse_translator, detect_ingress_protocol, needs_translation,
+    create_sse_translator, detect_ingress_protocol, json_response_to_sse, needs_translation,
     translate_request_with_session, translate_response_json,
 };
 
 use crate::affinity::{AffinityContext, AffinityExtractor};
-use crate::body::{ProxyBody, SegmentedBody};
+use crate::body::{ProxyBody, SegmentedBody, UploadTiming, UpstreamBody, upstream_ttft_ms};
 use crate::clash_manager::ClashProxyManager;
 use crate::client::{build_upstream_client, UpstreamHttpClient};
 use crate::model_extract::{find_model_span, ModelSpan};
@@ -104,23 +104,27 @@ impl ProxyEngine {
         &self,
         node: &UpstreamNode,
         req: Request<ProxyBody>,
-    ) -> Result<Response<Incoming>, GatewayError> {
-        if let Some(ref proxy_name) = node.proxy {
+    ) -> Result<(Response<Incoming>, Option<UploadTiming>), GatewayError> {
+        let upload_timing = self.tap_tx.as_ref().map(|_| UploadTiming::default());
+        let req = req.map(|body| UpstreamBody::new(body, upload_timing.clone()));
+        let response = if let Some(ref proxy_name) = node.proxy {
             let client = self.clash_manager.get_client(proxy_name).ok_or_else(|| {
                 GatewayError::UpstreamConnect(format!(
                     "{}: configured proxy '{}' is not active or disabled",
                     node.name, proxy_name
                 ))
             })?;
-            return client
+            client
                 .request(req)
                 .await
-                .map_err(|e| GatewayError::UpstreamConnect(format!("{} (via {}): {e}", node.name, proxy_name)));
-        }
-        self.client
-            .request(req)
-            .await
-            .map_err(|e| GatewayError::UpstreamConnect(format!("{}: {e}", node.name)))
+                .map_err(|e| GatewayError::UpstreamConnect(format!("{} (via {}): {e}", node.name, proxy_name)))?
+        } else {
+            self.client
+                .request(req)
+                .await
+                .map_err(|e| GatewayError::UpstreamConnect(format!("{}: {e}", node.name)))?
+        };
+        Ok((response, upload_timing))
     }
 
     /// Atomically replace the active client API key policies without interrupting hot-path traffic.
@@ -413,8 +417,8 @@ impl ProxyEngine {
             req_id,
         )?;
 
-        let upstream_resp = match self.send_upstream_request(node, upstream_req).await {
-            Ok(resp) => resp,
+        let (upstream_resp, upload_timing) = match self.send_upstream_request(node, upstream_req).await {
+            Ok(result) => result,
             Err(err) => {
                 node.record_transient_failure(self.router.routing_config().failure_cooldown_base_secs);
                 return Err(err);
@@ -439,6 +443,7 @@ impl ProxyEngine {
             affinity_source,
             path_and_query,
             telemetry,
+            upload_timing,
         ))
     }
 
@@ -696,7 +701,7 @@ impl ProxyEngine {
                 }
 
                 match self.send_upstream_request(node, upstream_req).await {
-                    Ok(resp) => {
+                    Ok((resp, upload_timing)) => {
                         let status = resp.status();
 
                         // Native OAuth 401 Singleflight refresh + transparent in-place retry.
@@ -779,6 +784,7 @@ impl ProxyEngine {
                                     affinity_source,
                                     translated_is_stream,
                                     telemetry,
+                                    upload_timing,
                                 )
                                 .await;
                         }
@@ -789,6 +795,7 @@ impl ProxyEngine {
                             affinity_source,
                             path_and_query,
                             telemetry,
+                            upload_timing,
                         ));
                     }
                     Err(err) => {
@@ -944,6 +951,7 @@ impl ProxyEngine {
         affinity_source: Option<&str>,
         path_and_query: &str,
         telemetry: RequestTelemetry,
+        upload_timing: Option<UploadTiming>,
     ) -> Response<ProxyBody> {
         let RequestTelemetry { req_id, started_at, lifetime } = telemetry;
         let (parts, body) = upstream_resp.into_parts();
@@ -979,7 +987,7 @@ impl ProxyEngine {
         }
 
         let tapped = ProxyBody::tap(
-            body, req_id, lifetime, status, is_stream, started_at, self.tap_tx.clone(),
+            body, req_id, lifetime, status, is_stream, started_at, upload_timing, self.tap_tx.clone(),
         );
         builder
             .body(tapped)
@@ -997,11 +1005,18 @@ impl ProxyEngine {
         affinity_source: Option<&str>,
         client_wants_stream: bool,
         telemetry: RequestTelemetry,
+        upload_timing: Option<UploadTiming>,
     ) -> Result<Response<ProxyBody>, GatewayError> {
         let RequestTelemetry { req_id, started_at, lifetime } = telemetry;
         let (parts, body) = upstream_resp.into_parts();
         let status = parts.status;
-        let is_sse = is_event_stream(&parts.headers) || client_wants_stream;
+        let explicit_json = parts
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
+        let is_sse = is_event_stream(&parts.headers) || (client_wants_stream && !explicit_json);
 
         let mut builder = Response::builder().status(status);
         if let Some(headers) = builder.headers_mut() {
@@ -1020,7 +1035,7 @@ impl ProxyEngine {
                 headers.insert(HEADER_X_TTT_AFFINITY_SOURCE.clone(), hv);
             }
 
-            if is_sse {
+            if is_sse || client_wants_stream {
                 headers.insert(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("text/event-stream; charset=utf-8"),
@@ -1050,6 +1065,7 @@ impl ProxyEngine {
                 lifetime,
                 status,
                 started_at,
+                upload_timing,
                 self.tap_tx.clone(),
             );
             return Ok(builder
@@ -1057,12 +1073,35 @@ impl ProxyEngine {
                 .unwrap_or_else(|_| Response::new(ProxyBody::empty())));
         }
 
-        // Non-streaming cross-protocol JSON response.
+        // Translate a complete upstream JSON response before constructing the downstream body.
+        let mut upload_timing = upload_timing;
+        let mut ttft_ms = None;
         let upstream_bytes = body
+            .map_frame(|frame| {
+                if upload_timing.is_some() && frame.data_ref().is_some_and(|data| !data.is_empty()) {
+                    ttft_ms = upstream_ttft_ms(upload_timing.take().as_ref());
+                }
+                frame
+            })
             .collect()
             .await
             .map_err(|e| GatewayError::UpstreamConnect(format!("{upstream_name}: {e}")))?
             .to_bytes();
+
+        if client_wants_stream {
+            let payload: serde_json::Value = serde_json::from_slice(&upstream_bytes)
+                .map_err(|err| {
+                    GatewayError::UpstreamConnect(format!("{upstream_name}: invalid JSON response: {err}"))
+                })?;
+            if let Some(error) = payload.get("error").filter(|error| error.is_object() || error.is_string()) {
+                let message = error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| error.as_str())
+                    .unwrap_or("upstream returned an error response");
+                return Err(GatewayError::UpstreamConnect(format!("{upstream_name}: {message}")));
+            }
+        }
 
         if let Some(tx) = &self.tap_tx {
             let elapsed = started_at.elapsed().as_millis() as u64;
@@ -1074,15 +1113,20 @@ impl ProxyEngine {
                 req_id,
                 lifetime,
                 status,
-                is_stream: false,
+                is_stream: client_wants_stream,
                 total_bytes: upstream_bytes.len() as u64,
-                ttft_ms: Some(elapsed),
+                ttft_ms,
                 duration_ms: elapsed,
             });
         }
 
         let translated =
             translate_response_json(ingress_proto, upstream_proto, &upstream_bytes, model)?;
+        let translated = if client_wants_stream {
+            json_response_to_sse(ingress_proto, &translated)?
+        } else {
+            translated
+        };
         if let Some(headers) = builder.headers_mut() {
             headers.insert(header::CONTENT_LENGTH, HeaderValue::from(translated.len() as u64));
         }

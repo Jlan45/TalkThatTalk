@@ -1,5 +1,5 @@
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -13,6 +13,79 @@ use tokio::sync::mpsc;
 use ttt_core::{RequestId, TapEvent};
 use ttt_protocol::{SseTranslator, TranslatedStreamBody};
 
+pub(crate) type UploadTiming = Arc<OnceLock<Instant>>;
+
+pub(crate) fn upstream_ttft_ms(upload: Option<&UploadTiming>) -> Option<u64> {
+    let upload = upload?;
+    let received_at = Instant::now();
+    let sent_at = *upload.get()?;
+    Some(received_at.checked_duration_since(sent_at)?.as_millis() as u64)
+}
+
+pin_project! {
+    pub struct UpstreamBody {
+        #[pin]
+        inner: ProxyBody,
+        timing: Option<UploadTiming>,
+        complete: bool,
+    }
+
+    impl PinnedDrop for UpstreamBody {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            // Hyper releases the request body after queuing its final frame for transport.
+            if *this.complete && let Some(timing) = this.timing.take() {
+                let _ = timing.set(Instant::now());
+            }
+        }
+    }
+}
+
+impl UpstreamBody {
+    pub(crate) fn new(inner: ProxyBody, timing: Option<UploadTiming>) -> Self {
+        let complete = timing.is_some() && inner.is_end_stream();
+        Self { inner, timing, complete }
+    }
+}
+
+impl From<ProxyBody> for UpstreamBody {
+    fn from(inner: ProxyBody) -> Self {
+        Self::new(inner, None)
+    }
+}
+
+impl Body for UpstreamBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.project();
+        let mut inner = this.inner;
+        let result = inner.as_mut().poll_frame(cx);
+        if this.timing.is_some() {
+            match &result {
+                Poll::Ready(None) => *this.complete = true,
+                Poll::Ready(Some(Ok(frame))) => {
+                    *this.complete = frame.is_trailers() || inner.is_end_stream();
+                }
+                _ => {}
+            }
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 pin_project! {
     /// Zero-copy streaming body wrapper that tees O(1) `Bytes::clone()` slices
     /// into a bounded side-channel without blocking the hot forwarding path.
@@ -24,6 +97,7 @@ pin_project! {
         status: StatusCode,
         is_stream: bool,
         started_at: Instant,
+        upload_timing: Option<UploadTiming>,
         ttft_ms: Option<u64>,
         total_bytes: u64,
         finished: bool,
@@ -52,13 +126,15 @@ pin_project! {
 }
 
 impl<B> TapBody<B> {
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         inner: B,
         req_id: RequestId,
         lifetime: Option<Arc<Instant>>,
         status: StatusCode,
         is_stream: bool,
         started_at: Instant,
+        upload_timing: Option<UploadTiming>,
         tap_tx: Option<mpsc::Sender<TapEvent>>,
     ) -> Self {
         Self {
@@ -68,6 +144,7 @@ impl<B> TapBody<B> {
             status,
             is_stream,
             started_at,
+            upload_timing,
             ttft_ms: None,
             total_bytes: 0,
             finished: false,
@@ -94,19 +171,18 @@ where
                 if let Some(data) = frame.data_ref()
                     && !data.is_empty()
                 {
-                    *this.total_bytes += data.len() as u64;
-                    if this.ttft_ms.is_none() {
-                        let ttft = this.started_at.elapsed().as_millis() as u64;
-                        *this.ttft_ms = Some(ttft);
+                    if *this.total_bytes == 0 {
+                        *this.ttft_ms = upstream_ttft_ms(this.upload_timing.take().as_ref());
                         if let Some(tx) = this.tap_tx.as_ref() {
                             let _ = tx.try_send(TapEvent::ResponseFirstByte {
                                 req_id: *this.req_id,
                                 status: *this.status,
                                 is_stream: *this.is_stream,
-                                ttft_ms: ttft,
+                                ttft_ms: *this.ttft_ms,
                             });
                         }
                     }
+                    *this.total_bytes += data.len() as u64;
                     if let Some(tx) = this.tap_tx.as_ref() {
                         // O(1) atomic ref-count increment, zero payload copy.
                         let _ = tx.try_send(TapEvent::ResponseChunk {
@@ -252,30 +328,34 @@ impl ProxyBody {
         Self::Incoming { inner: incoming }
     }
 
-    pub fn tap(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tap(
         incoming: Incoming,
         req_id: RequestId,
         lifetime: Option<Arc<Instant>>,
         status: StatusCode,
         is_stream: bool,
         started_at: Instant,
+        upload_timing: Option<UploadTiming>,
         tap_tx: Option<mpsc::Sender<TapEvent>>,
     ) -> Self {
         Self::Tap {
-            inner: TapBody::new(incoming, req_id, lifetime, status, is_stream, started_at, tap_tx),
+            inner: TapBody::new(incoming, req_id, lifetime, status, is_stream, started_at, upload_timing, tap_tx),
         }
     }
 
-    pub fn translated(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn translated(
         incoming: Incoming,
         translator: SseTranslator,
         req_id: RequestId,
         lifetime: Option<Arc<Instant>>,
         status: StatusCode,
         started_at: Instant,
+        upload_timing: Option<UploadTiming>,
         tap_tx: Option<mpsc::Sender<TapEvent>>,
     ) -> Self {
-        let tapped = TapBody::new(incoming, req_id, lifetime, status, true, started_at, tap_tx);
+        let tapped = TapBody::new(incoming, req_id, lifetime, status, true, started_at, upload_timing, tap_tx);
         Self::Translated {
             inner: TranslatedStreamBody::new(tapped, translator),
         }

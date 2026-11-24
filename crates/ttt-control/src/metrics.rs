@@ -24,6 +24,7 @@ pub struct RequestLogEntry {
     pub status: u16,
     pub is_stream: Option<bool>,
     pub ttft_ms: u64,
+    pub ttft_measured: bool,
     pub duration_ms: u64,
     pub total_bytes: u64,
     pub input_tokens: u64,
@@ -51,6 +52,7 @@ pub struct GatewayStatsSnapshot {
     pub success_requests: u64,
     pub error_requests: u64,
     pub avg_ttft_ms: u64,
+    pub ttft_sample_count: u64,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_tokens: u64,
@@ -234,8 +236,10 @@ impl MetricsStore {
                 } else {
                     g.error_requests += 1;
                 }
-                g.ttft_sum_ms += entry.ttft_ms;
-                g.ttft_count += 1;
+                if entry.ttft_measured {
+                    g.ttft_sum_ms += entry.ttft_ms;
+                    g.ttft_count += 1;
+                }
                 g.total_input_tokens += entry.input_tokens;
                 g.total_output_tokens += entry.output_tokens;
                 g.total_tokens += entry.total_tokens;
@@ -342,6 +346,7 @@ impl MetricsStore {
                 status,
                 is_stream: Some(is_stream),
                 ttft_ms: ttft_ms.unwrap_or(0),
+                ttft_measured: ttft_ms.is_some(),
                 duration_ms,
                 total_bytes,
                 input_tokens: usage.input_tokens,
@@ -371,6 +376,7 @@ impl MetricsStore {
         let mut success_requests = 0u64;
         let mut error_requests = 0u64;
         let mut ttft_sum_ms = 0u64;
+        let mut ttft_count = 0u64;
         let mut total_input_tokens = 0u64;
         let mut total_output_tokens = 0u64;
         let mut total_tokens = 0u64;
@@ -388,7 +394,10 @@ impl MetricsStore {
             } else {
                 error_requests += 1;
             }
-            ttft_sum_ms += e.ttft_ms;
+            if e.ttft_measured {
+                ttft_sum_ms += e.ttft_ms;
+                ttft_count += 1;
+            }
             total_input_tokens += e.input_tokens;
             total_output_tokens += e.output_tokens;
             total_tokens += e.total_tokens;
@@ -420,7 +429,7 @@ impl MetricsStore {
             up.cache_hit_rate = pct_rate(up.cache_read_tokens, up.input_tokens);
         }
 
-        let avg_ttft_ms = ttft_sum_ms.checked_div(total_requests).unwrap_or(0);
+        let avg_ttft_ms = ttft_sum_ms.checked_div(ttft_count).unwrap_or(0);
         let cache_hit_rate = pct_rate(total_cache_read_tokens, total_input_tokens);
         let cache_request_hit_rate = pct_rate(cache_hit_requests, usage_requests);
         let recent_requests = entries.into_iter().take(MAX_RECENT_LOGS).collect();
@@ -431,6 +440,7 @@ impl MetricsStore {
             success_requests,
             error_requests,
             avg_ttft_ms,
+            ttft_sample_count: ttft_count,
             total_input_tokens,
             total_output_tokens,
             total_tokens,
@@ -456,6 +466,7 @@ impl MetricsStore {
             success_requests: g.success_requests,
             error_requests: g.error_requests,
             avg_ttft_ms,
+            ttft_sample_count: g.ttft_count,
             total_input_tokens: g.total_input_tokens,
             total_output_tokens: g.total_output_tokens,
             total_tokens: g.total_tokens,
@@ -499,6 +510,24 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn ttft_average_uses_only_measured_samples_including_zero() {
+        let store = MetricsStore::new();
+        let entries: Vec<_> = [Some(0), Some(40), None]
+            .into_iter()
+            .map(|ttft| {
+                store.record_end(RequestId::next(), 200, true, 10, ttft, 50, TokenUsage::default()).unwrap()
+            })
+            .collect();
+        let reloaded = MetricsStore::new();
+        reloaded.preload_logs(entries.clone());
+        for snapshot in [store.snapshot(), store.snapshot_from_entries(entries), reloaded.snapshot()] {
+            assert_eq!(snapshot.total_requests, 3);
+            assert_eq!(snapshot.ttft_sample_count, 2);
+            assert_eq!(snapshot.avg_ttft_ms, 20);
+        }
+    }
 
     #[test]
     fn active_requests_follow_lifetime_and_owner() {

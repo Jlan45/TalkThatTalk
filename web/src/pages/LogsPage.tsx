@@ -210,7 +210,7 @@ export function LogsPage() {
                 <th>路径</th>
                 <th>状态</th>
                 <th>响应类型</th>
-                <th>TTFT</th>
+                <th title="上游请求体发送完成到收到首个非空响应数据块">TTFT</th>
                 <th>总耗时</th>
                 <th>Tokens (入/出/总)</th>
                 <th>缓存命中</th>
@@ -250,7 +250,7 @@ export function LogsPage() {
                         "非流式"
                       )}
                     </td>
-                    <td className="tabular">{row.ttft_ms} ms</td>
+                    <td className="tabular">{row.ttft_measured ? `${row.ttft_ms} ms` : "—"}</td>
                     <td className="tabular">{row.duration_ms} ms</td>
                     <td className="tabular muted">
                       {row.input_tokens} / {row.output_tokens} / <strong>{row.total_tokens}</strong>

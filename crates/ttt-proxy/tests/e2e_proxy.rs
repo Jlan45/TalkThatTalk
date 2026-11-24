@@ -93,6 +93,69 @@ fn full_body(data: impl Into<Bytes>) -> BoxedBody {
 }
 
 #[tokio::test]
+async fn ttft_starts_after_the_outbound_upload_finishes() {
+    use std::time::Duration;
+    use tokio::sync::{Notify, oneshot};
+
+    let first_frame_read = Arc::new(Notify::new());
+    let notify = Arc::clone(&first_frame_read);
+    let (upstream, _upstream_task) = spawn_mock_upstream(move |req| {
+        let notify = Arc::clone(&notify);
+        async move {
+            let mut body = req.into_body();
+            assert!(body.frame().await.unwrap().unwrap().is_data());
+            notify.notify_one();
+            body.collect().await.unwrap();
+            Response::new(full_body("answer"))
+        }
+    })
+    .await;
+    let cfg = serde_json::from_value(serde_json::json!({
+        "server": { "max_inspect_body_bytes": 1 },
+        "upstreams": [{
+            "name": "mock",
+            "base_url": format!("http://{upstream}"),
+            "auth": { "type": "api_key", "keys": ["mock-key"] }
+        }]
+    }))
+    .unwrap();
+    let (gateway, mut tap, _gateway_task) = spawn_gateway(cfg, None).await;
+
+    let head = Bytes::from_static(br#"{"model":"mock","messages":"#);
+    let tail = Bytes::from_static(b"[]}");
+    let content_len = head.len() + tail.len();
+    let (finish_upload, wait_for_tail) = oneshot::channel();
+    let chunks = futures_util::StreamExt::chain(
+        stream::iter([Ok(Frame::data(head))]),
+        stream::once(async move {
+            wait_for_tail.await.unwrap();
+            Ok(Frame::data(tail))
+        }),
+    );
+    let client: Client<_, BoxedBody> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::post(format!("http://{gateway}/v1/chat/completions"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, content_len)
+        .body(StreamBody::new(chunks).boxed())
+        .unwrap();
+    let response = client.request(req);
+    let verify = tokio::spawn(async move {
+        let resp = response.await.unwrap();
+        assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), "answer");
+        loop {
+            if let TapEvent::ResponseEnd { ttft_ms, duration_ms, .. } = tap.recv().await.unwrap() {
+                assert!(duration_ms.saturating_sub(ttft_ms.unwrap()) >= 225);
+                break;
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), first_frame_read.notified()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    finish_upload.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), verify).await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn clash_routes_named_proxy_and_preserves_it_on_failed_update() {
     let (upstream, _upstream_task) = spawn_mock_upstream(|_| async {
         Response::new(full_body(r#"{"proxied":true}"#))
@@ -944,13 +1007,23 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
         assert!(req.headers().contains_key("anthropic-version"));
         let body = req.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        if v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false) {
-            let chunks = vec![
+        let scenario = v.pointer("/messages/0/content").and_then(|v| v.as_str());
+        if scenario == Some("json-error") {
+            return Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(full_body(r#"{"type":"error","error":{"message":"upstream rejected request"}}"#))
+                .unwrap();
+        }
+        if v["stream"] == true && scenario != Some("json-fallback") {
+            let mut chunks = vec![
                 Ok(Frame::data(Bytes::from_static(
                     b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s1\",\"model\":\"claude-sonnet-4\",\"usage\":{\"input_tokens\":12}}}\n\n",
                 ))),
                 Ok(Frame::data(Bytes::from_static(
-                    b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello from claude\"}}\n\n",
+                    b"event: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\r",
+                ))),
+                Ok(Frame::data(Bytes::from_static(
+                    b"\ndata: \"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello from claude\"}}\r\n\r\n",
                 ))),
                 Ok(Frame::data(Bytes::from_static(
                     b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
@@ -959,18 +1032,26 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
                     b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
                 ))),
             ];
+            if scenario == Some("early-eof") {
+                chunks.truncate(3);
+            }
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/event-stream")
                 .body(StreamBody::new(stream::iter(chunks)).boxed())
                 .unwrap();
         }
+        let chunks = futures_util::StreamExt::chain(
+            stream::iter([Ok(Frame::data(Bytes::from_static(br#"{"id":"msg_1","model":"claude-sonnet-4","#)))]),
+            stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                Ok(Frame::data(Bytes::from_static(br#""content":[{"type":"text","text":"sync claude"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":3}}"#)))
+            }),
+        );
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(full_body(
-                r#"{"id":"msg_1","model":"claude-sonnet-4","content":[{"type":"text","text":"sync claude"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":3}}"#,
-            ))
+            .body(StreamBody::new(chunks).boxed())
             .unwrap()
     })
     .await;
@@ -1169,7 +1250,10 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
     let stream_statuses = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         let mut statuses = Vec::new();
         while statuses.len() < 2 {
-            if let TapEvent::ResponseEnd { is_stream, .. } = tap_rx.recv().await.unwrap() {
+            if let TapEvent::ResponseEnd { is_stream, ttft_ms, duration_ms, .. } = tap_rx.recv().await.unwrap() {
+                if !is_stream {
+                    assert!(duration_ms.saturating_sub(ttft_ms.unwrap()) >= 70);
+                }
                 statuses.push(is_stream);
             }
         }
@@ -1178,6 +1262,40 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
     .await
     .expect("missing translated response tap events");
     assert_eq!(stream_statuses, [false, true]);
+
+    for scenario in ["json-fallback", "early-eof", "json-error"] {
+        let request = serde_json::json!({
+            "model": "claude-sonnet-4", "stream": true,
+            "messages": [{"role": "user", "content": scenario}],
+        });
+        let resp = client
+            .request(
+                Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from(request.to_string())))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let content_type = resp.headers()[header::CONTENT_TYPE].clone();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+        if scenario == "json-error" {
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert!(text.contains("upstream rejected request"));
+            continue;
+        }
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, "text/event-stream; charset=utf-8");
+        if scenario == "json-fallback" {
+            assert!(text.contains("sync claude") && text.contains("[DONE]"));
+        } else {
+            assert!(text.contains("hello from claude"));
+            assert!(text.contains("upstream_stream_error"));
+            assert!(!text.contains("[DONE]"));
+        }
+    }
 
     // 2. OpenAI client -> Gemini upstream (streaming)
     let resp = client

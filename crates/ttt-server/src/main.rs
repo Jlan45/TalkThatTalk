@@ -330,7 +330,7 @@ async fn run_tap_worker(
                     ttft_ms,
                 } => {
                     metrics.record_first_byte(req_id, is_stream);
-                    tracing::debug!(%req_id, %status, ttft_ms, "first response byte forwarded");
+                    tracing::debug!(%req_id, %status, ttft_ms, "first upstream response data received");
                 }
                 TapEvent::ResponseChunk { req_id, data } => {
                     if let Some(acc) = active_usage.get_mut(&req_id) {
@@ -371,7 +371,7 @@ async fn run_tap_worker(
                         username = entry.as_ref().and_then(|entry| entry.username.as_deref()),
                         is_stream,
                         total_bytes,
-                        ttft_ms = ttft_ms.unwrap_or(0),
+                        ttft_ms,
                         duration_ms,
                         input_tokens = usage.input_tokens,
                         output_tokens = usage.output_tokens,

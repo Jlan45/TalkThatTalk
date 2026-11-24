@@ -79,10 +79,12 @@ export function DashboardPage() {
 
         <div className="card card-accent card-accent-ok">
           <div className="kpi-head">
-            <div className="kpi-label" style={{ marginBottom: 0 }}>平均首字延迟 (TTFT)</div>
+            <div className="kpi-label" style={{ marginBottom: 0 }} title="上游请求体发送完成到收到首个非空响应数据块">
+              平均上游首包延迟 (TTFT)
+            </div>
           </div>
           <div className="kpi-value" style={{ color: "var(--ok)" }}>
-            {stats ? `${stats.avg_ttft_ms} ms` : "—"}
+            {stats?.ttft_sample_count ? `${stats.avg_ttft_ms} ms` : "—"}
           </div>
         </div>
 
@@ -223,7 +225,7 @@ export function DashboardPage() {
                         {row.status}
                       </span>
                     </td>
-                    <td className="tabular">{row.ttft_ms} ms</td>
+                    <td className="tabular">{row.ttft_measured ? `${row.ttft_ms} ms` : "—"}</td>
                     <td className="tabular">{row.duration_ms} ms</td>
                     <td className="tabular muted">
                       {row.input_tokens} / {row.output_tokens}

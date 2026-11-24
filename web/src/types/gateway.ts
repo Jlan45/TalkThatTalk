@@ -75,9 +75,15 @@ export interface OAuthStatusView {
   can_login_pkce: boolean;
   can_refresh: boolean;
   client_id?: string | null;
+  effective_client_id?: string;
   redirect_uri?: string | null;
   has_client_secret?: boolean;
   project_id_pending?: boolean;
+}
+
+export interface AntigravityOAuthDefaults {
+  client_id: string;
+  has_client_secret: boolean;
 }
 
 export interface UpstreamView {

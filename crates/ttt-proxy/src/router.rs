@@ -950,6 +950,39 @@ impl Router {
     ) -> Vec<Arc<UpstreamNode>> {
         self.plan_route(model, ingress_proto, None, None).candidates
     }
+
+    /// Promote a healthy candidate without changing eligibility or future affinity decisions.
+    pub(crate) fn prefer_upstream(
+        &self,
+        plan: &mut RoutePlan,
+        preferred: &str,
+        native_protocol: Option<ProtocolFamily>,
+    ) -> bool {
+        let now = now_epoch_ms();
+        let eligible = |node: &UpstreamNode| {
+            !node.is_degraded(now, self.routing_config.quota_aware)
+                && native_protocol.is_none_or(|protocol| node.supports_protocol(protocol))
+        };
+        let find = |name: &str| {
+            plan.candidates
+                .iter()
+                .position(|node| node.name == name && eligible(node))
+        };
+        let index = find(preferred).or_else(|| {
+            if !preferred.as_bytes().contains(&b'%') {
+                return None;
+            }
+            let decoded = percent_encoding::percent_decode_str(preferred)
+                .decode_utf8()
+                .ok()?;
+            find(&decoded)
+        });
+        if let Some(index) = index {
+            plan.candidates[..=index].rotate_right(1);
+            return true;
+        }
+        false
+    }
 }
 
 #[inline]
@@ -1327,6 +1360,30 @@ mod tests {
         );
         assert_eq!(plan.candidates.len(), 1);
         assert_eq!(plan.candidates[0].name, "openai-ok");
+    }
+
+    #[test]
+    fn preferences_skip_unavailable_or_non_native_candidates() {
+        let native = make_node(
+            "native",
+            vec![(ProtocolFamily::OpenAi, "https://chat.example.com/v1")],
+        );
+        let translated = make_node(
+            "translated",
+            vec![(ProtocolFamily::Anthropic, "https://messages.example.com/v1")],
+        );
+        let router = Router::new(&[native, translated], None).unwrap();
+        let chat = Some(ProtocolFamily::OpenAi);
+        let mut plan = router.plan_route(Some("ark-code-latest"), chat, None, None);
+        assert_eq!(plan.candidates[0].name, "native");
+        assert!(!router.prefer_upstream(&mut plan, "translated", chat));
+        assert!(router.prefer_upstream(&mut plan, "translated", None));
+        assert_eq!(plan.candidates[0].name, "translated");
+
+        plan.candidates[0].mark_cooldown(30);
+        let mut plan = router.plan_route(Some("ark-code-latest"), chat, None, None);
+        assert!(!router.prefer_upstream(&mut plan, "translated", None));
+        assert_eq!(plan.candidates[0].name, "native");
     }
 
     #[test]

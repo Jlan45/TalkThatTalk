@@ -30,6 +30,8 @@ pub use crate::router::AccessPolicy;
 use crate::router::{ParsedEndpoint, Router, UpstreamNode};
 
 static HEADER_X_TTT_MODEL: HeaderName = HeaderName::from_static("x-ttt-model");
+static HEADER_X_TTT_PREFERRED_UPSTREAM: HeaderName =
+    HeaderName::from_static("x-ttt-preferred-upstream");
 static HEADER_X_TTT_SESSION_ID: HeaderName = HeaderName::from_static("x-ttt-session-id");
 static HEADER_X_TTT_REQUEST_ID: HeaderName = HeaderName::from_static("x-ttt-request-id");
 static HEADER_X_TTT_UPSTREAM: HeaderName = HeaderName::from_static("x-ttt-upstream");
@@ -382,9 +384,13 @@ impl ProxyEngine {
         let affinity_hash = affinity.as_ref().map(|a| a.hash);
         let affinity_source = affinity.as_ref().map(|a| a.source.as_str());
 
-        let plan = self
+        let mut plan = self
             .router
             .plan_route(model, ingress_proto, policy, affinity_hash);
+        if let Some(preferred) = preferred_upstream(incoming_headers) {
+            self.router
+                .prefer_upstream(&mut plan, preferred, ingress_proto);
+        }
         if plan.blocked_by_policy {
             return Err(GatewayError::Forbidden(format!(
                 "API key is not permitted to access any upstream for model '{}'",
@@ -478,9 +484,11 @@ impl ProxyEngine {
         let affinity_hash = affinity.as_ref().map(|a| a.hash);
         let affinity_source = affinity.as_ref().map(|a| a.source.as_str());
 
-        let plan = self
+        let mut plan = self
             .router
             .plan_route(model, ingress_proto, policy, affinity_hash);
+        let preferred_applied = preferred_upstream(incoming_headers)
+            .is_some_and(|preferred| self.router.prefer_upstream(&mut plan, preferred, None));
         if plan.blocked_by_policy {
             return Err(GatewayError::Forbidden(format!(
                 "API key is not permitted to access any upstream for model '{}'",
@@ -766,6 +774,7 @@ impl ProxyEngine {
                         }
 
                         if status.is_success()
+                            && !preferred_applied
                             && let Some(aff) = affinity.as_ref()
                             && (plan.primary_hrw_node.as_deref() != Some(node.name.as_str())
                                 || plan.sticky_hit)
@@ -1341,6 +1350,12 @@ fn should_use_pure_stream(
     false
 }
 
+fn preferred_upstream(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(&HEADER_X_TTT_PREFERRED_UPSTREAM)?;
+    let name = std::str::from_utf8(value.as_bytes()).ok()?.trim();
+    (!name.is_empty()).then_some(name)
+}
+
 fn copy_filtered_request_headers(src: &HeaderMap, dst: &mut HeaderMap) {
     let conn_tokens = collect_connection_headers(src);
     for (name, value) in src {
@@ -1349,6 +1364,7 @@ fn copy_filtered_request_headers(src: &HeaderMap, dst: &mut HeaderMap) {
             || *name == header::AUTHORIZATION
             || *name == HEADER_X_API_KEY
             || *name == HEADER_X_TTT_MODEL
+            || *name == HEADER_X_TTT_PREFERRED_UPSTREAM
             || *name == HEADER_X_TTT_SESSION_ID
             || conn_tokens.contains(name.as_str())
         {

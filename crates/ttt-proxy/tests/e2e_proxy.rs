@@ -1370,7 +1370,8 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
 
 #[tokio::test]
 async fn e2e_client_key_provider_and_model_restrictions() {
-    let (up_a_addr, _ha) = spawn_mock_upstream(|_req| async move {
+    let (up_a_addr, _ha) = spawn_mock_upstream(|req| async move {
+        assert!(!req.headers().contains_key("x-ttt-preferred-upstream"));
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
@@ -1379,7 +1380,8 @@ async fn e2e_client_key_provider_and_model_restrictions() {
     })
     .await;
 
-    let (up_b_addr, _hb) = spawn_mock_upstream(|_req| async move {
+    let (up_b_addr, _hb) = spawn_mock_upstream(|req| async move {
+        assert!(!req.headers().contains_key("x-ttt-preferred-upstream"));
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
@@ -1398,7 +1400,7 @@ async fn e2e_client_key_provider_and_model_restrictions() {
                     restrict_upstreams: false,
                     allowed_upstreams: vec![],
                     restrict_models: true,
-                    allowed_models: vec!["gpt-4o".into()],
+                    allowed_models: vec!["gpt-4o".into(), "shared-model".into()],
                     owner_user_id: None,
                 },
                 ClientKeyConfig {
@@ -1439,7 +1441,7 @@ async fn e2e_client_key_provider_and_model_restrictions() {
                     header_name: "authorization".into(),
                     prefix: Some("Bearer ".into()),
                 },
-                models: vec!["gpt-4o".into()],
+                models: vec!["gpt-4o".into(), "shared-model".into()],
                 model_mapping: HashMap::new(),
                 extra_headers: HashMap::new(),
                 protocol_headers: HashMap::new(),
@@ -1454,7 +1456,7 @@ async fn e2e_client_key_provider_and_model_restrictions() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
-                name: "provider-b".into(),
+                name: "provider-b 测试".into(),
                 base_url: format!("http://{up_b_addr}"),
                 protocol: ProtocolFamily::OpenAi,
                 protocol_endpoints: HashMap::new(),
@@ -1463,7 +1465,7 @@ async fn e2e_client_key_provider_and_model_restrictions() {
                     header_name: "authorization".into(),
                     prefix: Some("Bearer ".into()),
                 },
-                models: vec!["deepseek-chat".into()],
+                models: vec!["deepseek-chat".into(), "shared-model".into()],
                 model_mapping: HashMap::new(),
                 extra_headers: HashMap::new(),
                 protocol_headers: HashMap::new(),
@@ -1549,6 +1551,76 @@ async fn e2e_client_key_provider_and_model_restrictions() {
         .await
         .unwrap();
     assert_eq!(denied_provider.status(), StatusCode::FORBIDDEN);
+
+    let other_channel = "provider-b%20%E6%B5%8B%E8%AF%95";
+    let selected_channel = "provider-b %E6%B5%8B%E8%AF%95";
+    for (model, preferred, key, expected) in [
+        (
+            "shared-model",
+            other_channel,
+            "sk-model-only",
+            selected_channel,
+        ),
+        ("gpt-4o", other_channel, "sk-model-only", "provider-a"),
+        (
+            "shared-model",
+            other_channel,
+            "sk-provider-only",
+            "provider-a",
+        ),
+        ("gpt-4o", "missing-provider", "sk-model-only", "provider-a"),
+    ] {
+        let resp = client
+            .request(
+                Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+                    .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-ttt-preferred-upstream", preferred)
+                    .body(Full::new(Bytes::from(format!(r#"{{"model":"{model}"}}"#))))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-ttt-upstream"], expected);
+        resp.into_body().collect().await.unwrap();
+    }
+
+    let mut normal_route = String::new();
+    for phase in 0..3 {
+        let mut req = Request::post(format!("http://{gw_addr}/v1/chat/completions"))
+            .header(header::AUTHORIZATION, "Bearer sk-model-only")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(
+                "x-ttt-session-id",
+                "verify-preference-does-not-change-affinity",
+            );
+        let preferred = if normal_route == "provider-a" {
+            other_channel
+        } else {
+            "provider-a"
+        };
+        if phase == 1 {
+            req = req.header("x-ttt-preferred-upstream", preferred);
+        }
+        let resp = client
+            .request(
+                req.body(Full::new(Bytes::from_static(
+                    br#"{"model":"shared-model"}"#,
+                )))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let channel = resp.headers()["x-ttt-upstream"].to_str().unwrap();
+        match phase {
+            0 => normal_route = channel.to_owned(),
+            1 => assert_ne!(channel, normal_route),
+            _ => assert_eq!(channel, normal_route),
+        }
+        resp.into_body().collect().await.unwrap();
+    }
 
     // `/v1/models` filtered by key scope
     let models_resp = client

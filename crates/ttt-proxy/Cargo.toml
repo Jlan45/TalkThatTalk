@@ -16,6 +16,7 @@ hyper.workspace = true
 hyper-rustls.workspace = true
 hyper-util.workspace = true
 memchr.workspace = true
+percent-encoding.workspace = true
 pin-project-lite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

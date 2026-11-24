@@ -38,6 +38,7 @@ clash-lib = { git = "https://github.com/Watfaq-legacy/clash-rs.git", rev = "2f62
 # Concurrency & Performance
 arc-swap = "1.7"
 memchr = "2.7"
+percent-encoding = "2.3"
 
 # Crypto & OAuth
 aes-gcm = "0.10"

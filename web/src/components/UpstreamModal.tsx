@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { gatewayApi } from "../api/client";
 import type {
+  AntigravityOAuthDefaults,
   OAuthPreset,
   ProtocolFamily,
   ProxyView,
@@ -13,6 +14,7 @@ import { ProviderLogo, type ProviderLogoId } from "./ProviderLogos";
 
 interface Props {
   initial?: UpstreamView | null;
+  antigravityOAuthDefaults?: AntigravityOAuthDefaults | null;
   onClose: () => void;
   onSaved: (authorizeUpstream?: string) => void;
 }
@@ -131,6 +133,7 @@ const PROVIDER_CATALOG: ProviderCatalogItem[] = [
       tokenUrl: "https://oauth2.googleapis.com/token",
       redirectUri: "http://localhost:51121/oauth-callback",
       scopes: [
+        "https://www.googleapis.com/auth/aicode",
         "https://www.googleapis.com/auth/cloud-platform",
         "https://www.googleapis.com/auth/userinfo.email",
         "https://www.googleapis.com/auth/userinfo.profile",
@@ -434,7 +437,7 @@ function initialProtocolHeadersText(
   return out;
 }
 
-export function UpstreamModal({ initial, onClose, onSaved }: Props) {
+export function UpstreamModal({ initial, antigravityOAuthDefaults, onClose, onSaved }: Props) {
   const isEdit = Boolean(initial);
 
   // Two-step state: Step 1 = pick provider catalog, Step 2 = configure details.
@@ -519,6 +522,12 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
   const [error, setError] = useState<string | null>(null);
 
   const isAntigravity = authMode === "oauth" && preset === "antigravity";
+  const antigravityClientId = isEdit
+    ? initial?.oauth?.effective_client_id
+    : antigravityOAuthDefaults?.client_id;
+  const hasAntigravitySecret = isEdit
+    ? initial?.oauth?.has_client_secret
+    : antigravityOAuthDefaults?.has_client_secret;
   const authorizeAntigravity = isAntigravity && (
     !initial?.oauth?.token_present ||
     Boolean(clientSecret.trim()) ||
@@ -1372,14 +1381,14 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
                   </div>
                 ) : isAntigravity ? (
                   <div className="form-grid">
-                    <div className="form-field">
-                      <label className="form-label" htmlFor="antigravity-client-id">Google OAuth Client ID</label>
+                    <div className="form-field full">
+                      <label className="form-label" htmlFor="antigravity-client-id">App ID（Google OAuth Client ID）</label>
                       <input
                         id="antigravity-client-id"
                         className="input mono"
                         value={clientId}
                         onChange={(e) => setClientId(e.target.value)}
-                        placeholder="留空使用服务端配置"
+                        placeholder={antigravityClientId ?? "填写 Google OAuth Client ID"}
                       />
                     </div>
                     <div className="form-field">
@@ -1391,7 +1400,7 @@ export function UpstreamModal({ initial, onClose, onSaved }: Props) {
                         autoComplete="off"
                         value={clientSecret}
                         onChange={(e) => setClientSecret(e.target.value)}
-                        placeholder={initial?.oauth?.has_client_secret ? "已保存，留空保留" : "留空使用服务端配置"}
+                        placeholder={hasAntigravitySecret ? "已配置，留空保留" : "填写与 App ID 配套的 Client Secret"}
                       />
                     </div>
                     <div className="form-field full">

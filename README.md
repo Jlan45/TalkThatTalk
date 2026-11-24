@@ -101,6 +101,9 @@ GitHub Actions 会在提交到 `main` 或向它发起 PR 时构建前端并运�
 # 构建前端静态资源（会被 ttt-server 内嵌进二进制）
 cd web && pnpm install && pnpm build && cd ..
 
+# 导入 pi-antigravity 的默认桌面 OAuth 客户端（GitHub Actions 会自动执行）
+node scripts/prepare-antigravity-oauth.mjs
+
 # 编译 Release 二进制
 cargo build --release --bin talkthattalk
 
@@ -121,7 +124,9 @@ cp config.example.toml config.toml
 ./target/release/talkthattalk auth status --config config.toml
 ```
 
-Antigravity 渠道使用运行时配置的 Google OAuth Client ID 和 Client Secret。可在控制台为单个渠道填写配套凭据，也可在服务端设置 `ANTIGRAVITY_CLIENT_ID` 和 `ANTIGRAVITY_CLIENT_SECRET`。通过安装脚本部署时，可将这两个变量写入仅管理员可读的 `/etc/talkthattalk/environment`，再重启服务。默认 Redirect URI 为 `http://localhost:51121/oauth-callback`，也可填写与 OAuth 客户端配置一致的地址。授权后网关会发现并保存账号的 Project ID，供模型请求和后续令牌刷新使用。
+Antigravity 预设沿用 `pi-antigravity 0.15.0` 发布包中的桌面 OAuth Client ID（App ID）、配套 Client Secret 和授权范围。Release 构建会导入默认客户端，保存渠道即可发起授权。控制台显示实际使用的 App ID。离线构建或使用自己的 OAuth 应用时，可为渠道填写配套的 Client ID 和 Client Secret，或在服务端同时设置 `ANTIGRAVITY_CLIENT_ID` 和 `ANTIGRAVITY_CLIENT_SECRET`。通过安装脚本部署时，可将环境变量写入仅管理员可读的 `/etc/talkthattalk/environment`，再重启服务。默认 Redirect URI 为 `http://localhost:51121/oauth-callback`，也可填写与 OAuth 客户端配置一致的地址。授权后网关会发现并保存账号的 Project ID，供模型请求和后续令牌刷新使用。
+
+客户端可用 `X-TTT-Preferred-Upstream` 为本次模型请求指定优先渠道。例如 `-H 'X-TTT-Preferred-Upstream: volcengine-agent-plan'`。值填写控制台的渠道名称，中文名称可用 UTF-8 百分号编码。渠道不存在、不支持当前模型、无权使用或处于降级状态时，网关沿用默认路由。响应头 `X-TTT-Upstream` 返回实际使用的渠道。
 
 ### 3. 运行测试与代码检查
 

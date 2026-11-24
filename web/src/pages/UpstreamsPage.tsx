@@ -4,7 +4,7 @@ import { IconPlus, IconRefresh } from "../components/Icons";
 import { OAuthLoginModal } from "../components/OAuthLoginModal";
 import { detectProviderLogo, ProviderLogo } from "../components/ProviderLogos";
 import { UpstreamModal } from "../components/UpstreamModal";
-import type { AuthUser, UpstreamView } from "../types/gateway";
+import type { AntigravityOAuthDefaults, AuthUser, UpstreamView } from "../types/gateway";
 
 interface Props {
   currentUser: AuthUser;
@@ -33,6 +33,8 @@ export function UpstreamsPage({ currentUser }: Props) {
   const canCreate =
     currentUser.role === "admin" || currentUser.allow_private_upstreams !== false;
   const [upstreams, setUpstreams] = useState<UpstreamView[]>([]);
+  const [antigravityOAuthDefaults, setAntigravityOAuthDefaults] =
+    useState<AntigravityOAuthDefaults | null>(null);
   const [query, setQuery] = useState("");
   const [protoFilter, setProtoFilter] = useState("all");
   const [authFilter, setAuthFilter] = useState("all");
@@ -51,6 +53,7 @@ export function UpstreamsPage({ currentUser }: Props) {
     try {
       const res = await gatewayApi.listUpstreams();
       setUpstreams(res.upstreams);
+      setAntigravityOAuthDefaults(res.antigravity_oauth_defaults ?? null);
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -512,6 +515,7 @@ export function UpstreamsPage({ currentUser }: Props) {
       {modalOpen && (
         <UpstreamModal
           initial={editing}
+          antigravityOAuthDefaults={antigravityOAuthDefaults}
           onClose={() => setModalOpen(false)}
           onSaved={(authorizeUpstream) => {
             void load();

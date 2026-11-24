@@ -94,6 +94,8 @@ pub struct OAuthStatusView {
     pub can_login_pkce: bool,
     pub can_refresh: bool,
     pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_client_id: Option<String>,
     pub redirect_uri: Option<String>,
     pub has_client_secret: bool,
     pub project_id_pending: bool,
@@ -687,6 +689,19 @@ impl ControlPlane {
                                 (false, false, None, false, false)
                             };
                         let expires_in_secs = expires_at.map(|e| (e as i64) - (now_s as i64));
+                        let (effective_client_id, has_client_secret) =
+                            if can_manage && *preset == Some(OAuthPreset::Antigravity) {
+                                let (id, secret) = up.auth.oauth_credentials();
+                                (id, secret.is_some())
+                            } else {
+                                (
+                                    None,
+                                    can_manage
+                                        && client_secret
+                                            .as_deref()
+                                            .is_some_and(|secret| !secret.trim().is_empty()),
+                                )
+                            };
                         (
                             "oauth",
                             None,
@@ -708,11 +723,9 @@ impl ControlPlane {
                                     && token_present
                                     && !has_project,
                                 client_id: if can_manage { client_id.clone() } else { None },
+                                effective_client_id,
                                 redirect_uri: if can_manage { redirect_uri.clone() } else { None },
-                                has_client_secret: can_manage
-                                    && client_secret
-                                        .as_deref()
-                                        .is_some_and(|secret| !secret.trim().is_empty()),
+                                has_client_secret,
                             }),
                         )
                     }
@@ -773,7 +786,16 @@ impl ControlPlane {
             });
         }
 
-        json_ok(&json!({ "upstreams": views }))
+        let antigravity_oauth_defaults = if caller.can_create_private_upstream() {
+            let (client_id, client_secret) = OAuthPreset::antigravity_default_credentials();
+            client_id.map(|id| json!({ "client_id": id, "has_client_secret": client_secret.is_some() }))
+        } else {
+            None
+        };
+        json_ok(&json!({
+            "upstreams": views,
+            "antigravity_oauth_defaults": antigravity_oauth_defaults,
+        }))
     }
 
     async fn create_upstream(
@@ -1008,7 +1030,7 @@ impl ControlPlane {
             "antigravity" => {
                 return json_error(
                     StatusCode::BAD_REQUEST,
-                    "请先保存 Antigravity 渠道的 Google OAuth 客户端凭据，再从渠道发起授权",
+                    "请先保存 Antigravity 渠道，再从渠道发起授权",
                 );
             }
             _ => {

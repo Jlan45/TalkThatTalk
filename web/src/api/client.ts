@@ -1,5 +1,6 @@
 import type {
   ActiveRequestsSnapshot,
+  AntigravityOAuthDefaults,
   AuthUser,
   ClientKeysResponse,
   GatewayStatsSnapshot,
@@ -195,7 +196,11 @@ export const gatewayApi = {
   getActiveRequests: (signal: AbortSignal) =>
     request<ActiveRequestsSnapshot>("/requests/active", { signal, cache: "no-store" }),
 
-  listUpstreams: () => request<{ upstreams: UpstreamView[] }>("/upstreams"),
+  listUpstreams: () =>
+    request<{
+      upstreams: UpstreamView[];
+      antigravity_oauth_defaults?: AntigravityOAuthDefaults | null;
+    }>("/upstreams"),
 
   createUpstream: (payload: Record<string, unknown>) =>
     request<{ status: string; name: string }>("/upstreams", {

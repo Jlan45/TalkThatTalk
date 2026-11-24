@@ -588,6 +588,14 @@ pub struct OAuthPresetDefaults {
     pub scopes: &'static [&'static str],
 }
 
+include!(concat!(env!("OUT_DIR"), "/antigravity_oauth.rs"));
+
+fn antigravity_desktop_secret(client_id: &str) -> Option<String> {
+    ANTIGRAVITY_DESKTOP_CLIENT_SECRET
+        .filter(|_| ANTIGRAVITY_DESKTOP_CLIENT_ID == Some(client_id))
+        .map(str::to_owned)
+}
+
 impl OAuthPreset {
     pub fn authorization_params(self) -> &'static [(&'static str, &'static str)] {
         match self {
@@ -615,9 +623,10 @@ impl OAuthPreset {
             Self::Antigravity => Some(OAuthPresetDefaults {
                 authorize_url: "https://accounts.google.com/o/oauth2/v2/auth",
                 token_url: "https://oauth2.googleapis.com/token",
-                client_id: None,
+                client_id: ANTIGRAVITY_DESKTOP_CLIENT_ID,
                 redirect_uri: "http://localhost:51121/oauth-callback",
                 scopes: &[
+                    "https://www.googleapis.com/auth/aicode",
                     "https://www.googleapis.com/auth/cloud-platform",
                     "https://www.googleapis.com/auth/userinfo.email",
                     "https://www.googleapis.com/auth/userinfo.profile",
@@ -627,6 +636,20 @@ impl OAuthPreset {
             }),
             Self::Custom => None,
         }
+    }
+
+    pub fn antigravity_default_credentials() -> (Option<String>, Option<String>) {
+        let env_value = |name: &str| {
+            let value = std::env::var(name).ok()?;
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        };
+        let client_id = env_value("ANTIGRAVITY_CLIENT_ID")
+            .or_else(|| ANTIGRAVITY_DESKTOP_CLIENT_ID.map(str::to_owned));
+        let client_secret = client_id.as_deref().and_then(|id| {
+            env_value("ANTIGRAVITY_CLIENT_SECRET").or_else(|| antigravity_desktop_secret(id))
+        });
+        (client_id, client_secret)
     }
 }
 
@@ -711,25 +734,34 @@ impl UpstreamAuthConfig {
             return (None, None);
         };
         let defaults = preset.and_then(OAuthPreset::defaults);
-        if *preset == Some(OAuthPreset::Antigravity)
-            && client_secret
+        if *preset == Some(OAuthPreset::Antigravity) {
+            let client_id = client_id
                 .as_deref()
-                .is_none_or(|secret| secret.trim().is_empty())
-            && let Some(defaults) = defaults
-            && authorize_url.as_deref().unwrap_or(defaults.authorize_url) == defaults.authorize_url
-            && token_url.as_deref().unwrap_or(defaults.token_url) == defaults.token_url
-        {
-            if let (Ok(id), Ok(secret)) = (
-                std::env::var("ANTIGRAVITY_CLIENT_ID"),
-                std::env::var("ANTIGRAVITY_CLIENT_SECRET"),
-            ) && !id.trim().is_empty()
-                && !secret.trim().is_empty()
-                && client_id
-                    .as_deref()
-                    .is_none_or(|explicit| explicit == id.trim())
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let client_secret = client_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if let Some(defaults) = defaults
+                && authorize_url.as_deref().unwrap_or(defaults.authorize_url)
+                    == defaults.authorize_url
+                && token_url.as_deref().unwrap_or(defaults.token_url) == defaults.token_url
             {
-                return (Some(id.trim().to_owned()), Some(secret.trim().to_owned()));
+                let (default_id, default_secret) = OAuthPreset::antigravity_default_credentials();
+                let effective_id = client_id.or(default_id.as_deref());
+                let effective_secret = client_secret.map(str::to_owned).or_else(|| {
+                    let id = effective_id?;
+                    default_secret
+                        .filter(|_| default_id.as_deref() == Some(id))
+                        .or_else(|| antigravity_desktop_secret(id))
+                });
+                return (effective_id.map(str::to_owned), effective_secret);
             }
+            return (
+                client_id.map(str::to_owned),
+                client_secret.map(str::to_owned),
+            );
         }
         (
             client_id
@@ -746,7 +778,7 @@ impl UpstreamAuthConfig {
         let secret = secret.map(str::trim).filter(|value| !value.is_empty());
         if preset == Some(OAuthPreset::Antigravity) && secret.is_none() {
             return Err(GatewayError::Config(
-                "请为 Antigravity 配置配套的 Google OAuth Client ID 和 Client Secret，或设置服务端的 ANTIGRAVITY_CLIENT_ID 和 ANTIGRAVITY_CLIENT_SECRET".into(),
+                "请填写与当前 Antigravity App ID 配套的 Client Secret，或设置服务端的 ANTIGRAVITY_CLIENT_SECRET".into(),
             ));
         }
         Ok(secret)

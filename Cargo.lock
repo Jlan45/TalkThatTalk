@@ -6221,6 +6221,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "memchr",
+ "percent-encoding",
  "pin-project-lite",
  "serde",
  "serde_json",

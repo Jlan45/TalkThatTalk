@@ -23,6 +23,33 @@ impl std::fmt::Display for RequestId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamFailure {
+    Incomplete,
+    UpstreamError,
+    ClientDisconnected,
+}
+
+impl StreamFailure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Incomplete => "incomplete",
+            Self::UpstreamError => "upstream_error",
+            Self::ClientDisconnected => "client_disconnected",
+        }
+    }
+
+    pub fn from_stored(value: &str) -> Option<Self> {
+        match value {
+            "incomplete" => Some(Self::Incomplete),
+            "upstream_error" => Some(Self::UpstreamError),
+            "client_disconnected" => Some(Self::ClientDisconnected),
+            _ => None,
+        }
+    }
+}
+
 /// Zero-copy side-channel events emitted from the hot data plane to async workers.
 ///
 /// `ResponseChunk` carries an O(1) `Bytes::clone()` reference-counted slice so
@@ -53,6 +80,7 @@ pub enum TapEvent {
         lifetime: Option<Arc<Instant>>,
         status: StatusCode,
         is_stream: bool,
+        stream_failure: Option<StreamFailure>,
         total_bytes: u64,
         ttft_ms: Option<u64>,
         duration_ms: u64,

@@ -342,6 +342,7 @@ async fn run_tap_worker(
                     lifetime: _lifetime,
                     status,
                     is_stream,
+                    stream_failure,
                     total_bytes,
                     ttft_ms,
                     duration_ms,
@@ -354,6 +355,7 @@ async fn run_tap_worker(
                         req_id,
                         status.as_u16(),
                         is_stream,
+                        stream_failure,
                         total_bytes,
                         ttft_ms,
                         duration_ms,
@@ -370,6 +372,7 @@ async fn run_tap_worker(
                         user_id = entry.as_ref().and_then(|entry| entry.user_id),
                         username = entry.as_ref().and_then(|entry| entry.username.as_deref()),
                         is_stream,
+                        stream_failure = stream_failure.map(|failure| failure.as_str()),
                         total_bytes,
                         ttft_ms,
                         duration_ms,
@@ -378,7 +381,7 @@ async fn run_tap_worker(
                         total_tokens = usage.total_tokens,
                         cache_read_tokens = usage.cache_read_tokens,
                         cache_write_tokens = usage.cache_write_tokens,
-                        "proxy request completed"
+                        "proxy request ended"
                     );
                 }
             }

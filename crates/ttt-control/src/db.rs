@@ -12,7 +12,8 @@ use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use ttt_auth::{StoredOAuthToken, TokenStore};
 use ttt_core::{
-    ClientKeyConfig, GatewayError, OAuthStorageConfig, ProxyConfig, QuotaSnapshot, UpstreamConfig,
+    ClientKeyConfig, GatewayError, OAuthStorageConfig, ProxyConfig, QuotaSnapshot, StreamFailure,
+    UpstreamConfig,
 };
 
 use crate::metrics::RequestLogEntry;
@@ -476,8 +477,8 @@ impl GatewayDb {
             "INSERT OR REPLACE INTO request_logs
                (req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms, duration_ms,
                 total_bytes, input_tokens, output_tokens, total_tokens, cache_read_tokens,
-                cache_write_tokens, username, is_stream, ttft_measured)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                cache_write_tokens, username, is_stream, ttft_measured, stream_failure)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 entry.req_id,
                 entry.user_id,
@@ -497,6 +498,7 @@ impl GatewayDb {
                 entry.username,
                 entry.is_stream,
                 entry.ttft_measured,
+                entry.stream_failure.map(StreamFailure::as_str),
             ],
         )
         .map_err(db_err)?;
@@ -513,7 +515,7 @@ impl GatewayDb {
                 "SELECT req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms,
                         duration_ms, total_bytes, input_tokens, output_tokens, total_tokens,
                         cache_read_tokens, cache_write_tokens, COALESCE(log.username, users.username),
-                        is_stream, ttft_measured
+                        is_stream, ttft_measured, stream_failure
                  FROM request_logs AS log
                  LEFT JOIN users ON users.id = log.user_id
                  ORDER BY log.id DESC
@@ -546,7 +548,7 @@ impl GatewayDb {
                 "SELECT req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms,
                         duration_ms, total_bytes, input_tokens, output_tokens, total_tokens,
                         cache_read_tokens, cache_write_tokens, COALESCE(log.username, users.username),
-                        is_stream, ttft_measured
+                        is_stream, ttft_measured, stream_failure
                  FROM request_logs AS log
                  LEFT JOIN users ON users.id = log.user_id
                  WHERE log.user_id = ?1
@@ -1121,7 +1123,8 @@ fn init_schema(conn: &Connection) -> Result<(), GatewayError> {
              cache_read_tokens INTEGER NOT NULL DEFAULT 0,
              cache_write_tokens INTEGER NOT NULL DEFAULT 0,
              username TEXT,
-             is_stream INTEGER
+             is_stream INTEGER,
+             stream_failure TEXT
          );
 
          CREATE TABLE IF NOT EXISTS quota_snapshots (
@@ -1172,6 +1175,15 @@ fn init_schema(conn: &Connection) -> Result<(), GatewayError> {
     {
         return Err(db_err(err));
     }
+    if let Err(err) = conn.execute(
+        "ALTER TABLE request_logs ADD COLUMN stream_failure TEXT",
+        [],
+    ) && conn
+        .prepare("SELECT stream_failure FROM request_logs LIMIT 0")
+        .is_err()
+    {
+        return Err(db_err(err));
+    }
     Ok(())
 }
 
@@ -1196,6 +1208,10 @@ fn read_request_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogEntry
         cache_write_tokens: row.get::<_, i64>(14)? as u64,
         username: row.get(15)?,
         is_stream: row.get(16)?,
+        stream_failure: row
+            .get::<_, Option<String>>(18)?
+            .as_deref()
+            .and_then(StreamFailure::from_stored),
     })
 }
 
@@ -1378,6 +1394,7 @@ mod tests {
             path: "/v1/chat/completions".into(),
             status: 200,
             is_stream: Some(true),
+            stream_failure: Some(StreamFailure::Incomplete),
             ttft_ms: 95,
             ttft_measured: true,
             duration_ms: 420,
@@ -1393,6 +1410,7 @@ mod tests {
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].username.as_deref(), Some("alice"));
         assert_eq!(logs[0].is_stream, Some(true));
+        assert_eq!(logs[0].stream_failure, Some(StreamFailure::Incomplete));
         assert_eq!(logs[0].ttft_ms, 95);
         assert!(logs[0].ttft_measured);
         assert_eq!(logs[0].cache_read_tokens, 8_000);
@@ -1411,7 +1429,8 @@ mod tests {
             conn.execute_batch(
                 "ALTER TABLE request_logs DROP COLUMN username;
                  ALTER TABLE request_logs DROP COLUMN is_stream;
-                 ALTER TABLE request_logs DROP COLUMN ttft_measured;",
+                 ALTER TABLE request_logs DROP COLUMN ttft_measured;
+                 ALTER TABLE request_logs DROP COLUMN stream_failure;",
             )
             .unwrap();
             conn.execute(
@@ -1430,6 +1449,7 @@ mod tests {
         assert_eq!(logs[0].user_id, Some(user.id));
         assert_eq!(logs[0].username.as_deref(), Some("alice"));
         assert_eq!(logs[0].is_stream, None);
+        assert_eq!(logs[0].stream_failure, None);
         assert!(!logs[0].ttft_measured);
     }
 }

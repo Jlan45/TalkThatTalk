@@ -4,7 +4,7 @@ use std::sync::{Mutex, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use ttt_core::RequestId;
+use ttt_core::{RequestId, StreamFailure};
 use ttt_proxy::TokenUsage;
 
 const MAX_RECENT_LOGS: usize = 100;
@@ -23,6 +23,8 @@ pub struct RequestLogEntry {
     pub path: String,
     pub status: u16,
     pub is_stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_failure: Option<StreamFailure>,
     pub ttft_ms: u64,
     pub ttft_measured: bool,
     pub duration_ms: u64,
@@ -231,7 +233,7 @@ impl MetricsStore {
         if let Ok(mut g) = self.inner.lock() {
             for entry in entries.into_iter().rev() {
                 g.total_requests += 1;
-                if (200..400).contains(&entry.status) {
+                if (200..400).contains(&entry.status) && entry.stream_failure.is_none() {
                     g.success_requests += 1;
                 } else {
                     g.error_requests += 1;
@@ -254,7 +256,7 @@ impl MetricsStore {
 
                 let up_stat = g.by_upstream.entry(entry.upstream.clone()).or_default();
                 up_stat.requests += 1;
-                if entry.status >= 400 {
+                if entry.status >= 400 || entry.stream_failure.is_some() {
                     up_stat.errors += 1;
                 }
                 up_stat.input_tokens += entry.input_tokens;
@@ -280,6 +282,7 @@ impl MetricsStore {
         req_id: RequestId,
         status: u16,
         is_stream: bool,
+        stream_failure: Option<StreamFailure>,
         total_bytes: u64,
         ttft_ms: Option<u64>,
         duration_ms: u64,
@@ -297,7 +300,7 @@ impl MetricsStore {
             });
 
             g.total_requests += 1;
-            if (200..400).contains(&status) {
+            if (200..400).contains(&status) && stream_failure.is_none() {
                 g.success_requests += 1;
             } else {
                 g.error_requests += 1;
@@ -322,7 +325,7 @@ impl MetricsStore {
 
             let up_stat = g.by_upstream.entry(meta.upstream.clone()).or_default();
             up_stat.requests += 1;
-            if status >= 400 {
+            if status >= 400 || stream_failure.is_some() {
                 up_stat.errors += 1;
             }
             up_stat.input_tokens += usage.input_tokens;
@@ -345,6 +348,7 @@ impl MetricsStore {
                 path: meta.path,
                 status,
                 is_stream: Some(is_stream),
+                stream_failure,
                 ttft_ms: ttft_ms.unwrap_or(0),
                 ttft_measured: ttft_ms.is_some(),
                 duration_ms,
@@ -389,7 +393,7 @@ impl MetricsStore {
 
         for e in &entries {
             total_requests += 1;
-            if (200..400).contains(&e.status) {
+            if (200..400).contains(&e.status) && e.stream_failure.is_none() {
                 success_requests += 1;
             } else {
                 error_requests += 1;
@@ -412,7 +416,7 @@ impl MetricsStore {
 
             let up = by_upstream.entry(e.upstream.clone()).or_default();
             up.requests += 1;
-            if e.status >= 400 {
+            if e.status >= 400 || e.stream_failure.is_some() {
                 up.errors += 1;
             }
             up.input_tokens += e.input_tokens;
@@ -493,8 +497,7 @@ fn pct_rate(num: u64, den: u64) -> f64 {
     if den == 0 {
         0.0
     } else {
-        let pct = ((num as f64 / den as f64) * 1000.0).round() / 10.0;
-        pct.clamp(0.0, 100.0)
+        (num as f64 / den as f64 * 100.0).min(100.0)
     }
 }
 
@@ -512,12 +515,53 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn tracks_incomplete_streams_as_failures_with_the_original_http_status() {
+        let store = MetricsStore::new();
+        let entry = store
+            .record_end(
+                RequestId::next(),
+                200,
+                true,
+                Some(StreamFailure::Incomplete),
+                210,
+                Some(30),
+                300,
+                TokenUsage::default(),
+            )
+            .unwrap();
+        assert_eq!(entry.status, 200);
+        let reloaded = MetricsStore::new();
+        reloaded.preload_logs(vec![entry.clone()]);
+        for snapshot in [
+            store.snapshot(),
+            store.snapshot_from_entries(vec![entry]),
+            reloaded.snapshot(),
+        ] {
+            assert_eq!(snapshot.total_requests, 1);
+            assert_eq!(snapshot.success_requests, 0);
+            assert_eq!(snapshot.error_requests, 1);
+            assert_eq!(snapshot.by_upstream["unknown"].errors, 1);
+        }
+    }
+
+    #[test]
     fn ttft_average_uses_only_measured_samples_including_zero() {
         let store = MetricsStore::new();
         let entries: Vec<_> = [Some(0), Some(40), None]
             .into_iter()
             .map(|ttft| {
-                store.record_end(RequestId::next(), 200, true, 10, ttft, 50, TokenUsage::default()).unwrap()
+                store
+                    .record_end(
+                        RequestId::next(),
+                        200,
+                        true,
+                        None,
+                        10,
+                        ttft,
+                        50,
+                        TokenUsage::default(),
+                    )
+                    .unwrap()
             })
             .collect();
         let reloaded = MetricsStore::new();
@@ -588,6 +632,7 @@ mod tests {
             id1,
             200,
             true,
+            None,
             128,
             Some(120),
             200,
@@ -616,6 +661,7 @@ mod tests {
                 id2,
                 200,
                 false,
+                None,
                 128,
                 Some(250),
                 400,

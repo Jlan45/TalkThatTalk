@@ -19,8 +19,8 @@ use tokio::sync::mpsc;
 use ttt_auth::{EncryptedTokenStore, OAuthHttpClient, StoredOAuthToken, TokenStore};
 use ttt_core::{
     ClientKeyConfig, GatewayConfig, GatewayError, OAuthPreset, OAuthStorageConfig, PoolConfig,
-    ProtocolFamily, ProxyConfig, ServerConfig, TapEvent, TelemetryConfig, TokenRequestFormat,
-    UpstreamAuthConfig, UpstreamConfig,
+    ProtocolFamily, ProxyConfig, ServerConfig, StreamFailure, TapEvent, TelemetryConfig,
+    TokenRequestFormat, UpstreamAuthConfig, UpstreamConfig,
 };
 use ttt_proxy::ProxyEngine;
 
@@ -1577,35 +1577,73 @@ async fn e2e_client_key_provider_and_model_restrictions() {
 
 #[tokio::test]
 async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
+    const CHAT_DELTA: &str =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+    const MESSAGES_DELTA: &str = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n";
+    const CHAT_END: &str = "data: [DONE]\n\n";
+    const MESSAGES_END: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    const STREAM_ERROR: &str =
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"provider error\"}}\n\n";
+
     // A single mock upstream simulating Volcengine Agent Plan serving both
     // Anthropic (/api/plan/v1/messages) and OpenAI (/api/plan/v3/chat/completions) natively.
-    let (multi_addr, _hm) = spawn_mock_upstream(|req| async move {
-        let path = req.uri().path().to_string();
-        let ant_ver = req
-            .headers()
-            .get("anthropic-version")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let body = req.into_body().collect().await.unwrap().to_bytes();
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("x-hit-path", path)
-            .header("x-seen-ant-ver", ant_ver)
-            .body(full_body(body))
-            .unwrap()
+    let stream_calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&stream_calls);
+    let (multi_addr, _hm) = spawn_mock_upstream(move |req| {
+        let counter = Arc::clone(&counter);
+        async move {
+            let path = req.uri().path().to_string();
+            assert_eq!(req.headers()[header::AUTHORIZATION], "Bearer sk-ark");
+            let stream_case = req.uri().query().map(str::to_owned);
+            let ant_ver = req
+                .headers()
+                .get("anthropic-version")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            if let Some(stream_case) = stream_case {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let (delta, end) = match path.as_str() {
+                    "/api/plan/v3/chat/completions" => (CHAT_DELTA, CHAT_END),
+                    "/api/plan/v1/messages" => (MESSAGES_DELTA, MESSAGES_END),
+                    _ => panic!("unexpected Agent Plan path {path}"),
+                };
+                let body = match stream_case.as_str() {
+                    "complete" => full_body(format!("{delta}{end}")),
+                    "truncated" => full_body(delta),
+                    "error" => full_body(format!("{delta}{STREAM_ERROR}")),
+                    "disconnect" => StreamBody::new(futures_util::StreamExt::chain(
+                        stream::iter([Ok(Frame::data(Bytes::from_static(delta.as_bytes())))]),
+                        stream::pending(),
+                    ))
+                    .boxed(),
+                    _ => panic!("unexpected stream case"),
+                };
+                return Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(body)
+                    .unwrap();
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-hit-path", path)
+                .header("x-seen-ant-ver", ant_ver)
+                .body(full_body(body))
+                .unwrap()
+        }
     })
     .await;
 
     let mut protocol_endpoints = HashMap::new();
     protocol_endpoints.insert(
         ProtocolFamily::Anthropic,
-        format!("http://{multi_addr}/api/plan/v1"),
+        format!("http://{multi_addr}/api/plan/v1/messages"),
     );
     protocol_endpoints.insert(
         ProtocolFamily::OpenAi,
-        format!("http://{multi_addr}/api/plan/v3"),
+        format!("http://{multi_addr}/api/plan/v3/chat/completions"),
     );
 
     let mut ant_headers = HashMap::new();
@@ -1645,7 +1683,7 @@ async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
         }],
     };
 
-    let (gw_addr, _tap_rx, _gw) = spawn_gateway(cfg, None).await;
+    let (gw_addr, mut tap_rx, _gw) = spawn_gateway(cfg, None).await;
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
 
     // 1. Anthropic client -> zero-copy pass-through to /api/plan/v1/messages + anthropic-version header
@@ -1705,6 +1743,83 @@ async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
         resp.into_body().collect().await.unwrap().to_bytes().as_ref(),
         raw_oai
     );
+
+    for (path, delta, end, marker) in [
+        (
+            "/v1/messages",
+            MESSAGES_DELTA,
+            MESSAGES_END,
+            "without message_stop",
+        ),
+        (
+            "/v1/chat/completions",
+            CHAT_DELTA,
+            CHAT_END,
+            "without [DONE]",
+        ),
+    ] {
+        let mut previous_id = None;
+        for (scenario, expected_failure) in [
+            ("disconnect", Some(StreamFailure::ClientDisconnected)),
+            ("complete", None),
+            ("truncated", Some(StreamFailure::Incomplete)),
+            ("error", Some(StreamFailure::UpstreamError)),
+        ] {
+            let response = client
+                .request(
+                    Request::post(format!("http://{gw_addr}{path}?{scenario}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Full::new(Bytes::from_static(
+                            br#"{"model":"ark-code-latest","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#,
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let id = response.headers()["x-ttt-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert_ne!(previous_id.replace(id.clone()).as_ref(), Some(&id));
+            let mut body = response.into_body();
+            if scenario == "disconnect" {
+                let data = body.frame().await.unwrap().unwrap().into_data().unwrap();
+                assert_eq!(data.as_ref(), delta.as_bytes());
+                drop(body);
+            } else {
+                let data = body.collect().await.unwrap().to_bytes();
+                let text = std::str::from_utf8(&data).unwrap();
+                match scenario {
+                    "complete" => assert_eq!(text, format!("{delta}{end}")),
+                    "error" => assert_eq!(text, format!("{delta}{STREAM_ERROR}")),
+                    "truncated" => {
+                        assert!(text.starts_with(delta));
+                        assert!(text[delta.len()..].contains(marker));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while let Some(event) = tap_rx.recv().await {
+                    if let TapEvent::ResponseEnd {
+                        req_id,
+                        stream_failure,
+                        ..
+                    } = event
+                        && req_id.to_string() == id
+                    {
+                        assert_eq!(stream_failure, expected_failure, "{path} {scenario}");
+                        return;
+                    }
+                }
+                panic!("missing completion telemetry");
+            })
+            .await
+            .unwrap();
+        }
+    }
+    assert_eq!(stream_calls.load(Ordering::SeqCst), 8);
 }
 
 #[tokio::test]

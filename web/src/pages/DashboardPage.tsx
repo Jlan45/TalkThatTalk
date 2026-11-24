@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { gatewayApi } from "../api/client";
 import { IconRefresh } from "../components/Icons";
+import { RequestStatus } from "../components/RequestStatus";
+import { formatCacheHitRate } from "../format";
 import type { GatewayStatsSnapshot } from "../types/gateway";
 
 function formatNumber(n: number): string {
@@ -106,11 +108,11 @@ export function DashboardPage() {
             <div className="kpi-label" style={{ marginBottom: 0 }}>Prompt 缓存命中率</div>
           </div>
           <div className="kpi-value" style={{ color: "var(--ok)" }}>
-            {stats ? `${stats.cache_hit_rate.toFixed(1)}%` : "—"}
+            {stats ? formatCacheHitRate(stats.cache_hit_rate) : "—"}
           </div>
           <div className="kpi-sub">
             命中 {formatNumber(stats?.total_cache_read_tokens ?? 0)} · 请求命中{" "}
-            {stats ? `${stats.cache_request_hit_rate.toFixed(1)}%` : "0.0%"}
+            {stats ? formatCacheHitRate(stats.cache_request_hit_rate) : "0.00%"}
             {(stats?.total_cache_write_tokens ?? 0) > 0
               ? ` · 写入 ${formatNumber(stats?.total_cache_write_tokens ?? 0)}`
               : ""}
@@ -142,7 +144,7 @@ export function DashboardPage() {
                   <span className="mono">{name}</span>
                   <span className="muted tabular">
                     {item.requests} reqs · {formatNumber(item.total_tokens)} tok
-                    {item.input_tokens > 0 ? ` · 缓存 ${item.cache_hit_rate.toFixed(1)}%` : ""}
+                    {item.input_tokens > 0 ? ` · 缓存 ${formatCacheHitRate(item.cache_hit_rate)}` : ""}
                   </span>
                 </div>
                 <div className="bar-track">
@@ -207,7 +209,7 @@ export function DashboardPage() {
               {(stats?.recent_requests ?? []).slice(0, 6).map((row) => {
                 const rowHitPct =
                   row.input_tokens > 0 && row.cache_read_tokens > 0
-                    ? `${Math.min(100, (row.cache_read_tokens / row.input_tokens) * 100).toFixed(1)}%`
+                    ? formatCacheHitRate((row.cache_read_tokens / row.input_tokens) * 100)
                     : null;
                 return (
                   <tr key={row.req_id}>
@@ -216,15 +218,7 @@ export function DashboardPage() {
                       <span className="tag">{row.model ?? "-"}</span>
                     </td>
                     <td className="mono">{row.upstream}</td>
-                    <td>
-                      <span
-                        className={`chip ${
-                          row.status < 300 ? "chip-ok" : row.status < 500 ? "chip-warn" : "chip-err"
-                        }`}
-                      >
-                        {row.status}
-                      </span>
-                    </td>
+                    <td><RequestStatus row={row} /></td>
                     <td className="tabular">{row.ttft_measured ? `${row.ttft_ms} ms` : "—"}</td>
                     <td className="tabular">{row.duration_ms} ms</td>
                     <td className="tabular muted">

@@ -10,8 +10,8 @@ use http_body_util::{Empty, Full};
 use hyper::body::Incoming;
 use pin_project_lite::pin_project;
 use tokio::sync::mpsc;
-use ttt_core::{RequestId, TapEvent};
-use ttt_protocol::{SseTranslator, TranslatedStreamBody};
+use ttt_core::{RequestId, StreamFailure, TapEvent};
+use ttt_protocol::{NativeSse, SseTranslator, TranslatedStreamBody};
 
 pub(crate) type UploadTiming = Arc<OnceLock<Instant>>;
 
@@ -87,45 +87,99 @@ impl Body for UpstreamBody {
 }
 
 pin_project! {
-    /// Zero-copy streaming body wrapper that tees O(1) `Bytes::clone()` slices
-    /// into a bounded side-channel without blocking the hot forwarding path.
-    pub struct TapBody<B> {
+    /// Forward upstream frames while emitting nonblocking telemetry.
+    pub struct TapBody<B: Body> {
         #[pin]
         inner: B,
-        req_id: RequestId,
-        lifetime: Option<Arc<Instant>>,
-        status: StatusCode,
-        is_stream: bool,
-        started_at: Instant,
-        upload_timing: Option<UploadTiming>,
-        ttft_ms: Option<u64>,
-        total_bytes: u64,
-        finished: bool,
-        tap_tx: Option<mpsc::Sender<TapEvent>>,
+        state: TapState,
     }
 
-    impl<B> PinnedDrop for TapBody<B> {
+    impl<B: Body> PinnedDrop for TapBody<B> {
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
-            if !*this.finished {
-                *this.finished = true;
-                if let Some(tx) = this.tap_tx.take() {
-                    let _ = tx.try_send(TapEvent::ResponseEnd {
-                        req_id: *this.req_id,
-                        lifetime: this.lifetime.take(),
-                        status: *this.status,
-                        is_stream: *this.is_stream,
-                        total_bytes: *this.total_bytes,
-                        ttft_ms: *this.ttft_ms,
-                        duration_ms: this.started_at.elapsed().as_millis() as u64,
-                    });
-                }
+            if this.state.finished {
+                return;
             }
+            let mut failure = this.state.stream_end_failure();
+            if failure == Some(StreamFailure::Incomplete) && !this.inner.is_end_stream() {
+                failure = Some(StreamFailure::ClientDisconnected);
+            }
+            this.state.finish(failure);
         }
     }
 }
 
-impl<B> TapBody<B> {
+struct TapState {
+    req_id: RequestId,
+    lifetime: Option<Arc<Instant>>,
+    status: StatusCode,
+    is_stream: bool,
+    started_at: Instant,
+    upload_timing: Option<UploadTiming>,
+    ttft_ms: Option<u64>,
+    total_bytes: u64,
+    finished: bool,
+    tap_tx: Option<mpsc::Sender<TapEvent>>,
+    native_sse: Option<Box<NativeSse>>,
+}
+
+impl TapState {
+    fn observe(&mut self, data: &Bytes) {
+        if data.is_empty() {
+            return;
+        }
+        if self.total_bytes == 0 {
+            self.ttft_ms = upstream_ttft_ms(self.upload_timing.take().as_ref());
+            if let Some(tx) = self.tap_tx.as_ref() {
+                let _ = tx.try_send(TapEvent::ResponseFirstByte {
+                    req_id: self.req_id,
+                    status: self.status,
+                    is_stream: self.is_stream,
+                    ttft_ms: self.ttft_ms,
+                });
+            }
+        }
+        self.total_bytes += data.len() as u64;
+        if let Some(tx) = self.tap_tx.as_ref() {
+            let _ = tx.try_send(TapEvent::ResponseChunk {
+                req_id: self.req_id,
+                data: data.clone(),
+            });
+        }
+        if let Some(sse) = self.native_sse.as_mut() {
+            sse.push(data);
+        }
+    }
+
+    fn stream_end_failure(&self) -> Option<StreamFailure> {
+        let sse = self.native_sse.as_ref()?;
+        if sse.has_error() {
+            Some(StreamFailure::UpstreamError)
+        } else if sse.is_incomplete() {
+            Some(StreamFailure::Incomplete)
+        } else {
+            None
+        }
+    }
+
+    fn finish(&mut self, stream_failure: Option<StreamFailure>) {
+        self.finished = true;
+        if let Some(tx) = self.tap_tx.take() {
+            let _ = tx.try_send(TapEvent::ResponseEnd {
+                req_id: self.req_id,
+                lifetime: self.lifetime.take(),
+                status: self.status,
+                is_stream: self.is_stream,
+                stream_failure,
+                total_bytes: self.total_bytes,
+                ttft_ms: self.ttft_ms,
+                duration_ms: self.started_at.elapsed().as_millis() as u64,
+            });
+        }
+    }
+}
+
+impl<B: Body> TapBody<B> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inner: B,
@@ -136,27 +190,28 @@ impl<B> TapBody<B> {
         started_at: Instant,
         upload_timing: Option<UploadTiming>,
         tap_tx: Option<mpsc::Sender<TapEvent>>,
+        native_sse: Option<NativeSse>,
     ) -> Self {
         Self {
             inner,
-            req_id,
-            lifetime,
-            status,
-            is_stream,
-            started_at,
-            upload_timing,
-            ttft_ms: None,
-            total_bytes: 0,
-            finished: false,
-            tap_tx,
+            state: TapState {
+                req_id,
+                lifetime,
+                status,
+                is_stream,
+                started_at,
+                upload_timing,
+                ttft_ms: None,
+                total_bytes: 0,
+                finished: false,
+                tap_tx,
+                native_sse: native_sse.map(Box::new),
+            },
         }
     }
 }
 
-impl<B> Body for TapBody<B>
-where
-    B: Body<Data = Bytes>,
-{
+impl<B: Body<Data = Bytes>> Body for TapBody<B> {
     type Data = Bytes;
     type Error = B::Error;
 
@@ -165,77 +220,45 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
-        match this.inner.poll_frame(cx) {
-            Poll::Pending => Poll::Pending,
+        let state = this.state;
+        if state.finished {
+            return Poll::Ready(None);
+        }
+        let trailers = match this.inner.poll_frame(cx) {
+            Poll::Pending => return Poll::Pending,
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref()
-                    && !data.is_empty()
-                {
-                    if *this.total_bytes == 0 {
-                        *this.ttft_ms = upstream_ttft_ms(this.upload_timing.take().as_ref());
-                        if let Some(tx) = this.tap_tx.as_ref() {
-                            let _ = tx.try_send(TapEvent::ResponseFirstByte {
-                                req_id: *this.req_id,
-                                status: *this.status,
-                                is_stream: *this.is_stream,
-                                ttft_ms: *this.ttft_ms,
-                            });
-                        }
-                    }
-                    *this.total_bytes += data.len() as u64;
-                    if let Some(tx) = this.tap_tx.as_ref() {
-                        // O(1) atomic ref-count increment, zero payload copy.
-                        let _ = tx.try_send(TapEvent::ResponseChunk {
-                            req_id: *this.req_id,
-                            data: data.clone(),
-                        });
-                    }
+                if let Some(data) = frame.data_ref() {
+                    state.observe(data);
+                    return Poll::Ready(Some(Ok(frame)));
                 }
-                Poll::Ready(Some(Ok(frame)))
+                Some(frame)
             }
             Poll::Ready(Some(Err(err))) => {
-                if !*this.finished {
-                    *this.finished = true;
-                    if let Some(tx) = this.tap_tx.take() {
-                        let _ = tx.try_send(TapEvent::ResponseEnd {
-                            req_id: *this.req_id,
-                            lifetime: this.lifetime.take(),
-                            status: *this.status,
-                            is_stream: *this.is_stream,
-                            total_bytes: *this.total_bytes,
-                            ttft_ms: *this.ttft_ms,
-                            duration_ms: this.started_at.elapsed().as_millis() as u64,
-                        });
-                    }
-                }
-                Poll::Ready(Some(Err(err)))
+                state.finish(state.is_stream.then_some(StreamFailure::UpstreamError));
+                return Poll::Ready(Some(Err(err)));
             }
-            Poll::Ready(None) => {
-                if !*this.finished {
-                    *this.finished = true;
-                    if let Some(tx) = this.tap_tx.take() {
-                        let _ = tx.try_send(TapEvent::ResponseEnd {
-                            req_id: *this.req_id,
-                            lifetime: this.lifetime.take(),
-                            status: *this.status,
-                            is_stream: *this.is_stream,
-                            total_bytes: *this.total_bytes,
-                            ttft_ms: *this.ttft_ms,
-                            duration_ms: this.started_at.elapsed().as_millis() as u64,
-                        });
-                    }
-                }
-                Poll::Ready(None)
-            }
+            Poll::Ready(None) => None,
+        };
+        let failure = state.stream_end_failure();
+        state.finish(failure);
+        if failure == Some(StreamFailure::Incomplete)
+            && let Some(sse) = state.native_sse.as_ref()
+        {
+            return Poll::Ready(Some(Ok(Frame::data(sse.incomplete_event()))));
         }
+        Poll::Ready(trailers.map(Ok))
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.state.finished || (self.state.native_sse.is_none() && self.inner.is_end_stream())
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
+        if self.state.native_sse.is_some() {
+            SizeHint::default()
+        } else {
+            self.inner.size_hint()
+        }
     }
 }
 
@@ -338,9 +361,20 @@ impl ProxyBody {
         started_at: Instant,
         upload_timing: Option<UploadTiming>,
         tap_tx: Option<mpsc::Sender<TapEvent>>,
+        native_sse: Option<NativeSse>,
     ) -> Self {
         Self::Tap {
-            inner: TapBody::new(incoming, req_id, lifetime, status, is_stream, started_at, upload_timing, tap_tx),
+            inner: TapBody::new(
+                incoming,
+                req_id,
+                lifetime,
+                status,
+                is_stream,
+                started_at,
+                upload_timing,
+                tap_tx,
+                native_sse,
+            ),
         }
     }
 
@@ -355,7 +389,17 @@ impl ProxyBody {
         upload_timing: Option<UploadTiming>,
         tap_tx: Option<mpsc::Sender<TapEvent>>,
     ) -> Self {
-        let tapped = TapBody::new(incoming, req_id, lifetime, status, true, started_at, upload_timing, tap_tx);
+        let tapped = TapBody::new(
+            incoming,
+            req_id,
+            lifetime,
+            status,
+            true,
+            started_at,
+            upload_timing,
+            tap_tx,
+            None,
+        );
         Self::Translated {
             inner: TranslatedStreamBody::new(tapped, translator),
         }

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { gatewayApi } from "../api/client";
 import { IconRefresh } from "../components/Icons";
+import { RequestStatus } from "../components/RequestStatus";
+import { formatCacheHitRate } from "../format";
 import type { ActiveRequest, ActiveRequestsSnapshot, RequestLogEntry } from "../types/gateway";
 
 function formatTime(ts: number): string {
@@ -148,8 +150,9 @@ export function LogsPage() {
 
   const filtered = useMemo(() => {
     return logs.filter((row) => {
-      if (statusFilter === "ok" && (row.status < 200 || row.status >= 400)) return false;
-      if (statusFilter === "err" && row.status < 400) return false;
+      const success = row.status >= 200 && row.status < 400 && !row.stream_failure;
+      if (statusFilter === "ok" && !success) return false;
+      if (statusFilter === "err" && success) return false;
       return matchesQuery(row, normalizedQuery);
     });
   }, [logs, normalizedQuery, statusFilter]);
@@ -220,7 +223,7 @@ export function LogsPage() {
               {filtered.map((row) => {
                 const hitPct =
                   row.input_tokens > 0 && row.cache_read_tokens > 0
-                    ? `${Math.min(100, (row.cache_read_tokens / row.input_tokens) * 100).toFixed(1)}%`
+                    ? formatCacheHitRate((row.cache_read_tokens / row.input_tokens) * 100)
                     : null;
                 return (
                   <tr key={row.req_id}>
@@ -232,15 +235,7 @@ export function LogsPage() {
                     </td>
                     <td className="mono">{row.upstream}</td>
                     <td className="mono muted">{row.path}</td>
-                    <td>
-                      <span
-                        className={`chip ${
-                          row.status < 300 ? "chip-ok" : row.status < 500 ? "chip-warn" : "chip-err"
-                        }`}
-                      >
-                        {row.status}
-                      </span>
-                    </td>
+                    <td><RequestStatus row={row} /></td>
                     <td>
                       {row.is_stream == null ? (
                         <span className="muted">未知</span>
@@ -257,7 +252,7 @@ export function LogsPage() {
                     </td>
                     <td className="tabular">
                       {hitPct ? (
-                        <span className="chip chip-ok">
+                        <span className="chip chip-ok" title={`命中 ${row.cache_read_tokens.toLocaleString("en-US")} / ${row.input_tokens.toLocaleString("en-US")} 个输入 token`}>
                           {row.cache_read_tokens.toLocaleString("en-US")} ({hitPct})
                         </span>
                       ) : row.cache_write_tokens > 0 ? (

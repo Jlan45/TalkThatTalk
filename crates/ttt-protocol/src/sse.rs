@@ -185,9 +185,124 @@ impl SseDecoder {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeSseState {
+    Open,
+    Complete,
+    Error,
+    Unchecked,
+}
+
+/// Observe native SSE event boundaries without changing the forwarded payload.
+pub struct NativeSse {
+    protocol: ProtocolFamily,
+    decoder: SseDecoder,
+    state: NativeSseState,
+}
+
+impl NativeSse {
+    pub fn new(protocol: ProtocolFamily) -> Option<Self> {
+        matches!(protocol, ProtocolFamily::OpenAi | ProtocolFamily::Anthropic).then(|| Self {
+            protocol,
+            decoder: SseDecoder::default(),
+            state: NativeSseState::Open,
+        })
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) {
+        let Self {
+            protocol,
+            decoder,
+            state,
+        } = self;
+        if matches!(*state, NativeSseState::Error | NativeSseState::Unchecked) {
+            return;
+        }
+        // Keep validation memory bounded even if an upstream never ends its SSE event.
+        for chunk in bytes.chunks(8192) {
+            decoder.push(chunk, |event, data| {
+                if *state == NativeSseState::Error {
+                    return;
+                }
+                if event == "error" || has_error_payload(data) {
+                    *state = NativeSseState::Error;
+                } else if match protocol {
+                    ProtocolFamily::OpenAi => data.trim() == "[DONE]",
+                    ProtocolFamily::Anthropic => {
+                        event == "message_stop" || has_message_stop_payload(data)
+                    }
+                    _ => false,
+                } {
+                    *state = NativeSseState::Complete;
+                }
+            });
+            if decoder.line.len() + decoder.data.len() + decoder.event.len() > 1024 * 1024 {
+                if *state == NativeSseState::Open {
+                    *state = NativeSseState::Unchecked;
+                }
+                *decoder = SseDecoder::default();
+                break;
+            }
+        }
+    }
+
+    pub fn is_incomplete(&self) -> bool {
+        self.state == NativeSseState::Open
+    }
+
+    pub fn has_error(&self) -> bool {
+        self.state == NativeSseState::Error
+    }
+
+    pub fn incomplete_event(&self) -> Bytes {
+        match self.protocol {
+            ProtocolFamily::Anthropic => Bytes::from_static(
+                b"\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Upstream stream ended without message_stop\"}}\n\n",
+            ),
+            _ => Bytes::from_static(
+                b"\n\ndata: {\"error\":{\"type\":\"upstream_error\",\"code\":\"upstream_stream_incomplete\",\"message\":\"Upstream stream ended without [DONE]\"}}\n\n",
+            ),
+        }
+    }
+}
+
+fn has_error_payload(data: &str) -> bool {
+    memchr::memmem::find(data.as_bytes(), b"\"error\"").is_some()
+        && serde_json::from_str::<Value>(data).is_ok_and(|value| {
+            value.get("error").is_some_and(|error| !error.is_null()) || value["type"] == "error"
+        })
+}
+
+fn has_message_stop_payload(data: &str) -> bool {
+    memchr::memmem::find(data.as_bytes(), b"\"message_stop\"").is_some()
+        && serde_json::from_str::<Value>(data).is_ok_and(|value| value["type"] == "message_stop")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_streams_require_complete_terminal_events_across_frames() {
+        for (protocol, terminal) in [
+            (ProtocolFamily::OpenAi, "data: [DONE]\r\n\r\n"),
+            (
+                ProtocolFamily::Anthropic,
+                "event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
+            ),
+        ] {
+            let mut sse = NativeSse::new(protocol).unwrap();
+            sse.push(b"data: {\"text\":\"partial\"}\n\n");
+            assert!(sse.is_incomplete());
+            for byte in terminal.as_bytes().chunks(1) {
+                sse.push(byte);
+            }
+            assert!(!sse.is_incomplete());
+            assert!(!sse.has_error());
+            sse.push(b"data: {\"error\":{\"message\":\"provider error\"}}\n\n");
+            assert!(sse.has_error());
+        }
+    }
 
     #[test]
     fn decodes_multiline_events_across_utf8_and_crlf_boundaries() {

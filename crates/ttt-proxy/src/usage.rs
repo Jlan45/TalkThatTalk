@@ -217,6 +217,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn normalizes_agent_plan_cache_reads_without_losing_uncached_tokens() {
+        for response in [
+            br#"{"usage":{"prompt_tokens":232525,"completion_tokens":821,"total_tokens":233346,"prompt_tokens_details":{"cached_tokens":232448}}}"#.as_slice(),
+            br#"{"usage":{"input_tokens":77,"output_tokens":821,"cache_read_input_tokens":232448,"cache_creation_input_tokens":0}}"#.as_slice(),
+        ] {
+            let mut acc = UsageAccumulator::new();
+            acc.push_chunk(response);
+            let usage = acc.finish();
+            assert_eq!(usage.input_tokens, 232_525);
+            assert_eq!(usage.input_tokens - usage.cache_read_tokens, 77);
+            assert_eq!(usage.total_tokens, 233_346);
+        }
+    }
+
+    #[test]
     fn extracts_openai_and_codex_sse_usage() {
         let mut acc = UsageAccumulator::new();
         acc.push_chunk(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");

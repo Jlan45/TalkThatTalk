@@ -17,8 +17,8 @@ use ttt_core::{
 };
 use ttt_protocol::openai_antigravity::openai_to_antigravity_project_request;
 use ttt_protocol::{
-    create_sse_translator, detect_ingress_protocol, json_response_to_sse, needs_translation,
-    translate_request_with_session, translate_response_json,
+    NativeSse, create_sse_translator, detect_ingress_protocol, json_response_to_sse,
+    needs_translation, translate_request_with_session, translate_response_json,
 };
 
 use crate::affinity::{AffinityContext, AffinityExtractor};
@@ -444,6 +444,7 @@ impl ProxyEngine {
             path_and_query,
             telemetry,
             upload_timing,
+            target_proto,
         ))
     }
 
@@ -796,6 +797,7 @@ impl ProxyEngine {
                             path_and_query,
                             telemetry,
                             upload_timing,
+                            target_proto,
                         ));
                     }
                     Err(err) => {
@@ -944,6 +946,7 @@ impl ProxyEngine {
         Ok((cred_handle, req))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn wrap_upstream_response(
         &self,
         upstream_resp: Response<Incoming>,
@@ -952,6 +955,7 @@ impl ProxyEngine {
         path_and_query: &str,
         telemetry: RequestTelemetry,
         upload_timing: Option<UploadTiming>,
+        target_proto: ProtocolFamily,
     ) -> Response<ProxyBody> {
         let RequestTelemetry { req_id, started_at, lifetime } = telemetry;
         let (parts, body) = upstream_resp.into_parts();
@@ -959,10 +963,26 @@ impl ProxyEngine {
         let is_sse = is_event_stream(&parts.headers);
         let path = path_and_query.split('?').next().unwrap_or_default();
         let is_stream = is_sse || (status.is_success() && path.ends_with(":streamGenerateContent"));
+        let native_sse = if is_sse
+            && status.is_success()
+            && detect_ingress_protocol(path) == Some(target_proto)
+            && parts
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .is_none_or(|encoding| encoding.as_bytes().eq_ignore_ascii_case(b"identity"))
+        {
+            NativeSse::new(target_proto)
+        } else {
+            None
+        };
 
         let mut builder = Response::builder().status(status);
         if let Some(headers) = builder.headers_mut() {
             copy_filtered_response_headers(&parts.headers, headers);
+            if native_sse.is_some() {
+                // An incomplete response may need one extra SSE error event.
+                headers.remove(header::CONTENT_LENGTH);
+            }
 
             if let Ok(hv) = HeaderValue::from_str(&req_id.to_string()) {
                 headers.insert(HEADER_X_TTT_REQUEST_ID.clone(), hv);
@@ -987,7 +1007,15 @@ impl ProxyEngine {
         }
 
         let tapped = ProxyBody::tap(
-            body, req_id, lifetime, status, is_stream, started_at, upload_timing, self.tap_tx.clone(),
+            body,
+            req_id,
+            lifetime,
+            status,
+            is_stream,
+            started_at,
+            upload_timing,
+            self.tap_tx.clone(),
+            native_sse,
         );
         builder
             .body(tapped)
@@ -1114,6 +1142,7 @@ impl ProxyEngine {
                 lifetime,
                 status,
                 is_stream: client_wants_stream,
+                stream_failure: None,
                 total_bytes: upstream_bytes.len() as u64,
                 ttft_ms,
                 duration_ms: elapsed,

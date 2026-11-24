@@ -11,4 +11,4 @@ pub use config::{
     UpstreamAuthConfig, UpstreamConfig,
 };
 pub use error::GatewayError;
-pub use types::{RequestId, TapEvent};
+pub use types::{RequestId, StreamFailure, TapEvent};

@@ -189,6 +189,7 @@ export interface RequestLogEntry {
   path: string;
   status: number;
   is_stream?: boolean | null;
+  stream_failure?: "incomplete" | "upstream_error" | "client_disconnected";
   ttft_ms: number;
   ttft_measured?: boolean;
   duration_ms: number;

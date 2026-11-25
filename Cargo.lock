@@ -6129,7 +6129,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "ttt-auth"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "aes-gcm 0.10.3",
  "arc-swap",
@@ -6153,7 +6153,7 @@ dependencies = [
 
 [[package]]
 name = "ttt-control"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "aes-gcm 0.10.3",
  "base64 0.22.1",
@@ -6181,7 +6181,7 @@ dependencies = [
 
 [[package]]
 name = "ttt-core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "bytes",
  "http",
@@ -6193,7 +6193,7 @@ dependencies = [
 
 [[package]]
 name = "ttt-protocol"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "bytes",
  "http",
@@ -6207,7 +6207,7 @@ dependencies = [
 
 [[package]]
 name = "ttt-proxy"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -6236,7 +6236,7 @@ dependencies = [
 
 [[package]]
 name = "ttt-server"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "bytes",
  "http",

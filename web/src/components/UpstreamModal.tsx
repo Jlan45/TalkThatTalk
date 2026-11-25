@@ -116,7 +116,7 @@ const PROVIDER_CATALOG: ProviderCatalogItem[] = [
     id: "antigravity-oauth",
     title: "Antigravity",
     badge: "OAuth 2.0",
-    logo: "gemini",
+    logo: "antigravity",
     desc: "Google Cloud Code Assist OAuth，支持 Gemini / Claude 模型与额度监控",
     authMode: "oauth",
     defaultName: "antigravity-oauth",

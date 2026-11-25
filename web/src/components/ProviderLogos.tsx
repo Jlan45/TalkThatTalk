@@ -1,3 +1,4 @@
+import antigravityColor from "@lobehub/icons-static-svg/icons/antigravity-color.svg";
 import claudeColor from "@lobehub/icons-static-svg/icons/claude-color.svg";
 import claudeCodeColor from "@lobehub/icons-static-svg/icons/claudecode-color.svg";
 import codexColor from "@lobehub/icons-static-svg/icons/codex-color.svg";
@@ -20,6 +21,7 @@ export type ProviderLogoId =
   | "claude"
   | "claudecode"
   | "gemini"
+  | "antigravity"
   | "minimax"
   | "deepseek"
   | "openrouter"
@@ -36,10 +38,14 @@ export function detectProviderLogo(opts: {
   protocol?: ProtocolFamily;
   preset?: OAuthPreset;
 }): ProviderLogoId {
+  if (opts.preset === "codex") return "codex";
+  if (opts.preset === "claude_code") return "claudecode";
+  if (opts.preset === "antigravity" || opts.protocol === "antigravity") return "antigravity";
+
   const n = (opts.name ?? "").toLowerCase();
   const u = (opts.baseUrl ?? "").toLowerCase();
 
-  if (opts.preset === "codex" || n.includes("codex") || u.includes("chatgpt.com")) return "codex";
+  if (n.includes("codex") || u.includes("chatgpt.com")) return "codex";
   if (
     n.includes("volc") ||
     n.includes("ark") ||
@@ -48,7 +54,7 @@ export function detectProviderLogo(opts: {
   ) {
     return "volcengine";
   }
-  if (opts.preset === "claude_code" || n.includes("claude-code") || n.includes("claudecode")) {
+  if (n.includes("claude-code") || n.includes("claudecode")) {
     return "claudecode";
   }
   if (n.includes("minimax") || u.includes("api.minimax.cn") || u.includes("api.minimaxi.com")) {
@@ -90,6 +96,7 @@ const LOGO_ASSETS: Record<
   claude: { src: claudeColor },
   claudecode: { src: claudeCodeColor },
   gemini: { src: geminiColor },
+  antigravity: { src: antigravityColor },
   minimax: { src: minimaxColor },
   deepseek: { src: deepseekColor },
   openrouter: { src: openrouterColor },

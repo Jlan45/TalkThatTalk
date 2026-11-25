@@ -10,6 +10,7 @@ use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use tracing::warn;
+use ttt_core::config::antigravity_daily_fallback;
 use ttt_core::{
     ANTIGRAVITY_USER_AGENT, GatewayError, OAuthPreset, ProtocolFamily, TokenRequestFormat,
     UpstreamAuthConfig, UpstreamConfig,
@@ -117,27 +118,28 @@ impl OAuthHttpClient {
     ) -> Result<String, GatewayError> {
         let base = url::Url::parse(endpoint)
             .map_err(|err| GatewayError::Config(format!("Antigravity 项目发现端点无效: {err}")))?;
-        let fallback = match (base.scheme(), base.host_str(), base.port()) {
-            ("https", Some("daily-cloudcode-pa.googleapis.com"), None) => {
-                Some("https://cloudcode-pa.googleapis.com")
-            }
-            ("https", Some("cloudcode-pa.googleapis.com"), None) => {
-                Some("https://daily-cloudcode-pa.googleapis.com")
-            }
-            _ => None,
+        let origin = base.origin().ascii_serialization();
+        let fallbacks: &[&str] = match antigravity_daily_fallback(&origin) {
+            Some(peer) => &[peer, "https://cloudcode-pa.googleapis.com"],
+            None if origin == "https://cloudcode-pa.googleapis.com" => &[
+                "https://daily-cloudcode-pa.googleapis.com",
+                "https://daily-cloudcode-pa.sandbox.googleapis.com",
+            ],
+            None => &[],
         };
-        let discovery = self
+        let mut result = self
             .discover_antigravity_project_at(&base, access_token)
             .await;
-        if discovery.is_err()
-            && let Some(fallback) = fallback
-        {
+        for fallback in fallbacks {
+            if result.is_ok() {
+                break;
+            }
             let fallback = url::Url::parse(fallback).expect("valid Google API endpoint");
-            return self
+            result = self
                 .discover_antigravity_project_at(&fallback, access_token)
                 .await;
         }
-        discovery
+        result
     }
 
     async fn discover_antigravity_project_at(

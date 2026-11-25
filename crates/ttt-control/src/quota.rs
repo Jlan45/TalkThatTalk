@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,6 +10,7 @@ use http_body_util::{BodyExt, Full};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
+use ttt_core::config::antigravity_daily_fallback;
 use ttt_core::{
     ANTIGRAVITY_USER_AGENT, PoolConfig, ProtocolFamily, QuotaDimension, QuotaMonitorConfig,
     QuotaProbeKind, QuotaSnapshot, QuotaStatus, UpstreamAuthConfig, UpstreamConfig,
@@ -23,7 +24,6 @@ const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const ANTIGRAVITY_MODELS_PATH: &str = "/v1internal:fetchAvailableModels";
 const ANTIGRAVITY_QUOTA_PATH: &str = "/v1internal:retrieveUserQuotaSummary";
-const ANTIGRAVITY_QUOTA_USER_AGENT: &str = "antigravity/hub/2.25.0";
 const OPENCODE_GO_USAGE_URL: &str = "https://opencode.ai/inference/go/v1/usage";
 const MIN_POLL_INTERVAL_SECS: u64 = 60;
 
@@ -357,12 +357,16 @@ impl AntigravityQuotaSession {
         })
     }
 
-    async fn catalog(&self, engine: &ProxyEngine, cfg: &UpstreamConfig) -> Result<Value, String> {
-        let data = self.post(engine, cfg, ANTIGRAVITY_MODELS_PATH).await?;
+    async fn catalog(
+        &self,
+        engine: &ProxyEngine,
+        cfg: &UpstreamConfig,
+    ) -> Result<(String, Value), String> {
+        let (url, data) = self.post(engine, cfg, ANTIGRAVITY_MODELS_PATH).await?;
         if data.get("models").and_then(Value::as_object).is_none() {
             return Err("Antigravity 未返回模型目录".into());
         }
-        Ok(data)
+        Ok((url, data))
     }
 
     async fn post(
@@ -370,7 +374,7 @@ impl AntigravityQuotaSession {
         engine: &ProxyEngine,
         cfg: &UpstreamConfig,
         path: &str,
-    ) -> Result<Value, String> {
+    ) -> Result<(String, Value), String> {
         let mut auth = http::HeaderValue::from_str(&format!("Bearer {}", self.access_token))
             .map_err(|err| err.to_string())?;
         auth.set_sensitive(true);
@@ -378,22 +382,39 @@ impl AntigravityQuotaSession {
             Some(project) => serde_json::json!({ "project": project }),
             None => serde_json::json!({}),
         };
-        let user_agent = if path == ANTIGRAVITY_QUOTA_PATH {
-            ANTIGRAVITY_QUOTA_USER_AGENT
-        } else {
-            ANTIGRAVITY_USER_AGENT
-        };
-        let req = Request::post(format!("{}{path}", self.origin))
-            .header("authorization", auth)
-            .header("user-agent", user_agent)
-            .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(body.to_string())))
-            .map_err(|err| err.to_string())?;
-        let (status, body) = send_http_json(engine, cfg, req).await?;
-        if !status.is_success() {
-            return Err(format!("Antigravity {path} HTTP {status}"));
+        let body = Bytes::from(body.to_string());
+        let mut last_error = String::new();
+        for origin in
+            std::iter::once(self.origin.as_str()).chain(antigravity_daily_fallback(&self.origin))
+        {
+            let url = format!("{origin}{path}");
+            let req = Request::post(&url)
+                .header("authorization", auth.clone())
+                .header("user-agent", ANTIGRAVITY_USER_AGENT)
+                .header("content-type", "application/json")
+                .body(Full::new(body.clone()))
+                .map_err(|err| err.to_string())?;
+            match tokio::time::timeout(Duration::from_secs(12), send_http_json(engine, cfg, req))
+                .await
+            {
+                Ok(Ok((status, response))) if status.is_success() => {
+                    return serde_json::from_str(&response)
+                        .map(|data| (url, data))
+                        .map_err(|err| format!("Antigravity {path} JSON 无效: {err}"));
+                }
+                Ok(Ok((status, _))) => {
+                    last_error = format!("Antigravity {path} HTTP {status}");
+                    if !status.is_server_error()
+                        && !matches!(status, StatusCode::NOT_FOUND | StatusCode::REQUEST_TIMEOUT)
+                    {
+                        break;
+                    }
+                }
+                Ok(Err(err)) => last_error = err,
+                Err(_) => last_error = format!("Antigravity {path} 请求超时"),
+            }
         }
-        serde_json::from_str(&body).map_err(|err| format!("Antigravity {path} JSON 无效: {err}"))
+        Err(last_error)
     }
 }
 
@@ -402,15 +423,12 @@ pub async fn fetch_antigravity_models(
     cfg: &UpstreamConfig,
 ) -> Result<(String, Vec<String>), String> {
     let session = AntigravityQuotaSession::load(engine, cfg).await?;
-    let catalog = session.catalog(engine, cfg).await?;
+    let (url, catalog) = session.catalog(engine, cfg).await?;
     let models = antigravity_models(&catalog)
         .into_iter()
         .map(|(id, _)| id.to_string())
         .collect();
-    Ok((
-        format!("{}{ANTIGRAVITY_MODELS_PATH}", session.origin),
-        models,
-    ))
+    Ok((url, models))
 }
 
 async fn probe_antigravity(
@@ -429,8 +447,8 @@ async fn probe_antigravity(
     );
     let mut snapshot = antigravity_usage(
         &cfg.name,
-        summary.as_ref().ok(),
-        catalog.as_ref().ok(),
+        summary.as_ref().ok().map(|(_, data)| data),
+        catalog.as_ref().ok().map(|(_, data)| data),
         fetched_at,
     );
     if snapshot.dimensions.is_empty() {
@@ -844,11 +862,29 @@ fn antigravity_models(catalog: &Value) -> Vec<(&str, &Value)> {
     let Some(models) = catalog.get("models").and_then(Value::as_object) else {
         return Vec::new();
     };
+    let advertised: HashSet<_> = catalog["agentModelSorts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|sort| sort["groups"].as_array().into_iter().flatten())
+        .map(|group| &group["modelIds"])
+        .chain(
+            catalog["tieredModelIds"]
+                .as_object()
+                .into_iter()
+                .flat_map(|tiers| tiers.values()),
+        )
+        .flat_map(|ids| ids.as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .map(|id| id.trim().to_ascii_lowercase())
+        .filter(|id| !id.is_empty())
+        .collect();
     let mut models: Vec<_> = models
         .iter()
         .filter(|(id, info)| {
             let id = id.to_ascii_lowercase();
-            id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+            (advertised.is_empty() || advertised.contains(&id))
+                && id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
                 && id
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
@@ -856,6 +892,7 @@ fn antigravity_models(catalog: &Value) -> Vec<(&str, &Value)> {
                 && !id.starts_with("chat_")
                 && !id.starts_with("tab_")
                 && !id.ends_with("-disabled")
+                && !id.ends_with("_disabled")
                 && !id.contains("image")
                 && info.is_object()
                 && info["disabled"].as_bool() != Some(true)
@@ -869,14 +906,16 @@ fn antigravity_models(catalog: &Value) -> Vec<(&str, &Value)> {
 }
 
 fn antigravity_window(label: String, info: &Value) -> Option<QuotaDimension> {
-    let fraction = info
-        .get("remainingFraction")?
-        .as_f64()
-        .filter(|f| (0.0..=1.0).contains(f))?;
     let resets_at = info
         .get("resetTime")
         .and_then(Value::as_str)
         .and_then(parse_rfc3339_secs);
+    // Protobuf JSON can omit a zero balance while still returning its reset time.
+    let fraction = match info.get("remainingFraction") {
+        Some(value) => value.as_f64().filter(|f| (0.0..=1.0).contains(f))?,
+        None if resets_at.is_some() => 0.0,
+        None => return None,
+    };
     Some(QuotaDimension::WindowUtilization {
         window: label,
         used_percent: (1.0 - fraction) * 100.0,
@@ -900,9 +939,9 @@ fn antigravity_quota_windows(summary: &Value) -> Vec<QuotaDimension> {
                 continue;
             }
             let id = bucket["bucketId"].as_str().unwrap_or_default();
-            let (family_order, family) = if id.starts_with("gemini-argon-")
-                || lowercase_name.contains("argon")
-            {
+            let (family_order, family) = if lowercase_name.starts_with("gemini 4") {
+                (2, name)
+            } else if id.starts_with("gemini-argon-") || lowercase_name.contains("argon") {
                 (2, "Gemini 4 Argon")
             } else if id.starts_with("gemini-") || lowercase_name.starts_with("gemini") {
                 (0, "Gemini")
@@ -914,7 +953,7 @@ fn antigravity_quota_windows(summary: &Value) -> Vec<QuotaDimension> {
                 (3, name)
             };
             let (period_order, period) = match bucket["window"].as_str() {
-                Some("weekly") => (0, "每周"),
+                Some("weekly" | "week" | "7d") => (0, "每周"),
                 Some("5h") => (1, "5h"),
                 other => (
                     2,
@@ -1237,5 +1276,38 @@ mod tests {
         assert!(matches!(&fallback.dimensions[..], [
             QuotaDimension::WindowUtilization { window, used_percent, .. }
         ] if window == "gemini-2.5-pro" && (*used_percent - 35.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn antigravity_catalog_uses_advertised_text_models_and_reports_exhausted_balances() {
+        let catalog = serde_json::json!({
+            "agentModelSorts": [{"groups": [{"modelIds": ["gemini-4-neon", "gemini-image"]}]}],
+            "tieredModelIds": {"flash": ["gemini-tiered"]},
+            "models": {
+                "gemini-4-neon": {"quotaInfo": {"resetTime": "2026-11-23T08:00:00Z"}},
+                "gemini-tiered": {},
+                "gemini-disabled-in-catalog": {},
+                "gemini-image": {},
+            }
+        });
+        let snapshot = antigravity_usage("antigravity", None, Some(&catalog), 0);
+        assert_eq!(
+            snapshot.available_models,
+            ["gemini-4-neon", "gemini-tiered"]
+        );
+        assert!(
+            matches!(&snapshot.dimensions[..], [QuotaDimension::WindowUtilization {
+            window, used_percent: 100.0, resets_at: Some(_),
+        }] if window == "gemini-4-neon")
+        );
+
+        let summary = serde_json::json!({"groups": [{"displayName": "Gemini 4 Neon", "buckets": [
+            {"bucketId": "gemini-neon-weekly", "window": "7d", "remainingFraction": 0.5},
+        ]}]});
+        assert!(
+            matches!(&antigravity_quota_windows(&summary)[..], [QuotaDimension::WindowUtilization {
+            window, used_percent: 50.0, ..
+        }] if window == "Gemini 4 Neon · 每周")
+        );
     }
 }

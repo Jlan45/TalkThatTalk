@@ -8,7 +8,9 @@ use pin_project_lite::pin_project;
 use serde_json::{Value, json};
 
 use crate::openai_anthropic::{map_anthropic_stop_reason, map_openai_finish_reason};
-use crate::openai_gemini::{extract_gemini_text, map_gemini_finish_reason};
+use crate::openai_gemini::{
+    google_candidate_delta, google_completion_id, google_finish_reason, google_usage,
+};
 use crate::sse::{SseDecoder, sse_data_bytes, sse_event_bytes};
 
 /// Static-dispatch incremental SSE protocol state machine.
@@ -23,7 +25,10 @@ pub enum SseTranslator {
     },
     GeminiToOpenAi {
         model: String,
-        sent_role: bool,
+        response_id: Option<String>,
+        next_call: usize,
+        pending_finish: Option<&'static str>,
+        usage: Option<Value>,
         sent_done: bool,
     },
     OpenAiToAnthropic {
@@ -67,7 +72,10 @@ impl SseTranslator {
     pub fn gemini_to_openai(model: String) -> Self {
         Self::GeminiToOpenAi {
             model,
-            sent_role: false,
+            response_id: None,
+            next_call: 0,
+            pending_finish: None,
+            usage: None,
             sent_done: false,
         }
     }
@@ -133,6 +141,10 @@ impl SseTranslator {
                     *sent_done = true;
                     out.push_back(Bytes::from_static(b"data: [DONE]\n\n"));
                 }
+                Self::GeminiToOpenAi {
+                    pending_finish: Some(_),
+                    ..
+                } => self.finish(out),
                 _ => self.fail("Upstream sent an unexpected stream terminator", out),
             }
             return;
@@ -148,7 +160,9 @@ impl SseTranslator {
                 event_type,
                 "error" | "response.failed" | "response.incomplete"
             )
-            || v.get("error").is_some_and(|error| error.is_object())
+            || v.get("error")
+                .or_else(|| v.pointer("/response/error"))
+                .is_some_and(|error| error.is_object())
         {
             let message = v
                 .pointer("/error/message")
@@ -292,75 +306,35 @@ impl SseTranslator {
 
             Self::GeminiToOpenAi {
                 model,
-                sent_role,
+                response_id,
+                next_call,
+                pending_finish,
+                usage,
                 sent_done,
             } => {
                 let v = v.get("response").unwrap_or(&v);
-                if !*sent_role {
-                    *sent_role = true;
-                    let role_chunk = json!({
-                        "id": "chatcmpl-gemini",
-                        "object": "chat.completion.chunk",
-                        "created": 0,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": { "role": "assistant" },
-                            "finish_reason": Value::Null,
-                        }]
-                    });
-                    out.push_back(sse_data_bytes(&role_chunk));
+                if response_id.is_none() {
+                    let id = google_completion_id(v);
+                    out.push_back(chat_delta(&id, model, json!({"role": "assistant"})));
+                    *response_id = Some(id);
                 }
-
-                let text = extract_gemini_text(v);
-                let finish_raw = v
-                    .pointer("/candidates/0/finishReason")
-                    .and_then(Value::as_str);
-
-                if !text.is_empty() {
-                    let chunk = json!({
-                        "id": "chatcmpl-gemini",
-                        "object": "chat.completion.chunk",
-                        "created": 0,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": { "content": text },
-                            "finish_reason": Value::Null,
-                        }]
-                    });
-                    out.push_back(sse_data_bytes(&chunk));
+                let id = response_id.as_deref().expect("completion ID initialized");
+                let delta = google_candidate_delta(v, id, next_call, true);
+                if delta.as_object().is_some_and(|fields| !fields.is_empty()) {
+                    out.push_back(chat_delta(id, model, delta));
                 }
-
-                if let Some(fr) = finish_raw {
-                    let prompt_tokens = v
-                        .pointer("/usageMetadata/promptTokenCount")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let completion_tokens = v
-                        .pointer("/usageMetadata/candidatesTokenCount")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let chunk = json!({
-                        "id": "chatcmpl-gemini",
-                        "object": "chat.completion.chunk",
-                        "created": 0,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": map_gemini_finish_reason(Some(fr)),
-                        }],
-                        "usage": {
-                            "prompt_tokens": prompt_tokens,
-                            "completion_tokens": completion_tokens,
-                            "total_tokens": prompt_tokens + completion_tokens,
-                        }
-                    });
-                    out.push_back(sse_data_bytes(&chunk));
-                    if !*sent_done {
+                if let Some(reason) = google_finish_reason(v, *next_call > 0) {
+                    *pending_finish = Some(reason);
+                }
+                if let Some(metadata) = v["usageMetadata"].as_object() {
+                    if let Some(existing) = usage.as_mut().and_then(Value::as_object_mut) {
+                        existing.extend(metadata.clone());
+                    } else {
+                        *usage = Some(Value::Object(metadata.clone()));
+                    }
+                    if let Some(reason) = *pending_finish {
+                        emit_google_finish(id, model, reason, usage.as_ref(), out);
                         *sent_done = true;
-                        out.push_back(Bytes::from_static(b"data: [DONE]\n\n"));
                     }
                 }
             }
@@ -780,6 +754,17 @@ impl SseTranslator {
             } if last_finish_reason.is_some() => {
                 emit_anthropic_finish(finished, last_finish_reason.as_deref(), *output_tokens, out);
             }
+            Self::GeminiToOpenAi {
+                model,
+                response_id: Some(id),
+                pending_finish: Some(reason),
+                usage,
+                sent_done,
+                ..
+            } => {
+                emit_google_finish(id, model, reason, usage.as_ref(), out);
+                *sent_done = true;
+            }
             _ => self.fail("Upstream stream ended without a completion event", out),
         }
     }
@@ -811,6 +796,24 @@ fn chat_delta(id: &str, model: &str, delta: Value) -> Bytes {
         "id": id, "object": "chat.completion.chunk", "created": 0, "model": model,
         "choices": [{ "index": 0, "delta": delta, "finish_reason": null }]
     }))
+}
+
+fn emit_google_finish(
+    id: &str,
+    model: &str,
+    reason: &str,
+    usage: Option<&Value>,
+    out: &mut VecDeque<Bytes>,
+) {
+    let mut chunk = json!({
+        "id": id, "object": "chat.completion.chunk", "created": 0, "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
+    });
+    if let Some(usage) = usage {
+        chunk["usage"] = google_usage(usage);
+    }
+    out.push_back(sse_data_bytes(&chunk));
+    out.push_back(Bytes::from_static(b"data: [DONE]\n\n"));
 }
 
 fn emit_anthropic_finish(

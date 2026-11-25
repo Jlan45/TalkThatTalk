@@ -876,6 +876,9 @@ async fn antigravity_discovers_project_and_preserves_it_on_refresh() {
                     }
                     "/v1internal:generateContent" => {
                         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(parts.headers[header::USER_AGENT], ttt_core::ANTIGRAVITY_USER_AGENT);
+                        assert!(body["requestId"].is_string());
+                        assert!(body.get("requestType").is_none());
                         let expected = match authorization.unwrap().to_str().unwrap() {
                             "Bearer legacy-access" | "Bearer rotated-access" => "legacy-project",
                             "Bearer new-access" => "new-project",
@@ -889,8 +892,39 @@ async fn antigravity_discovers_project_and_preserves_it_on_refresh() {
                                 .unwrap();
                         }
                         Response::new(full_body(
-                            r#"{"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}}"#,
+                            r#"{"response":{"candidates":[{"content":{"parts":[{"thought":true,"text":"reasoning summary"},{"text":"ok"}]},"finishReason":"STOP"}]}}"#,
                         ))
+                    }
+                    "/v1internal:streamGenerateContent" => {
+                        assert_eq!(parts.uri.query(), Some("alt=sse"));
+                        assert_eq!(authorization.unwrap(), "Bearer new-access");
+                        assert_eq!(parts.headers[header::USER_AGENT], ttt_core::ANTIGRAVITY_USER_AGENT);
+                        assert_eq!(parts.headers[header::ACCEPT], "text/event-stream");
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(body["project"], "new-project");
+                        assert_eq!(body["requestType"], "agent");
+                        assert!(body["request"]["sessionId"].as_str().unwrap().parse::<i64>().is_ok());
+                        assert_eq!(body.pointer("/request/tools/0/functionDeclarations/0/parameters/properties/grid/items/type").unwrap(), "ARRAY");
+                        let stream = if let Some(result) = body.pointer("/request/contents/2/parts/0/functionResponse") {
+                            assert_eq!(result["id"], "tool-1");
+                            assert_eq!(result["name"], "lookup");
+                            assert_eq!(result["response"]["output"], "result");
+                            assert_eq!(body["request"]["contents"][2]["role"], "model");
+                            assert_eq!(body.pointer("/request/contents/1/parts/0/thoughtSignature").unwrap(), "signed");
+                            concat!(
+                                "data: ", r#"{"response":{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}]}}"#, "\n\n",
+                            )
+                        } else {
+                            concat!(
+                                "data: ", r#"{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"lookup","id":"tool-1","args":{"grid":[[1]]}},"thoughtSignature":"signed"}]}}],"usageMetadata":{"promptTokenCount":10,"cachedContentTokenCount":4}}}"#, "\n\n",
+                                "data: ", r#"{"response":{"candidates":[{"finishReason":"STOP"}]}}"#, "\n\n",
+                                "data: ", r#"{"response":{"usageMetadata":{"candidatesTokenCount":2,"thoughtsTokenCount":1,"totalTokenCount":13}}}"#, "\n\n",
+                            )
+                        };
+                        Response::builder()
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .body(full_body(stream))
+                            .unwrap()
                     }
                     path => panic!("unexpected upstream path {path}"),
                 }
@@ -903,6 +937,7 @@ async fn antigravity_discovers_project_and_preserves_it_on_refresh() {
             "name": "antigravity",
             "base_url": format!("http://{upstream}"),
             "protocol": "antigravity",
+            "protocol_endpoints": {"antigravity": "/v1internal:generateContent"},
             "auth": {
                 "type": "oauth",
                 "preset": "antigravity",
@@ -936,6 +971,7 @@ async fn antigravity_discovers_project_and_preserves_it_on_refresh() {
             .request(
                 Request::post(format!("http://{gateway}/v1/chat/completions"))
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::USER_AGENT, "openai-sdk")
                     .body(Full::new(Bytes::from_static(
                         br#"{"model":"test","messages":[{"role":"user","content":"Hello"}]}"#,
                     )))
@@ -947,6 +983,10 @@ async fn antigravity_discovers_project_and_preserves_it_on_refresh() {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["choices"][0]["message"]["content"], "ok");
+        assert_eq!(
+            body["choices"][0]["message"]["reasoning_content"],
+            "reasoning summary"
+        );
     };
 
     generate().await;
@@ -996,6 +1036,52 @@ async fn antigravity_discovers_project_and_preserves_it_on_refresh() {
             .antigravity_project_id(),
         Some("new-project")
     );
+
+    let client = &client;
+    let stream = |body: serde_json::Value| async move {
+        let resp = client
+            .request(
+                Request::post(format!("http://{gateway}/v1/chat/completions"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-ttt-session-id", "conversation-1")
+                    .body(Full::new(Bytes::from(body.to_string())))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.ends_with("data: [DONE]\n\n"));
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let mut request = serde_json::json!({
+        "model": "test",
+        "stream": true,
+        "messages": [{"role": "user", "content": "Hello"}],
+        "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {
+            "type": "object", "properties": {"grid": {"type": "array", "items": {"items": {"type": "integer"}}}}
+        }}}]
+    });
+    let frames = stream(request.clone()).await;
+    let mut call = frames[1]["choices"][0]["delta"]["tool_calls"][0].clone();
+    assert_eq!(call.as_object_mut().unwrap().remove("index").unwrap(), 0);
+    assert_eq!(call["id"], "tool-1");
+    assert_eq!(call["function"]["arguments"], r#"{"grid":[[1]]}"#);
+    let end = frames.last().unwrap();
+    assert_eq!(end["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(end["usage"]["completion_tokens"], 3);
+    assert_eq!(end["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
+    request["messages"].as_array_mut().unwrap().extend([
+        serde_json::json!({"role": "assistant", "tool_calls": [call]}),
+        serde_json::json!({"role": "tool", "tool_call_id": "tool-1", "content": "result"}),
+    ]);
+    let frames = stream(request).await;
+    assert_eq!(frames[1]["choices"][0]["delta"]["content"], "done");
     std::fs::remove_file(path).unwrap();
 }
 

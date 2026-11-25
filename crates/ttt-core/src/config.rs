@@ -459,7 +459,19 @@ pub struct QuotaSnapshot {
     pub fetched_at: i64,
 }
 
-pub const ANTIGRAVITY_USER_AGENT: &str = "antigravity/1.15.8 linux/amd64";
+pub const ANTIGRAVITY_USER_AGENT: &str = "antigravity/hub/2.33.0";
+
+pub fn antigravity_daily_fallback(origin: &str) -> Option<&'static str> {
+    match origin {
+        "https://daily-cloudcode-pa.googleapis.com" => {
+            Some("https://daily-cloudcode-pa.sandbox.googleapis.com")
+        }
+        "https://daily-cloudcode-pa.sandbox.googleapis.com" => {
+            Some("https://daily-cloudcode-pa.googleapis.com")
+        }
+        _ => None,
+    }
+}
 
 /// Supported outbound proxy protocols backed by ClashRS and native HTTP CONNECT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

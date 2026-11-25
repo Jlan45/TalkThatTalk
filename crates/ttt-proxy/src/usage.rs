@@ -32,6 +32,8 @@ impl TokenUsage {
 pub struct UsageAccumulator {
     buf: Vec<u8>,
     base_input_tokens: u64,
+    gemini_candidate_tokens: u64,
+    gemini_thought_tokens: u64,
     is_anthropic_additive: bool,
     pub usage: TokenUsage,
 }
@@ -157,7 +159,15 @@ impl UsageAccumulator {
             self.base_input_tokens = v;
         }
         if let Some(v) = g.candidates_token_count {
-            self.usage.output_tokens = v;
+            self.gemini_candidate_tokens = v;
+        }
+        if let Some(v) = g.thoughts_token_count {
+            self.gemini_thought_tokens = v;
+        }
+        if g.candidates_token_count.is_some() || g.thoughts_token_count.is_some() {
+            self.usage.output_tokens = self
+                .gemini_candidate_tokens
+                .saturating_add(self.gemini_thought_tokens);
         }
         if let Some(v) = g.total_token_count {
             self.usage.total_tokens = v;
@@ -208,6 +218,7 @@ struct RawUsage {
 struct GeminiUsageMetadata {
     prompt_token_count: Option<u64>,
     candidates_token_count: Option<u64>,
+    thoughts_token_count: Option<u64>,
     total_token_count: Option<u64>,
     cached_content_token_count: Option<u64>,
 }
@@ -370,14 +381,17 @@ mod tests {
 
         let mut anti = UsageAccumulator::new();
         anti.push_chunk(
-            b"data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":4000,\"candidatesTokenCount\":50,\"totalTokenCount\":4050,\"cachedContentTokenCount\":3200}}}\n\n",
+            b"data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":4000,\"candidatesTokenCount\":50,\"cachedContentTokenCount\":3200}}}\n\n",
+        );
+        anti.push_chunk(
+            b"data: {\"response\":{\"usageMetadata\":{\"thoughtsTokenCount\":10,\"totalTokenCount\":4060}}}\n\n",
         );
         assert_eq!(
             anti.finish(),
             TokenUsage {
                 input_tokens: 4_000,
-                output_tokens: 50,
-                total_tokens: 4_050,
+                output_tokens: 60,
+                total_tokens: 4_060,
                 cache_read_tokens: 3_200,
                 cache_write_tokens: 0,
             }

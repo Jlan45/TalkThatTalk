@@ -100,7 +100,19 @@ impl ParsedEndpoint {
 
     /// Join this endpoint's resolved URL (`base_url + endpoint`) with `incoming_path_and_query`.
     pub fn build_target_uri(&self, incoming_path_and_query: &str) -> Result<Uri, GatewayError> {
-        let joined = if is_concrete_action_path(&self.base_path_prefix) {
+        let antigravity_prefix = [
+            "/v1internal:generateContent",
+            "/v1internal:streamGenerateContent",
+        ]
+        .into_iter()
+        .find_map(|action| self.base_path_prefix.strip_suffix(action));
+        let joined = if let Some(prefix) = antigravity_prefix
+            && matches!(
+                incoming_path_and_query.split('?').next(),
+                Some("/v1internal:generateContent" | "/v1internal:streamGenerateContent")
+            ) {
+            format!("{prefix}{incoming_path_and_query}")
+        } else if is_concrete_action_path(&self.base_path_prefix) {
             if let Some((_, query)) = incoming_path_and_query.split_once('?') {
                 if self.base_path_prefix.contains('?') {
                     format!("{}&{}", self.base_path_prefix, query)
@@ -344,6 +356,7 @@ impl UpstreamNode {
                     | PromptCacheMode::VolcengineArk
             )
             || self.is_codex_oauth
+            || self.endpoints.contains_key(&ProtocolFamily::Antigravity)
             || (self.effective_cache_mode == PromptCacheMode::OpenAi
                 && (self.default_protocol == ProtocolFamily::OpenAiResponses
                     || self.endpoints.contains_key(&ProtocolFamily::OpenAiResponses)))

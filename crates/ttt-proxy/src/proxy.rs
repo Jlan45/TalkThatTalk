@@ -12,10 +12,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use ttt_auth::{CredentialHandle, TokenStore};
 use ttt_core::{
-    ClientKeyConfig, GatewayConfig, GatewayError, PromptCacheMode, ProtocolFamily, ProxyConfig,
-    RequestId, TapEvent,
+    ANTIGRAVITY_USER_AGENT, ClientKeyConfig, GatewayConfig, GatewayError, PromptCacheMode,
+    ProtocolFamily, ProxyConfig, RequestId, TapEvent,
 };
-use ttt_protocol::openai_antigravity::openai_to_antigravity_project_request;
+use ttt_protocol::openai_antigravity::openai_to_antigravity_session_request;
 use ttt_protocol::{
     NativeSse, create_sse_translator, detect_ingress_protocol, json_response_to_sse,
     needs_translation, translate_request_with_session, translate_response_json,
@@ -524,8 +524,13 @@ impl ProxyEngine {
             // Resolve best endpoint on this node: zero-copy native protocol if supported,
             // otherwise fall back to node's primary protocol with translation.
             let (target_proto, endpoint) = node.resolve_endpoint(ingress_proto);
-            let cross_proto = ingress_proto
-                .filter(|&in_p| needs_translation(in_p, target_proto));
+            let cross_proto = ingress_proto.filter(|&in_p| needs_translation(in_p, target_proto));
+            let antigravity_session_hint = affinity
+                .as_ref()
+                .filter(|aff| {
+                    target_proto == ProtocolFamily::Antigravity && aff.source != "prefix_hash"
+                })
+                .map(|aff| format!("{}:{:016x}", node.name, aff.hash));
 
             let mut oauth_refreshed_on_node = false;
 
@@ -563,8 +568,15 @@ impl ProxyEngine {
                     let project = antigravity_session
                         .as_ref()
                         .and_then(|session| session.antigravity_project_id.as_deref());
-                    let tr = if let Some(project) = project {
-                        openai_to_antigravity_project_request(&raw_body, mapped, project)?
+                    let tr = if (in_p, target_proto)
+                        == (ProtocolFamily::OpenAi, ProtocolFamily::Antigravity)
+                    {
+                        openai_to_antigravity_session_request(
+                            &raw_body,
+                            mapped,
+                            project.unwrap_or_default(),
+                            antigravity_session_hint.as_deref(),
+                        )?
                     } else {
                         translate_request_with_session(
                             in_p,
@@ -853,6 +865,12 @@ impl ProxyEngine {
             .ok_or_else(|| GatewayError::Internal("failed to access request headers".into()))?;
 
         copy_filtered_request_headers(incoming_headers, headers);
+        if target_proto == ProtocolFamily::Antigravity {
+            headers.insert(
+                header::USER_AGENT,
+                HeaderValue::from_static(ANTIGRAVITY_USER_AGENT),
+            );
+        }
 
         // Outbound session header mapping & optional cleanup of heterogeneous agent headers.
         let out_session_header = node.resolve_outbound_session_header(target_proto);

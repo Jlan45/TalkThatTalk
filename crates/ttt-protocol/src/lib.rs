@@ -88,7 +88,12 @@ pub fn translate_request_with_session(
             openai_gemini::openai_to_gemini_request(raw_body, model_override)
         }
         (ProtocolFamily::OpenAi, ProtocolFamily::Antigravity) => {
-            openai_antigravity::openai_to_antigravity_request(raw_body, model_override)
+            openai_antigravity::openai_to_antigravity_session_request(
+                raw_body,
+                model_override,
+                "",
+                session_hint,
+            )
         }
         (ProtocolFamily::OpenAi, ProtocolFamily::OpenAiResponses) => {
             openai_responses::openai_to_responses_request_with_session(
@@ -333,6 +338,7 @@ mod tests {
             r#"{"response":{"candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}]}}"#,
             &mut out,
         );
+        tr.finish(&mut out);
         let joined: String = out
             .iter()
             .map(|b| String::from_utf8_lossy(b).into_owned())

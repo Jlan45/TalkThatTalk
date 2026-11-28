@@ -28,6 +28,12 @@ pub struct StoredOAuthToken {
 }
 
 impl StoredOAuthToken {
+    pub fn requires_reauthorization(&self) -> bool {
+        self.extra
+            .get("reauthorization_required")
+            .is_some_and(|v| v == "true")
+    }
+
     pub fn antigravity_project_id(&self) -> Option<&str> {
         self.extra.get("project_id").map(String::as_str)
     }

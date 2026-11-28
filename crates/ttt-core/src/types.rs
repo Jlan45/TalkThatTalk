@@ -65,6 +65,7 @@ pub enum TapEvent {
         lifetime: Weak<Instant>,
         user_id: Option<i64>,
         upstream: String,
+        upstream_id: String,
         model: Option<String>,
         path: String,
     },

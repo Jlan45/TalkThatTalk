@@ -3,12 +3,13 @@ import { gatewayApi } from "../api/client";
 import { IconExternal } from "./Icons";
 
 interface Props {
+  upstreamId: string;
   upstreamName: string;
   onClose: () => void;
   onSuccess: () => void;
 }
 
-export function OAuthLoginModal({ upstreamName, onClose, onSuccess }: Props) {
+export function OAuthLoginModal({ upstreamId, upstreamName, onClose, onSuccess }: Props) {
   const [authUrl, setAuthUrl] = useState("");
   const [state, setState] = useState("");
   const [callbackInput, setCallbackInput] = useState("");
@@ -19,7 +20,7 @@ export function OAuthLoginModal({ upstreamName, onClose, onSuccess }: Props) {
   useEffect(() => {
     let active = true;
     gatewayApi
-      .startOAuthAuthorize(upstreamName)
+      .startOAuthAuthorize(upstreamId)
       .then((res) => {
         if (!active) return;
         setAuthUrl(res.authorize_url);
@@ -35,7 +36,7 @@ export function OAuthLoginModal({ upstreamName, onClose, onSuccess }: Props) {
     return () => {
       active = false;
     };
-  }, [upstreamName]);
+  }, [upstreamId]);
 
   const handleSubmit = async () => {
     if (!callbackInput.trim()) {
@@ -45,7 +46,7 @@ export function OAuthLoginModal({ upstreamName, onClose, onSuccess }: Props) {
     setSubmitting(true);
     setError(null);
     try {
-      await gatewayApi.submitOAuthCallback(upstreamName, callbackInput.trim(), state);
+      await gatewayApi.submitOAuthCallback(upstreamId, callbackInput.trim(), state);
       onSuccess();
       onClose();
     } catch (e) {

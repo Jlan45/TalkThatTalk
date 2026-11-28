@@ -19,6 +19,8 @@ pub struct RequestLogEntry {
     pub username: Option<String>,
     pub timestamp_secs: u64,
     pub upstream: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_id: Option<String>,
     pub model: Option<String>,
     pub path: String,
     pub status: u16,
@@ -38,6 +40,7 @@ pub struct RequestLogEntry {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UpstreamStats {
+    pub name: String,
     pub requests: u64,
     pub errors: u64,
     pub input_tokens: u64,
@@ -82,6 +85,7 @@ struct ActiveRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<String>,
     upstream: String,
+    upstream_id: Option<String>,
     model: Option<String>,
     path: String,
     elapsed_ms: u64,
@@ -93,6 +97,7 @@ struct PendingMeta {
     user_id: Option<i64>,
     username: Option<String>,
     upstream: String,
+    upstream_id: Option<String>,
     model: Option<String>,
     path: String,
     is_stream: Option<bool>,
@@ -136,7 +141,14 @@ impl RequestTotals {
         self.usage_requests += u64::from(entry.input_tokens > 0);
         self.cache_hit_requests += u64::from(entry.cache_read_tokens > 0);
 
-        let upstream = self.by_upstream.entry(entry.upstream.clone()).or_default();
+        let key = entry
+            .upstream_id
+            .clone()
+            .unwrap_or_else(|| entry.upstream.clone());
+        let upstream = self.by_upstream.entry(key).or_default();
+        if upstream.name.is_empty() {
+            upstream.name.clone_from(&entry.upstream);
+        }
         upstream.requests += 1;
         upstream.errors += u64::from(entry.status >= 400 || entry.stream_failure.is_some());
         upstream.input_tokens += entry.input_tokens;
@@ -212,6 +224,7 @@ impl MetricsStore {
         user_id: Option<i64>,
         username: Option<String>,
         upstream: String,
+        upstream_id: Option<String>,
         model: Option<String>,
         path: String,
     ) {
@@ -223,6 +236,7 @@ impl MetricsStore {
                     user_id,
                     username,
                     upstream,
+                    upstream_id,
                     model,
                     path,
                     is_stream: None,
@@ -275,6 +289,7 @@ impl MetricsStore {
                 user_id: meta.user_id,
                 username: meta.username.clone(),
                 upstream: meta.upstream.clone(),
+                upstream_id: meta.upstream_id.clone(),
                 model: meta.model.clone(),
                 path: meta.path.split('?').next().unwrap_or_default().to_string(),
                 elapsed_ms: now.saturating_duration_since(started_at).as_millis() as u64,
@@ -331,6 +346,7 @@ impl MetricsStore {
                 user_id: None,
                 username: None,
                 upstream: "unknown".into(),
+                upstream_id: None,
                 model: None,
                 path: "-".into(),
                 is_stream: None,
@@ -342,6 +358,7 @@ impl MetricsStore {
                 username: meta.username,
                 timestamp_secs: now_secs(),
                 upstream: meta.upstream,
+                upstream_id: meta.upstream_id,
                 model: meta.model,
                 path: meta.path,
                 status,
@@ -500,6 +517,7 @@ mod tests {
             Some(1),
             Some("alice".into()),
             "primary".into(),
+            None,
             Some("model".into()),
             "/v1/messages?private=value".into(),
         );
@@ -513,6 +531,7 @@ mod tests {
             Some(1),
             Some("alice".into()),
             "backup".into(),
+            None,
             Some("model".into()),
             "/v1/messages?private=value".into(),
         );
@@ -541,6 +560,7 @@ mod tests {
             Some(1),
             Some("alice".into()),
             "up-a".into(),
+            None,
             Some("gpt-4o".into()),
             "/v1/chat/completions".into(),
         );
@@ -569,6 +589,7 @@ mod tests {
             Some(1),
             Some("alice".into()),
             "up-b".into(),
+            None,
             Some("claude-sonnet-4".into()),
             "/v1/messages".into(),
         );

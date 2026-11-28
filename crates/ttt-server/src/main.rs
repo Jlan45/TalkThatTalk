@@ -141,7 +141,13 @@ async fn run_server(
     // One-time migration: if SQLite is empty and legacy TOML had upstreams/keys, seed SQLite once.
     let mut upstreams = db.list_upstreams()?;
     if upstreams.is_empty() && !config.upstreams.is_empty() {
-        for up in &config.upstreams {
+        let mut seeded = config.upstreams.clone();
+        for up in &mut seeded {
+            if up.id.is_empty() {
+                up.id = GatewayDb::new_upstream_id();
+            }
+        }
+        for up in &seeded {
             db.upsert_upstream(up)?;
         }
         upstreams = db.list_upstreams()?;
@@ -150,8 +156,21 @@ async fn run_server(
     let mut client_keys = db.list_client_keys()?;
     let legacy_keys = config.server.effective_client_keys();
     if client_keys.is_empty() && !legacy_keys.is_empty() {
-        for k in &legacy_keys {
-            db.upsert_client_key(k)?;
+        for mut key in legacy_keys {
+            key.allowed_upstreams.retain_mut(|selector| {
+                if upstreams.iter().any(|up| up.id == *selector) {
+                    return true;
+                }
+                let mut matches = upstreams.iter().filter(|up| up.name == *selector);
+                if let Some(up) = matches.next()
+                    && matches.next().is_none()
+                {
+                    *selector = up.id.clone();
+                    return true;
+                }
+                false
+            });
+            db.upsert_client_key(&key)?;
         }
         client_keys = db.list_client_keys()?;
     }
@@ -305,6 +324,7 @@ async fn run_tap_worker(
                     lifetime,
                     user_id,
                     upstream,
+                    upstream_id,
                     model,
                     path,
                 } => {
@@ -321,7 +341,16 @@ async fn run_tap_worker(
                         %path,
                         "proxy request started"
                     );
-                    metrics.record_start(req_id, lifetime, user_id, username, upstream, model, path);
+                    metrics.record_start(
+                        req_id,
+                        lifetime,
+                        user_id,
+                        username,
+                        upstream,
+                        Some(upstream_id),
+                        model,
+                        path,
+                    );
                 }
                 TapEvent::ResponseFirstByte {
                     req_id,

@@ -16,7 +16,7 @@ interface Props {
   initial?: UpstreamView | null;
   antigravityOAuthDefaults?: AntigravityOAuthDefaults | null;
   onClose: () => void;
-  onSaved: (authorizeUpstream?: string) => void;
+  onSaved: (authorizeUpstream?: { id: string; name: string }) => void;
 }
 
 type AuthMode = "api_key" | "oauth";
@@ -85,10 +85,10 @@ const PROVIDER_CATALOG: ProviderCatalogItem[] = [
   },
   {
     id: "claude-code-oauth",
-    title: "Claude Code",
+    title: "Claude Code OAuth（旧版）",
     badge: "OAuth 2.0",
     logo: "claudecode",
-    desc: "Anthropic OAuth JSON 令牌端点，支持 code#state 与自动刷新",
+    desc: "用于管理已有的 Claude Code OAuth 渠道。新接入可使用 Anthropic API Key。",
     authMode: "oauth",
     defaultName: "claude-code-oauth",
     baseUrl: "https://api.anthropic.com",
@@ -162,7 +162,7 @@ const PROVIDER_CATALOG: ProviderCatalogItem[] = [
   },
   {
     id: "anthropic-api",
-    title: "Anthropic Claude",
+    title: "Anthropic API · Claude Code",
     badge: "API Base",
     logo: "claude",
     desc: "使用 x-api-key 连接官方 Anthropic Messages 端点，支持跨协议互转",
@@ -173,7 +173,7 @@ const PROVIDER_CATALOG: ProviderCatalogItem[] = [
     protocolEndpoints: [{ protocol: "anthropic", endpoint: "/v1/messages" }],
     headerName: "x-api-key",
     headerPrefix: "",
-    suggestedModels: ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-3-5-haiku-20241022"],
+    suggestedModels: [],
     protocolHeaders: {
       anthropic: {
         "anthropic-version": "2023-06-01",
@@ -449,6 +449,7 @@ export function UpstreamModal({ initial, antigravityOAuthDefaults, onClose, onSa
 
   // Step 2 form state: Base URL + relative protocol_endpoints (`final = base_url + endpoint`)
   const [name, setName] = useState(initial?.name ?? "");
+  const [createdId, setCreatedId] = useState<string>();
   const [baseUrl, setBaseUrl] = useState(initial?.base_url ?? "https://api.openai.com");
   const [proxyName, setProxyName] = useState(initial?.proxy ?? "");
   const [quotaEnabled, setQuotaEnabled] = useState(initial?.quota_config?.enabled ?? true);
@@ -656,7 +657,7 @@ export function UpstreamModal({ initial, antigravityOAuthDefaults, onClose, onSa
 
       let res: { url: string; models: string[] };
       if (isEdit && initial && !firstKey) {
-        res = await gatewayApi.fetchUpstreamModels(initial.name, modelsPath);
+        res = await gatewayApi.fetchUpstreamModels(initial.id, modelsPath);
       } else {
         const targetBase = baseUrl.trim();
         if (!targetBase) {
@@ -852,20 +853,20 @@ export function UpstreamModal({ initial, antigravityOAuthDefaults, onClose, onSa
 
     setSaving(true);
     try {
-      if (isEdit && initial) {
-        await gatewayApi.updateUpstream(initial.name, payload);
-      } else {
-        await gatewayApi.createUpstream(payload);
-      }
+      const savedId = initial?.id ?? createdId;
+      const saved = savedId
+        ? await gatewayApi.updateUpstream(savedId, payload)
+        : await gatewayApi.createUpstream(payload);
+      if (!savedId) setCreatedId(saved.id);
       // If user pasted the official OAuth callback code/URL in Step 2, complete token exchange immediately.
       if (isOfficialOAuth && officialCallbackInput.trim() && officialAuthState) {
         await gatewayApi.submitOAuthCallback(
-          name.trim(),
+          saved.id,
           officialCallbackInput.trim(),
           officialAuthState
         );
       }
-      onSaved(authorizeAntigravity ? initial?.name ?? name.trim() : undefined);
+      onSaved(authorizeAntigravity ? { id: saved.id, name: saved.name } : undefined);
       onClose();
     } catch (e) {
       setError((e as Error).message);
@@ -1057,7 +1058,6 @@ export function UpstreamModal({ initial, antigravityOAuthDefaults, onClose, onSa
                     <label className="form-label">渠道名称</label>
                     <input
                       className="input"
-                      disabled={isEdit}
                       value={name}
                       onChange={(e) => setName(e.target.value)}
                       placeholder="e.g. volcengine-agent-plan"

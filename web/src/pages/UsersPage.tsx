@@ -285,22 +285,23 @@ export function UsersPage({ currentUser }: Props) {
           {defaultRestrict && (
             <div className="chip-picker" style={{ marginTop: 0 }}>
               {globalUpstreams.map((up) => {
-                const selected = defaultAllowed.includes(up.name);
+                const selected = defaultAllowed.includes(up.id);
                 return (
                   <button
                     type="button"
-                    key={up.name}
+                    key={up.id}
+                    title={up.id}
                     disabled={savingDefaults}
                     className={`pick-chip ${selected ? "selected" : ""}`}
                     onClick={() => {
                       const next = selected
-                        ? defaultAllowed.filter((x) => x !== up.name)
-                        : [...defaultAllowed, up.name];
+                        ? defaultAllowed.filter((x) => x !== up.id)
+                        : [...defaultAllowed, up.id];
                       void saveDefaultChannels(true, next);
                     }}
                   >
                     {selected ? "✓ " : ""}
-                    {up.name}
+                    {up.name} · {up.id.slice(-8)}
                   </button>
                 );
               })}
@@ -506,18 +507,19 @@ export function UsersPage({ currentUser }: Props) {
                     {restrictUpstreams && (
                       <div className="chip-picker">
                         {globalUpstreams.map((up) => {
-                          const selected = allowedUpstreams.includes(up.name);
+                          const selected = allowedUpstreams.includes(up.id);
                           return (
                             <button
                               type="button"
-                              key={up.name}
+                              key={up.id}
+                    title={up.id}
                               className={`pick-chip ${selected ? "selected" : ""}`}
                               onClick={() =>
-                                toggleItem(allowedUpstreams, up.name, setAllowedUpstreams)
+                                toggleItem(allowedUpstreams, up.id, setAllowedUpstreams)
                               }
                             >
                               {selected ? "✓ " : ""}
-                              {up.name}
+                              {up.name} · {up.id.slice(-8)}
                             </button>
                           );
                         })}

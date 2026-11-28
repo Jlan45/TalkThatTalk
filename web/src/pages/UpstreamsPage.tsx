@@ -45,7 +45,7 @@ export function UpstreamsPage({ currentUser }: Props) {
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<UpstreamView | null>(null);
-  const [oauthTarget, setOauthTarget] = useState<string | null>(null);
+  const [oauthTarget, setOauthTarget] = useState<{ id: string; name: string } | null>(null);
   const [expandedModels, setExpandedModels] = useState<Record<string, boolean>>({});
   const [refreshingQuota, setRefreshingQuota] = useState<Record<string, boolean>>({});
 
@@ -84,6 +84,7 @@ export function UpstreamsPage({ currentUser }: Props) {
       if (!q) return true;
       return (
         u.name.toLowerCase().includes(q) ||
+        u.id.toLowerCase().includes(q) ||
         u.base_url.toLowerCase().includes(q) ||
         Object.values(u.protocol_endpoints ?? {}).some((url) =>
           (url ?? "").toLowerCase().includes(q)
@@ -121,10 +122,10 @@ export function UpstreamsPage({ currentUser }: Props) {
     }
   };
 
-  const handleDelete = async (name: string) => {
+  const handleDelete = async (id: string, name: string) => {
     if (!window.confirm(`确认删除上游渠道 "${name}"？`)) return;
     try {
-      await gatewayApi.deleteUpstream(name);
+      await gatewayApi.deleteUpstream(id);
       await load();
     } catch (e) {
       setError((e as Error).message);
@@ -216,14 +217,14 @@ export function UpstreamsPage({ currentUser }: Props) {
             </thead>
             <tbody>
               {paged.map((up) => {
-                const isExpanded = Boolean(expandedModels[up.name]);
+                const isExpanded = Boolean(expandedModels[up.id]);
                 const MAX_VISIBLE_MODELS = 2;
                 const catalog = up.quota?.available_models?.length ? up.quota.available_models : up.models;
                 const visibleModels = isExpanded ? catalog : catalog.slice(0, MAX_VISIBLE_MODELS);
                 const hiddenCount = Math.max(0, catalog.length - MAX_VISIBLE_MODELS);
 
                 return (
-                <tr key={up.name}>
+                <tr key={up.id}>
                   <td>
                     <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                       <div className="provider-icon" style={{ width: 32, height: 32, flexShrink: 0 }}>
@@ -239,7 +240,10 @@ export function UpstreamsPage({ currentUser }: Props) {
                       </div>
                       <div style={{ minWidth: 0 }}>
                         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <span style={{ fontWeight: 600, whiteSpace: "nowrap" }}>{up.name}</span>
+                          <span title={up.id} style={{ fontWeight: 600, whiteSpace: "nowrap" }}>{up.name}</span>
+                          {upstreams.some((other) => other.id !== up.id && other.name === up.name) && (
+                            <span className="muted mono" title={up.id}>{up.id.slice(-8)}</span>
+                          )}
                           {up.scope === "private" ? (
                             <span className="chip chip-purple">
                               {up.owner_username && up.owner_username !== currentUser.username
@@ -311,7 +315,7 @@ export function UpstreamsPage({ currentUser }: Props) {
                           onClick={() =>
                             setExpandedModels((prev) => ({
                               ...prev,
-                              [up.name]: !prev[up.name],
+                              [up.id]: !prev[up.id],
                             }))
                           }
                         >
@@ -327,7 +331,9 @@ export function UpstreamsPage({ currentUser }: Props) {
                     {up.cooling_down ? (
                       <span className="chip chip-warn">429 冷却中</span>
                     ) : up.auth_mode === "oauth" ? (
-                      up.oauth?.token_present ? (
+                      up.oauth?.reauthorization_required ? (
+                        <span className="chip chip-warn">需要重新授权</span>
+                      ) : up.oauth?.token_present ? (
                         <span className={up.oauth.project_id_pending ? "chip chip-warn" : "chip chip-ok"}>
                           {up.oauth.project_id_pending ? "已授权，等待 Project ID" : `已授权 ${formatTtl(up.oauth.expires_in_secs)}`}
                         </span>
@@ -342,7 +348,7 @@ export function UpstreamsPage({ currentUser }: Props) {
                     {(() => {
                       const canProbeQuota = up.can_probe_quota;
                       const q = up.quota;
-                      const isRefreshing = Boolean(refreshingQuota[up.name]);
+                      const isRefreshing = Boolean(refreshingQuota[up.id]);
                       const showAllWindows = q?.probe === "antigravity" || q?.probe === "opencode_go";
                       if (!q && !canProbeQuota) {
                         return <span className="muted">—</span>;
@@ -416,7 +422,7 @@ export function UpstreamsPage({ currentUser }: Props) {
                               className="btn btn-ghost btn-sm"
                               style={{ padding: "2px 6px", fontSize: 11, alignSelf: "flex-start" }}
                               disabled={isRefreshing}
-                              onClick={() => void handleRefreshQuota(up.name)}
+                              onClick={() => void handleRefreshQuota(up.id)}
                             >
                               <IconRefresh width={11} height={11} />
                               {isRefreshing ? "探测中..." : "刷新额度"}
@@ -432,7 +438,7 @@ export function UpstreamsPage({ currentUser }: Props) {
                         {up.auth_mode === "oauth" && up.oauth?.can_login_pkce && (
                           <button
                             className={up.oauth.token_present ? "btn btn-ghost btn-sm" : "btn btn-sm"}
-                            onClick={() => setOauthTarget(up.name)}
+                            onClick={() => setOauthTarget({ id: up.id, name: up.name })}
                           >
                             {up.oauth.token_present ? "重授" : "登录"}
                           </button>
@@ -440,7 +446,7 @@ export function UpstreamsPage({ currentUser }: Props) {
                         {up.auth_mode === "oauth" && up.oauth?.can_refresh && (
                           <button
                             className="btn btn-ghost btn-sm"
-                            onClick={() => void handleRefreshOAuth(up.name)}
+                            onClick={() => void handleRefreshOAuth(up.id)}
                           >
                             刷新
                           </button>
@@ -456,7 +462,7 @@ export function UpstreamsPage({ currentUser }: Props) {
                         </button>
                         <button
                           className="btn btn-danger btn-sm"
-                          onClick={() => void handleDelete(up.name)}
+                          onClick={() => void handleDelete(up.id, up.name)}
                         >
                           删除
                         </button>
@@ -526,7 +532,8 @@ export function UpstreamsPage({ currentUser }: Props) {
 
       {oauthTarget && (
         <OAuthLoginModal
-          upstreamName={oauthTarget}
+          upstreamId={oauthTarget.id}
+          upstreamName={oauthTarget.name}
           onClose={() => setOauthTarget(null)}
           onSuccess={() => void load()}
         />

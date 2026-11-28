@@ -1,3 +1,4 @@
+mod anthropic_stream;
 pub mod openai_anthropic;
 pub mod openai_antigravity;
 pub mod openai_gemini;
@@ -28,13 +29,17 @@ pub fn detect_ingress_protocol(path: &str) -> Option<ProtocolFamily> {
         Some(ProtocolFamily::OpenAi)
     } else if path.ends_with("/responses") {
         Some(ProtocolFamily::OpenAiResponses)
-    } else if path.ends_with("/messages") {
+    } else if path.ends_with("/messages") || is_anthropic_count_tokens(path) {
         Some(ProtocolFamily::Anthropic)
     } else if path.contains(":generateContent") || path.contains(":streamGenerateContent") {
         Some(ProtocolFamily::Gemini)
     } else {
         None
     }
+}
+
+pub fn is_anthropic_count_tokens(path: &str) -> bool {
+    path.ends_with("/messages/count_tokens")
 }
 
 /// Returns true if a cross-protocol translation pair is supported by `ttt-protocol`.

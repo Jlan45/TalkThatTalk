@@ -58,7 +58,7 @@ impl AccessPolicy {
         if let Some(node_owner) = node.owner_user_id {
             return self.owner_user_id == Some(node_owner);
         }
-        self.allows_upstream(&node.name)
+        self.allows_upstream(&node.id)
     }
 }
 
@@ -100,13 +100,24 @@ impl ParsedEndpoint {
 
     /// Join this endpoint's resolved URL (`base_url + endpoint`) with `incoming_path_and_query`.
     pub fn build_target_uri(&self, incoming_path_and_query: &str) -> Result<Uri, GatewayError> {
+        let path = incoming_path_and_query
+            .split('?')
+            .next()
+            .unwrap_or_default();
         let antigravity_prefix = [
             "/v1internal:generateContent",
             "/v1internal:streamGenerateContent",
         ]
         .into_iter()
         .find_map(|action| self.base_path_prefix.strip_suffix(action));
-        let joined = if let Some(prefix) = antigravity_prefix
+        let joined = if self.base_path_prefix.ends_with("/messages")
+            && ttt_protocol::is_anthropic_count_tokens(path)
+        {
+            let suffix = incoming_path_and_query
+                .strip_prefix(path)
+                .unwrap_or_default();
+            format!("{}/count_tokens{suffix}", self.base_path_prefix)
+        } else if let Some(prefix) = antigravity_prefix
             && matches!(
                 incoming_path_and_query.split('?').next(),
                 Some("/v1internal:generateContent" | "/v1internal:streamGenerateContent")
@@ -158,10 +169,10 @@ impl ParsedEndpoint {
 
 pub struct UpstreamNode {
     pub name: String,
-    pub name_hash: u64,
+    pub id: String,
+    pub id_hash: u64,
     pub weight: u32,
     pub default_protocol: ProtocolFamily,
-    pub is_claude_code_oauth: bool,
     pub is_codex_oauth: bool,
     pub effective_cache_mode: PromptCacheMode,
     pub session_header_out: Option<HeaderName>,
@@ -169,7 +180,8 @@ pub struct UpstreamNode {
     pub owner_user_id: Option<i64>,
     pub proxy: Option<String>,
     pub endpoints: HashMap<ProtocolFamily, ParsedEndpoint>,
-    pub auth: AuthProvider,
+    pub auth: Arc<AuthProvider>,
+    auth_config: UpstreamAuthConfig,
     pub extra_headers: Vec<(HeaderName, HeaderValue)>,
     pub protocol_headers: HashMap<ProtocolFamily, Vec<(HeaderName, HeaderValue)>>,
     pub model_mapping: HashMap<String, String>,
@@ -185,6 +197,14 @@ impl UpstreamNode {
         cfg: &UpstreamConfig,
         token_store: Option<Arc<dyn TokenStore>>,
     ) -> Result<Self, GatewayError> {
+        Self::from_config_with_auth(cfg, token_store, None)
+    }
+
+    fn from_config_with_auth(
+        cfg: &UpstreamConfig,
+        token_store: Option<Arc<dyn TokenStore>>,
+        existing_auth: Option<Arc<AuthProvider>>,
+    ) -> Result<Self, GatewayError> {
         let raw_endpoints = cfg.effective_endpoints();
         if raw_endpoints.is_empty() {
             return Err(GatewayError::Config(format!(
@@ -199,7 +219,10 @@ impl UpstreamNode {
         }
         let default_protocol = cfg.primary_protocol();
 
-        let auth = AuthProvider::from_config(&cfg.name, &cfg.auth, token_store)?;
+        let auth = match existing_auth {
+            Some(auth) => auth,
+            None => Arc::new(AuthProvider::from_config(cfg, token_store)?),
+        };
 
         let mut extra_headers = Vec::with_capacity(cfg.extra_headers.len());
         for (k, v) in &cfg.extra_headers {
@@ -242,13 +265,6 @@ impl UpstreamNode {
             }
         }
 
-        let is_claude_code_oauth = matches!(
-            cfg.auth,
-            UpstreamAuthConfig::OAuth {
-                preset: Some(OAuthPreset::ClaudeCode),
-                ..
-            }
-        );
         let is_codex_oauth = matches!(
             cfg.auth,
             UpstreamAuthConfig::OAuth {
@@ -275,10 +291,10 @@ impl UpstreamNode {
 
         Ok(Self {
             name: cfg.name.clone(),
-            name_hash: hash_str_64(&cfg.name),
+            id: cfg.channel_id().to_owned(),
+            id_hash: hash_str_64(cfg.channel_id()),
             weight: cfg.weight.max(1),
             default_protocol,
-            is_claude_code_oauth,
             is_codex_oauth,
             effective_cache_mode,
             session_header_out,
@@ -292,6 +308,7 @@ impl UpstreamNode {
                 .map(ToOwned::to_owned),
             endpoints,
             auth,
+            auth_config: cfg.auth.clone(),
             extra_headers,
             protocol_headers,
             model_mapping: cfg.model_mapping.clone(),
@@ -542,7 +559,7 @@ impl ModelPool {
     }
 
     fn push(&mut self, node: Arc<UpstreamNode>) {
-        if !self.nodes.iter().any(|n| n.name == node.name) {
+        if !self.nodes.iter().any(|n| n.id == node.id) {
             self.nodes.push(node);
         }
     }
@@ -568,6 +585,7 @@ impl RoutingTable {
         configs: &[UpstreamConfig],
         token_store: Option<Arc<dyn TokenStore>>,
         exhausted_upstreams: &HashSet<String>,
+        previous: Option<&RoutingTable>,
     ) -> Result<Self, GatewayError> {
         let mut exact: HashMap<String, ModelPool> = HashMap::new();
         let mut wildcard = ModelPool::new();
@@ -575,10 +593,30 @@ impl RoutingTable {
         let mut has_model_mapping = false;
         let mut has_mixed_protocols = false;
         let mut has_outbound_session_mapping = false;
+        let mut upstream_ids = HashSet::new();
 
         for cfg in configs {
-            let node = Arc::new(UpstreamNode::from_config(cfg, token_store.clone())?);
-            if exhausted_upstreams.contains(&node.name) {
+            if !upstream_ids.insert(cfg.channel_id()) {
+                return Err(GatewayError::Config(format!(
+                    "duplicate upstream ID '{}'",
+                    cfg.channel_id()
+                )));
+            }
+            let auth = previous
+                .and_then(|table| {
+                    table.all_nodes.iter().find(|node| {
+                        node.id == cfg.channel_id()
+                            && node.owner_user_id == cfg.owner_user_id
+                            && node.auth_config == cfg.auth
+                    })
+                })
+                .map(|node| Arc::clone(&node.auth));
+            let node = Arc::new(UpstreamNode::from_config_with_auth(
+                cfg,
+                token_store.clone(),
+                auth,
+            )?);
+            if exhausted_upstreams.contains(&node.id) {
                 node.set_quota_exhausted(true);
             }
             if node.default_protocol != ProtocolFamily::OpenAi || node.endpoints.len() > 1 {
@@ -661,7 +699,7 @@ impl Router {
         routing_config: RoutingConfig,
     ) -> Result<Self, GatewayError> {
         let exhausted = HashSet::new();
-        let table = RoutingTable::build(configs, token_store.clone(), &exhausted)?;
+        let table = RoutingTable::build(configs, token_store.clone(), &exhausted, None)?;
         Ok(Self {
             table: ArcSwap::from_pointee(table),
             token_store,
@@ -673,12 +711,31 @@ impl Router {
     }
 
     pub fn reload(&self, configs: &[UpstreamConfig]) -> Result<(), GatewayError> {
+        self.replace_table(configs, None, || Ok(()))
+    }
+
+    pub fn reload_with(
+        &self,
+        configs: &[UpstreamConfig],
+        persist: impl FnOnce() -> Result<(), GatewayError>,
+    ) -> Result<(), GatewayError> {
+        let previous = self.table.load_full();
+        self.replace_table(configs, Some(&previous), persist)
+    }
+
+    fn replace_table(
+        &self,
+        configs: &[UpstreamConfig],
+        previous: Option<&RoutingTable>,
+        persist: impl FnOnce() -> Result<(), GatewayError>,
+    ) -> Result<(), GatewayError> {
         let exhausted = self
             .exhausted_upstreams
             .read()
             .map(|g| g.clone())
             .unwrap_or_default();
-        let next = RoutingTable::build(configs, self.token_store.clone(), &exhausted)?;
+        let next = RoutingTable::build(configs, self.token_store.clone(), &exhausted, previous)?;
+        persist()?;
         self.table.store(Arc::new(next));
         Ok(())
     }
@@ -748,7 +805,7 @@ impl Router {
                     if n.needs_outbound_session_mapping() {
                         return true;
                     }
-                    seen.push(&n.name);
+                    seen.push(&n.id);
                     count += 1;
                     max_keys = max_keys.max(n.key_count());
                     if count > 1 || max_keys > 1 {
@@ -758,7 +815,7 @@ impl Router {
             }
         }
         for n in &table.wildcard.nodes {
-            if !seen.contains(&n.name.as_str()) && node_allowed_by_policy(n, policy) {
+            if !seen.contains(&n.id.as_str()) && node_allowed_by_policy(n, policy) {
                 if n.needs_outbound_session_mapping() {
                     return true;
                 }
@@ -782,7 +839,7 @@ impl Router {
         }
         let table = self.table.load();
         for node in &table.all_nodes {
-            if node.name == upstream_name {
+            if node.id == upstream_name {
                 node.set_quota_exhausted(exhausted);
             }
         }
@@ -819,7 +876,7 @@ impl Router {
 
         let mut exact_names: HashSet<&str> = HashSet::with_capacity(exact_raw.len());
         for n in exact_raw {
-            exact_names.insert(n.name.as_str());
+            exact_names.insert(n.id.as_str());
         }
 
         let had_any = !exact_raw.is_empty() || !wildcard_raw.is_empty();
@@ -841,7 +898,7 @@ impl Router {
 
         let mut wildcard_allowed: Vec<Arc<UpstreamNode>> = Vec::with_capacity(wildcard_raw.len());
         for n in wildcard_raw {
-            if !exact_names.contains(n.name.as_str()) && node_allowed_by_policy(n, policy) {
+            if !exact_names.contains(n.id.as_str()) && node_allowed_by_policy(n, policy) {
                 wildcard_allowed.push(Arc::clone(n));
             }
         }
@@ -926,13 +983,13 @@ impl Router {
             candidates.append(bucket);
         }
 
-        let primary_hrw_node = affinity_hash.and_then(|_| candidates.first().map(|n| n.name.clone()));
+        let primary_hrw_node = affinity_hash.and_then(|_| candidates.first().map(|n| n.id.clone()));
         let mut sticky_hit = false;
 
         if let Some(h) = affinity_hash
             && let Some(sticky_name) = self.sticky_cache.get(h, now)
         {
-            if let Some(idx) = candidates.iter().position(|n| n.name == sticky_name) {
+            if let Some(idx) = candidates.iter().position(|n| n.id == sticky_name) {
                 if !candidates[idx].is_degraded(now, quota_aware) {
                     if idx > 0 {
                         let node = candidates.remove(idx);
@@ -976,10 +1033,21 @@ impl Router {
             !node.is_degraded(now, self.routing_config.quota_aware)
                 && native_protocol.is_none_or(|protocol| node.supports_protocol(protocol))
         };
-        let find = |name: &str| {
+        let find = |selector: &str| {
+            let table = self.table.load();
+            let id = if table.all_nodes.iter().any(|node| node.id == selector) {
+                selector
+            } else {
+                let mut matches = table.all_nodes.iter().filter(|node| node.name == selector);
+                let unique = matches.next()?;
+                if matches.next().is_some() {
+                    return None;
+                }
+                &unique.id
+            };
             plan.candidates
                 .iter()
-                .position(|node| node.name == name && eligible(node))
+                .position(|node| node.id == id && eligible(node))
         };
         let index = find(preferred).or_else(|| {
             if !preferred.as_bytes().contains(&b'%') {
@@ -1010,9 +1078,9 @@ fn node_allowed_by_policy(node: &UpstreamNode, policy: Option<&AccessPolicy>) ->
 /// `score_i = -ln(u_i) / weight_i`, sorted ascending.
 fn sort_weighted_hrw(bucket: &mut [Arc<UpstreamNode>], affinity_hash: u64) {
     bucket.sort_by(|a, b| {
-        let sa = hrw_score(affinity_hash, a.name_hash, a.weight);
-        let sb = hrw_score(affinity_hash, b.name_hash, b.weight);
-        sa.total_cmp(&sb).then_with(|| a.name.cmp(&b.name))
+        let sa = hrw_score(affinity_hash, a.id_hash, a.weight);
+        let sb = hrw_score(affinity_hash, b.id_hash, b.weight);
+        sa.total_cmp(&sb).then_with(|| a.id.cmp(&b.id))
     });
 }
 
@@ -1155,6 +1223,7 @@ mod tests {
             map.insert(p, u.to_string());
         }
         UpstreamConfig {
+            id: String::new(),
             name: name.into(),
             base_url: first_url,
             protocol: first_proto,
@@ -1397,6 +1466,37 @@ mod tests {
         let mut plan = router.plan_route(Some("ark-code-latest"), chat, None, None);
         assert!(!router.prefer_upstream(&mut plan, "translated", None));
         assert_eq!(plan.candidates[0].name, "native");
+    }
+
+    #[test]
+    fn same_named_channels_have_distinct_routing_ids() {
+        let endpoint = vec![(ProtocolFamily::Anthropic, "https://api.anthropic.com")];
+        let mut first = make_node("shared label", endpoint.clone());
+        first.id = "up_first".into();
+        let mut second = make_node("shared label", endpoint);
+        second.id = "up_second".into();
+        let router = Router::new(&[first.clone(), second.clone()], None).unwrap();
+        let plan = |policy| {
+            router.plan_route(
+                Some("ark-code-latest"),
+                Some(ProtocolFamily::Anthropic),
+                policy,
+                Some(7),
+            )
+        };
+        let mut both = plan(None);
+        assert_eq!(both.candidates.len(), 2);
+        assert!(!router.prefer_upstream(&mut both, "shared label", None));
+        assert!(router.prefer_upstream(&mut both, &second.id, None));
+        assert_eq!(both.candidates[0].id, second.id);
+
+        let policy = AccessPolicy::new(None, Some(vec![second.id.clone()]), None);
+        let mut permitted = plan(Some(&policy));
+        assert_eq!(permitted.candidates.len(), 1);
+        assert!(!router.prefer_upstream(&mut permitted, &first.id, None));
+        first.name = "renamed".into();
+        router.reload(&[first, second.clone()]).unwrap();
+        assert_eq!(plan(Some(&policy)).candidates[0].id, second.id);
     }
 
     #[test]

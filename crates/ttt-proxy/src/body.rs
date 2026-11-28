@@ -1,7 +1,8 @@
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::StatusCode;
@@ -14,6 +15,7 @@ use ttt_core::{RequestId, StreamFailure, TapEvent};
 use ttt_protocol::{NativeSse, SseTranslator, TranslatedStreamBody};
 
 pub(crate) type UploadTiming = Arc<OnceLock<Instant>>;
+const ANTHROPIC_PING_INTERVAL: Duration = Duration::from_secs(20);
 
 pub(crate) fn upstream_ttft_ms(upload: Option<&UploadTiming>) -> Option<u64> {
     let upload = upload?;
@@ -330,7 +332,11 @@ pin_project! {
         Full { #[pin] inner: Full<Bytes> },
         Incoming { #[pin] inner: Incoming },
         Tap { #[pin] inner: TapBody<Incoming> },
-        Translated { #[pin] inner: TranslatedStreamBody<TapBody<Incoming>> },
+        Translated {
+            #[pin]
+            inner: TranslatedStreamBody<TapBody<Incoming>>,
+            heartbeat: Option<Pin<Box<tokio::time::Sleep>>>,
+        },
         Segmented { #[pin] inner: SegmentedBody },
     }
 }
@@ -383,6 +389,7 @@ impl ProxyBody {
     pub(crate) fn translated(
         incoming: Incoming,
         translator: SseTranslator,
+        send_anthropic_pings: bool,
         req_id: RequestId,
         lifetime: Option<Arc<Instant>>,
         status: StatusCode,
@@ -403,6 +410,8 @@ impl ProxyBody {
         );
         Self::Translated {
             inner: TranslatedStreamBody::new(tapped, translator),
+            heartbeat: send_anthropic_pings
+                .then(|| Box::pin(tokio::time::sleep(ANTHROPIC_PING_INTERVAL))),
         }
     }
 
@@ -424,7 +433,24 @@ impl Body for ProxyBody {
             ProxyBodyProj::Full { inner } => inner.poll_frame(cx).map_err(|never| match never {}),
             ProxyBodyProj::Incoming { inner } => inner.poll_frame(cx),
             ProxyBodyProj::Tap { inner } => inner.poll_frame(cx),
-            ProxyBodyProj::Translated { inner } => inner.poll_frame(cx),
+            ProxyBodyProj::Translated { inner, heartbeat } => {
+                let result = inner.poll_frame(cx);
+                if let Some(timer) = heartbeat {
+                    if result.is_ready() {
+                        timer
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + ANTHROPIC_PING_INTERVAL);
+                    } else if timer.as_mut().poll(cx).is_ready() {
+                        timer
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + ANTHROPIC_PING_INTERVAL);
+                        return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(
+                            b"event: ping\ndata: {\"type\":\"ping\"}\n\n",
+                        )))));
+                    }
+                }
+                result
+            }
             ProxyBodyProj::Segmented { inner } => inner.poll_frame(cx),
         }
     }
@@ -435,7 +461,7 @@ impl Body for ProxyBody {
             Self::Full { inner } => inner.is_end_stream(),
             Self::Incoming { inner } => inner.is_end_stream(),
             Self::Tap { inner } => inner.is_end_stream(),
-            Self::Translated { inner } => inner.is_end_stream(),
+            Self::Translated { inner, .. } => inner.is_end_stream(),
             Self::Segmented { inner } => inner.is_end_stream(),
         }
     }
@@ -446,7 +472,7 @@ impl Body for ProxyBody {
             Self::Full { inner } => inner.size_hint(),
             Self::Incoming { inner } => inner.size_hint(),
             Self::Tap { inner } => inner.size_hint(),
-            Self::Translated { inner } => inner.size_hint(),
+            Self::Translated { inner, .. } => inner.size_hint(),
             Self::Segmented { inner } => inner.size_hint(),
         }
     }

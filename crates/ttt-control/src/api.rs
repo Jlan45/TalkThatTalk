@@ -32,7 +32,8 @@ use crate::proxy_subscription::fetch_subscription;
 use crate::quota::{QuotaMonitor, fetch_antigravity_models, resolve_probe_kind};
 
 struct PendingPkceSession {
-    upstream: Option<String>,
+    upstream_key: Option<String>,
+    caller_id: Option<i64>,
     verifier: String,
     redirect_uri: String,
     client_id: String,
@@ -42,6 +43,7 @@ struct PendingPkceSession {
 /// Sanitized upstream view returned to the management UI (never leaks secrets).
 #[derive(Debug, Serialize)]
 pub struct UpstreamView {
+    pub id: String,
     pub name: String,
     pub base_url: String,
     pub protocol: ProtocolFamily,
@@ -93,6 +95,7 @@ pub struct OAuthStatusView {
     pub expires_in_secs: Option<i64>,
     pub can_login_pkce: bool,
     pub can_refresh: bool,
+    pub reauthorization_required: bool,
     pub client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_client_id: Option<String>,
@@ -300,6 +303,7 @@ pub struct ControlPlane {
     quota_monitor: Arc<QuotaMonitor>,
     pkce_sessions: Mutex<HashMap<String, PendingPkceSession>>,
     proxy_updates: Mutex<()>,
+    upstream_updates: Mutex<()>,
     oauth_http: OAuthHttpClient,
 }
 
@@ -349,6 +353,7 @@ impl ControlPlane {
             quota_monitor,
             pkce_sessions: Mutex::new(HashMap::new()),
             proxy_updates: Mutex::new(()),
+            upstream_updates: Mutex::new(()),
             oauth_http: OAuthHttpClient::new(),
         }
     }
@@ -538,25 +543,27 @@ impl ControlPlane {
             (Method::GET, p)
                 if p.starts_with("/api/v1/upstreams/") && p.ends_with("/models") =>
             {
-                let name = percent_decode(&p["/api/v1/upstreams/".len()..p.len() - "/models".len()]);
+                let id = percent_decode(&p["/api/v1/upstreams/".len()..p.len() - "/models".len()]);
                 let models_path = extract_query_param(req.uri().query(), "models_path")
                     .unwrap_or_else(default_models_path);
-                self.fetch_models_for_upstream(&caller, &name, &models_path).await
+                self.fetch_models_for_upstream(&caller, &id, &models_path)
+                    .await
             }
             (Method::POST, p)
                 if p.starts_with("/api/v1/upstreams/") && p.ends_with("/quota/refresh") =>
             {
-                let name =
-                    percent_decode(&p["/api/v1/upstreams/".len()..p.len() - "/quota/refresh".len()]);
-                self.refresh_upstream_quota(&caller, &name).await
+                let id = percent_decode(
+                    &p["/api/v1/upstreams/".len()..p.len() - "/quota/refresh".len()],
+                );
+                self.refresh_upstream_quota(&caller, &id).await
             }
             (Method::PUT, p) if p.starts_with("/api/v1/upstreams/") => {
-                let name = percent_decode(&p["/api/v1/upstreams/".len()..]);
-                self.update_upstream(&caller, &name, req).await
+                let id = percent_decode(&p["/api/v1/upstreams/".len()..]);
+                self.update_upstream(&caller, &id, req).await
             }
             (Method::DELETE, p) if p.starts_with("/api/v1/upstreams/") => {
-                let name = percent_decode(&p["/api/v1/upstreams/".len()..]);
-                self.delete_upstream(&caller, &name)
+                let id = percent_decode(&p["/api/v1/upstreams/".len()..]);
+                self.delete_upstream(&caller, &id).await
             }
             (Method::POST, p)
                 if p.starts_with("/api/v1/oauth/preset/") && p.ends_with("/authorize") =>
@@ -564,36 +571,36 @@ impl ControlPlane {
                 if !caller.can_create_private_upstream() {
                     return Ok(json_error(StatusCode::FORBIDDEN, "当前账号未开启自建渠道权限"));
                 }
-                let preset_str =
-                    &p["/api/v1/oauth/preset/".len()..p.len() - "/authorize".len()];
-                self.oauth_preset_authorize(preset_str).await
+                let preset_str = &p["/api/v1/oauth/preset/".len()..p.len() - "/authorize".len()];
+                self.oauth_preset_authorize(preset_str, caller.user_id)
+                    .await
             }
             (Method::POST, p)
                 if p.starts_with("/api/v1/oauth/") && p.ends_with("/authorize") =>
             {
-                let name = percent_decode(&p["/api/v1/oauth/".len()..p.len() - "/authorize".len()]);
-                if !self.caller_can_manage_upstream_name(&caller, &name) {
+                let id = percent_decode(&p["/api/v1/oauth/".len()..p.len() - "/authorize".len()]);
+                if !self.caller_can_manage_upstream(&caller, &id) {
                     return Ok(json_error(StatusCode::FORBIDDEN, "无权操作该渠道"));
                 }
-                self.oauth_authorize(&name).await
+                self.oauth_authorize(&id, caller.user_id).await
             }
             (Method::POST, p)
                 if p.starts_with("/api/v1/oauth/") && p.ends_with("/callback") =>
             {
-                let name = percent_decode(&p["/api/v1/oauth/".len()..p.len() - "/callback".len()]);
-                if !self.caller_can_manage_upstream_name(&caller, &name) {
+                let id = percent_decode(&p["/api/v1/oauth/".len()..p.len() - "/callback".len()]);
+                if !self.caller_can_manage_upstream(&caller, &id) {
                     return Ok(json_error(StatusCode::FORBIDDEN, "无权操作该渠道"));
                 }
-                self.oauth_callback(&name, req).await
+                self.oauth_callback(&id, caller.user_id, req).await
             }
             (Method::POST, p)
                 if p.starts_with("/api/v1/oauth/") && p.ends_with("/refresh") =>
             {
-                let name = percent_decode(&p["/api/v1/oauth/".len()..p.len() - "/refresh".len()]);
-                if !self.caller_can_manage_upstream_name(&caller, &name) {
+                let id = percent_decode(&p["/api/v1/oauth/".len()..p.len() - "/refresh".len()]);
+                if !self.caller_can_manage_upstream(&caller, &id) {
                     return Ok(json_error(StatusCode::FORBIDDEN, "无权操作该渠道"));
                 }
-                self.oauth_refresh(&name).await
+                self.oauth_refresh(&id).await
             }
             _ => json_error(StatusCode::NOT_FOUND, "management endpoint not found"),
         };
@@ -601,14 +608,14 @@ impl ControlPlane {
         Ok(resp)
     }
 
-    fn caller_can_manage_upstream_name(&self, caller: &CallerIdentity, name: &str) -> bool {
+    fn caller_can_manage_upstream(&self, caller: &CallerIdentity, id: &str) -> bool {
         if caller.is_admin() {
             return true;
         }
         self.db
             .list_upstreams()
             .ok()
-            .and_then(|list| list.into_iter().find(|u| u.name == name))
+            .and_then(|list| list.into_iter().find(|u| u.id == id))
             .map(|u| caller.can_manage_upstream(u.owner_user_id))
             .unwrap_or(false)
     }
@@ -640,13 +647,11 @@ impl ControlPlane {
                     if up.owner_user_id != caller.user_id {
                         continue;
                     }
-                } else if caller.restrict_upstreams
-                    && !caller.allowed_upstreams.iter().any(|n| n == &up.name)
-                {
+                } else if caller.restrict_upstreams && !caller.allowed_upstreams.contains(&up.id) {
                     continue;
                 }
             }
-            let live_node = nodes.iter().find(|n| n.name == up.name);
+            let live_node = nodes.iter().find(|n| n.id == up.id);
             let cooling_down = live_node.map(|n| n.is_cooling_down(now_ms)).unwrap_or(false);
             let can_manage = caller.can_manage_upstream(up.owner_user_id);
 
@@ -675,19 +680,26 @@ impl ControlPlane {
                         ..
                     } => {
                         let acct = account_id.clone().unwrap_or_else(|| up.name.clone());
-                        let (token_present, refresh_present, expires_at, can_refresh, has_project) =
-                            if let Some(mgr) = live_node.and_then(|n| n.auth.oauth_manager()) {
-                                let st = mgr.current_state();
-                                (
-                                    !st.access_token.is_empty(),
-                                    st.refresh_token.is_some(),
-                                    st.expires_at,
-                                    mgr.can_refresh(),
-                                    st.antigravity_project_id.is_some(),
-                                )
-                            } else {
-                                (false, false, None, false, false)
-                            };
+                        let (
+                            token_present,
+                            refresh_present,
+                            expires_at,
+                            can_refresh,
+                            has_project,
+                            reauthorization_required,
+                        ) = if let Some(mgr) = live_node.and_then(|n| n.auth.oauth_manager()) {
+                            let st = mgr.current_state();
+                            (
+                                !st.access_token.is_empty(),
+                                st.refresh_token.is_some(),
+                                st.expires_at,
+                                mgr.can_refresh(),
+                                st.antigravity_project_id.is_some(),
+                                st.reauthorization_required,
+                            )
+                        } else {
+                            (false, false, None, false, false, false)
+                        };
                         let expires_in_secs = expires_at.map(|e| (e as i64) - (now_s as i64));
                         let (effective_client_id, has_client_secret) =
                             if can_manage && *preset == Some(OAuthPreset::Antigravity) {
@@ -719,6 +731,7 @@ impl ControlPlane {
                                         && redirect_uri.is_some()
                                         && client_id.is_some()),
                                 can_refresh,
+                                reauthorization_required,
                                 project_id_pending: *preset == Some(OAuthPreset::Antigravity)
                                     && token_present
                                     && !has_project,
@@ -755,6 +768,7 @@ impl ControlPlane {
                 "global"
             };
             views.push(UpstreamView {
+                id: up.id.clone(),
                 name: up.name.clone(),
                 base_url: display_base,
                 protocol: primary_proto,
@@ -779,7 +793,7 @@ impl ControlPlane {
                 proxy: up.proxy.clone(),
                 quota_config: up.quota.clone(),
                 can_probe_quota: resolve_probe_kind(up).is_some(),
-                quota: quota_map.get(&up.name).cloned(),
+                quota: quota_map.get(&up.id).cloned(),
                 session_header_out: up.session_header_out.clone(),
                 strip_other_session_headers: up.strip_other_session_headers,
                 prompt_cache_mode: up.prompt_cache_mode,
@@ -810,6 +824,8 @@ impl ControlPlane {
             Ok(v) => v,
             Err(resp) => return resp,
         };
+        let _guard = self.upstream_updates.lock().await;
+        new_up.id = GatewayDb::new_upstream_id();
         // Non-admin users always create private upstreams owned by themselves.
         if !caller.is_admin() {
             new_up.owner_user_id = caller.user_id;
@@ -822,46 +838,41 @@ impl ControlPlane {
             Ok(v) => v,
             Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
-        if existing.iter().any(|u| u.name == new_up.name) {
-            return json_error(
-                StatusCode::CONFLICT,
-                &format!("upstream '{}' already exists", new_up.name),
-            );
-        }
-
         let mut next = existing;
         next.push(new_up.clone());
-        if let Err(err) = self.engine.router().reload(&next) {
-            return json_error(StatusCode::BAD_REQUEST, &err.to_string());
-        }
-        if let Err(err) = self.db.upsert_upstream(&new_up) {
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
+        if let Err(err) = self
+            .engine
+            .router()
+            .reload_with(&next, || self.db.upsert_upstream(&new_up))
+        {
+            return json_error(err.status_code(), &err.to_string());
         }
 
         json_status(
             StatusCode::CREATED,
-            &json!({ "status": "created", "name": new_up.name }),
+            &json!({ "status": "created", "id": new_up.id, "name": new_up.name }),
         )
     }
 
     async fn update_upstream(
         &self,
         caller: &CallerIdentity,
-        name: &str,
+        id: &str,
         req: Request<Incoming>,
     ) -> Response<ProxyBody> {
         let mut updated: UpstreamConfig = match read_json_body(req).await {
             Ok(v) => v,
             Err(resp) => return resp,
         };
-        updated.name = name.to_string();
+        let _guard = self.upstream_updates.lock().await;
+        updated.id = id.to_owned();
 
         let mut next = match self.db.list_upstreams() {
             Ok(v) => v,
             Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
-        let Some(pos) = next.iter().position(|u| u.name == name) else {
-            return json_error(StatusCode::NOT_FOUND, &format!("upstream '{name}' not found"));
+        let Some(pos) = next.iter().position(|u| u.id == id) else {
+            return json_error(StatusCode::NOT_FOUND, &format!("upstream '{id}' not found"));
         };
         if !caller.can_manage_upstream(next[pos].owner_user_id) {
             return json_error(StatusCode::FORBIDDEN, "无权编辑该渠道");
@@ -872,6 +883,7 @@ impl ControlPlane {
         }
 
         // Preserve existing secrets/OAuth fields when left empty during edit.
+        if updated.owner_user_id == next[pos].owner_user_id {
         match (&mut updated.auth, &next[pos].auth) {
             (
                 UpstreamAuthConfig::ApiKey { keys, .. },
@@ -964,66 +976,79 @@ impl ControlPlane {
             }
             _ => {}
         }
+        }
 
         if let Err(err) = updated.validate() {
             return json_error(StatusCode::BAD_REQUEST, &err.to_string());
         }
 
         next[pos] = updated.clone();
-        if let Err(err) = self.engine.router().reload(&next) {
-            return json_error(StatusCode::BAD_REQUEST, &err.to_string());
-        }
-        if let Err(err) = self.db.upsert_upstream(&updated) {
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
+        if let Err(err) = self
+            .engine
+            .router()
+            .reload_with(&next, || self.db.upsert_upstream(&updated))
+        {
+            return json_error(err.status_code(), &err.to_string());
         }
 
-        json_ok(&json!({ "status": "updated", "name": name }))
+        json_ok(&json!({ "status": "updated", "id": id, "name": updated.name }))
     }
 
-    fn delete_upstream(&self, caller: &CallerIdentity, name: &str) -> Response<ProxyBody> {
+    async fn delete_upstream(&self, caller: &CallerIdentity, id: &str) -> Response<ProxyBody> {
+        let _guard = self.upstream_updates.lock().await;
         let mut next = match self.db.list_upstreams() {
             Ok(v) => v,
             Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
-        let Some(pos) = next.iter().position(|u| u.name == name) else {
-            return json_error(StatusCode::NOT_FOUND, &format!("upstream '{name}' not found"));
+        let Some(pos) = next.iter().position(|u| u.id == id) else {
+            return json_error(StatusCode::NOT_FOUND, &format!("upstream '{id}' not found"));
         };
         if !caller.can_manage_upstream(next[pos].owner_user_id) {
             return json_error(StatusCode::FORBIDDEN, "无权删除该渠道");
         }
 
-        next.remove(pos);
-        if let Err(err) = self.engine.router().reload(&next) {
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
+        let removed = next.remove(pos);
+        if let Err(err) = self
+            .engine
+            .router()
+            .reload_with(&next, || self.db.delete_upstream(id).map(|_| ()))
+        {
+            return json_error(err.status_code(), &err.to_string());
         }
-        if let Err(err) = self.db.delete_upstream(name) {
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
-        }
-        self.quota_monitor.remove_upstream(name);
+        self.quota_monitor.remove_upstream(id);
 
-        json_ok(&json!({ "status": "deleted", "name": name }))
+        json_ok(&json!({ "status": "deleted", "id": id, "name": removed.name }))
     }
 
     async fn refresh_upstream_quota(
         &self,
         caller: &CallerIdentity,
-        name: &str,
+        id: &str,
     ) -> Response<ProxyBody> {
         let upstreams = match self.db.list_upstreams() {
             Ok(v) => v,
             Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
-        let Some(up) = upstreams.into_iter().find(|u| u.name == name) else {
-            return json_error(StatusCode::NOT_FOUND, &format!("upstream '{name}' not found"));
+        let Some(up) = upstreams.into_iter().find(|u| u.id == id) else {
+            return json_error(StatusCode::NOT_FOUND, &format!("upstream '{id}' not found"));
         };
-        if !caller.is_admin() && up.owner_user_id != caller.user_id && up.owner_user_id.is_some() {
+        if !caller.is_admin()
+            && (up.owner_user_id.is_some() && up.owner_user_id != caller.user_id
+                || up.owner_user_id.is_none()
+                    && caller.restrict_upstreams
+                    && !caller.allowed_upstreams.contains(&up.id))
+        {
             return json_error(StatusCode::FORBIDDEN, "无权访问该渠道额度");
         }
         let snap = self.quota_monitor.refresh_upstream(&up).await;
         json_ok(&json!({ "quota": snap }))
     }
 
-    async fn oauth_preset_authorize(&self, preset_str: &str) -> Response<ProxyBody> {
+    async fn oauth_preset_authorize(
+        &self,
+        preset_str: &str,
+        caller_id: Option<i64>,
+    ) -> Response<ProxyBody> {
         let preset = match preset_str {
             "codex" => OAuthPreset::Codex,
             "claude_code" => OAuthPreset::ClaudeCode,
@@ -1069,7 +1094,8 @@ impl ControlPlane {
         sessions.insert(
             state.clone(),
             PendingPkceSession {
-                upstream: None,
+                upstream_key: None,
+                caller_id,
                 verifier: pkce.verifier,
                 redirect_uri: defaults.redirect_uri.to_string(),
                 client_id: client_id.to_string(),
@@ -1083,15 +1109,19 @@ impl ControlPlane {
         }))
     }
 
-    async fn oauth_authorize(&self, upstream_name: &str) -> Response<ProxyBody> {
+    async fn oauth_authorize(
+        &self,
+        upstream_id: &str,
+        caller_id: Option<i64>,
+    ) -> Response<ProxyBody> {
         let upstreams = match self.db.list_upstreams() {
             Ok(v) => v,
             Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
-        let Some(up) = upstreams.iter().find(|u| u.name == upstream_name) else {
+        let Some(up) = upstreams.iter().find(|u| u.id == upstream_id) else {
             return json_error(
                 StatusCode::NOT_FOUND,
-                &format!("upstream '{upstream_name}' not found"),
+                &format!("upstream '{upstream_id}' not found"),
             );
         };
 
@@ -1155,7 +1185,8 @@ impl ControlPlane {
         sessions.insert(
             state.clone(),
             PendingPkceSession {
-                upstream: Some(upstream_name.to_string()),
+                upstream_key: Some(up.oauth_storage_key()),
+                caller_id,
                 verifier: pkce.verifier,
                 redirect_uri: redir.to_string(),
                 client_id: cid.to_string(),
@@ -1171,7 +1202,8 @@ impl ControlPlane {
 
     async fn oauth_callback(
         &self,
-        upstream_name: &str,
+        upstream_id: &str,
+        caller_id: Option<i64>,
         req: Request<Incoming>,
     ) -> Response<ProxyBody> {
         let payload: OAuthCallbackPayload = match read_json_body(req).await {
@@ -1181,7 +1213,14 @@ impl ControlPlane {
 
         let session = {
             let mut sessions = self.pkce_sessions.lock().await;
-            sessions.remove(&payload.state)
+            if sessions.get(&payload.state).is_some_and(|pending| {
+                pending.caller_id == caller_id
+                    && now_epoch_secs().saturating_sub(pending.created_at_secs) < 600
+            }) {
+                sessions.remove(&payload.state)
+            } else {
+                None
+            }
         };
         let Some(session) = session else {
             return json_error(
@@ -1189,15 +1228,6 @@ impl ControlPlane {
                 "unknown or expired OAuth state session",
             );
         };
-        if let Some(bound_upstream) = &session.upstream
-            && bound_upstream != upstream_name
-        {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "OAuth state belongs to another upstream",
-            );
-        }
-
         let code = match parse_authorization_input(&payload.input, &payload.state) {
             Ok(c) => c,
             Err(err) => return json_error(StatusCode::BAD_REQUEST, &err.to_string()),
@@ -1207,14 +1237,13 @@ impl ControlPlane {
             Ok(v) => v,
             Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
-        let Some(up) = upstreams.iter().find(|u| u.name == upstream_name) else {
+        let Some(up) = upstreams.iter().find(|u| u.id == upstream_id) else {
             return json_error(StatusCode::NOT_FOUND, "upstream not found");
         };
         let UpstreamAuthConfig::OAuth {
             preset,
             token_url,
             token_request_format,
-            account_id,
             ..
         } = &up.auth
         else {
@@ -1241,9 +1270,17 @@ impl ControlPlane {
                 Err(err) => return json_error(StatusCode::BAD_REQUEST, &err.to_string()),
             };
         let format = UpstreamAuthConfig::effective_token_format(*preset, *token_request_format);
-        let acct_id = account_id
-            .clone()
-            .unwrap_or_else(|| upstream_name.to_string());
+        let acct_id = up.oauth_storage_key();
+        if session
+            .upstream_key
+            .as_ref()
+            .is_some_and(|key| key != &acct_id)
+        {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "OAuth state belongs to another upstream",
+            );
+        }
 
         let state_param = match preset {
             Some(OAuthPreset::ClaudeCode) => Some(payload.state.as_str()),
@@ -1274,12 +1311,27 @@ impl ControlPlane {
         };
         let expires_at = stored.expires_at;
 
+        let _guard = self.upstream_updates.lock().await;
+        let current = self
+            .db
+            .list_upstreams()
+            .ok()
+            .and_then(|list| list.into_iter().find(|up| up.id == upstream_id));
+        if current.as_ref().is_none_or(|current| {
+            current.oauth_storage_key() != acct_id
+                || current.auth.oauth_credentials().0.as_deref() != Some(&cid)
+        }) {
+            return json_error(
+                StatusCode::CONFLICT,
+                "OAuth channel changed during authorization; try again",
+            );
+        }
         let node = self
             .engine
             .router()
             .all_nodes()
             .into_iter()
-            .find(|n| n.name == upstream_name);
+            .find(|n| n.id == upstream_id);
         let result = if let Some(mgr) = node.as_ref().and_then(|n| n.auth.oauth_manager())
             && mgr.client_meta().account_id == acct_id
         {
@@ -1293,23 +1345,23 @@ impl ControlPlane {
 
         json_ok(&json!({
             "status": "authenticated",
-            "upstream": upstream_name,
+            "upstream_id": upstream_id,
             "account_id": acct_id,
             "expires_at": expires_at,
         }))
     }
 
-    async fn oauth_refresh(&self, upstream_name: &str) -> Response<ProxyBody> {
+    async fn oauth_refresh(&self, upstream_id: &str) -> Response<ProxyBody> {
         let Some(node) = self
             .engine
             .router()
             .all_nodes()
             .into_iter()
-            .find(|n| n.name == upstream_name)
+            .find(|n| n.id == upstream_id)
         else {
             return json_error(
                 StatusCode::NOT_FOUND,
-                &format!("upstream '{upstream_name}' not found"),
+                &format!("upstream '{upstream_id}' not found"),
             );
         };
 
@@ -1323,7 +1375,7 @@ impl ControlPlane {
                 let st = mgr.current_state();
                 json_ok(&json!({
                     "status": "refreshed",
-                    "upstream": upstream_name,
+                    "upstream_id": upstream_id,
                     "expires_at": st.expires_at,
                 }))
             }
@@ -1361,17 +1413,17 @@ impl ControlPlane {
     async fn fetch_models_for_upstream(
         &self,
         caller: &CallerIdentity,
-        upstream_name: &str,
+        upstream_id: &str,
         models_path: &str,
     ) -> Response<ProxyBody> {
         let upstreams = match self.db.list_upstreams() {
             Ok(v) => v,
             Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
         };
-        let Some(up) = upstreams.iter().find(|u| u.name == upstream_name) else {
+        let Some(up) = upstreams.iter().find(|u| u.id == upstream_id) else {
             return json_error(
                 StatusCode::NOT_FOUND,
-                &format!("upstream '{upstream_name}' not found"),
+                &format!("upstream '{upstream_id}' not found"),
             );
         };
         if !caller.can_manage_upstream(up.owner_user_id) {
@@ -1412,7 +1464,7 @@ impl ControlPlane {
             .router()
             .all_nodes()
             .into_iter()
-            .find(|n| n.name == upstream_name)
+            .find(|n| n.id == upstream_id)
         {
             let (_, cred) = node.auth.acquire();
             if let Ok(val) = cred.header_value.to_str()

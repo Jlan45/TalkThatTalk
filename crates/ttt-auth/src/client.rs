@@ -404,9 +404,16 @@ impl OAuthHttpClient {
     ) -> Result<T, GatewayError> {
         let (status, body) = self.post_raw(url, format, params).await?;
         if !status.is_success() {
+            if params
+                .iter()
+                .any(|(key, value)| *key == "grant_type" && value == "refresh_token")
+                && serde_json::from_slice::<OAuthErrorBody>(&body)
+                    .is_ok_and(|error| error.error.as_deref() == Some("invalid_grant"))
+            {
+                return Err(GatewayError::OAuthReauthorizationRequired);
+            }
             return Err(GatewayError::Auth(format!(
-                "oauth endpoint {url} returned HTTP {status}: {}",
-                String::from_utf8_lossy(&body)
+                "oauth endpoint returned HTTP {status}"
             )));
         }
         serde_json::from_slice(&body)
@@ -450,21 +457,24 @@ impl OAuthHttpClient {
             .body(Full::new(payload))
             .map_err(|e| GatewayError::Auth(format!("failed to build oauth request: {e}")))?;
 
-        let resp = self
-            .client
-            .request(req)
-            .await
-            .map_err(|e| GatewayError::Auth(format!("oauth HTTP request failed: {e}")))?;
-
-        let status = resp.status();
-        let body = resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| GatewayError::Auth(format!("failed to read oauth response body: {e}")))?
-            .to_bytes();
-
-        Ok((status, body))
+        tokio::time::timeout(Duration::from_secs(12), async {
+            let resp = self
+                .client
+                .request(req)
+                .await
+                .map_err(|e| GatewayError::Auth(format!("oauth HTTP request failed: {e}")))?;
+            let status = resp.status();
+            let body = Limited::new(resp.into_body(), 1024 * 1024)
+                .collect()
+                .await
+                .map_err(|e| {
+                    GatewayError::Auth(format!("failed to read oauth response body: {e}"))
+                })?
+                .to_bytes();
+            Ok((status, body))
+        })
+        .await
+        .map_err(|_| GatewayError::UpstreamTimeout)?
     }
 }
 

@@ -203,19 +203,19 @@ export const gatewayApi = {
     }>("/upstreams"),
 
   createUpstream: (payload: Record<string, unknown>) =>
-    request<{ status: string; name: string }>("/upstreams", {
+    request<{ status: string; id: string; name: string }>("/upstreams", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
 
   updateUpstream: (name: string, payload: Record<string, unknown>) =>
-    request<{ status: string; name: string }>(`/upstreams/${encodeURIComponent(name)}`, {
+    request<{ status: string; id: string; name: string }>(`/upstreams/${encodeURIComponent(name)}`, {
       method: "PUT",
       body: JSON.stringify(payload),
     }),
 
   deleteUpstream: (name: string) =>
-    request<{ status: string; name: string }>(`/upstreams/${encodeURIComponent(name)}`, {
+    request<{ status: string; id: string; name: string }>(`/upstreams/${encodeURIComponent(name)}`, {
       method: "DELETE",
     }),
 

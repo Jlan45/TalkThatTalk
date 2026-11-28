@@ -144,7 +144,7 @@ impl QuotaMonitor {
         let lock = {
             let mut map = self.refresh_locks.lock().await;
             Arc::clone(
-                map.entry(cfg.name.clone())
+                map.entry(cfg.id.clone())
                     .or_insert_with(|| Arc::new(Mutex::new(()))),
             )
         };
@@ -153,11 +153,11 @@ impl QuotaMonitor {
         let snap = probe_upstream(&self.engine, cfg).await;
         self.engine
             .router()
-            .set_quota_exhausted(&cfg.name, snap.status == QuotaStatus::Exhausted);
+            .set_quota_exhausted(&cfg.id, snap.status == QuotaStatus::Exhausted);
         if let Ok(mut g) = self.snapshots.write() {
-            g.insert(cfg.name.clone(), snap.clone());
+            g.insert(cfg.id.clone(), snap.clone());
         }
-        if let Err(err) = self.db.upsert_quota_snapshot(&snap) {
+        if let Err(err) = self.db.upsert_quota_snapshot(&cfg.id, &snap) {
             warn!(upstream = %cfg.name, error = %err, "failed to persist quota snapshot");
         }
         snap
@@ -189,7 +189,7 @@ impl QuotaMonitor {
                 continue;
             }
             let interval = effective_poll_interval(&cfg) as i64;
-            let last_fetched = existing.get(&cfg.name).map(|s| s.fetched_at).unwrap_or(0);
+            let last_fetched = existing.get(&cfg.id).map(|s| s.fetched_at).unwrap_or(0);
             if now - last_fetched < interval {
                 continue;
             }
@@ -233,7 +233,7 @@ async fn probe_claude_code(
     cfg: &UpstreamConfig,
     fetched_at: i64,
 ) -> QuotaSnapshot {
-    let token = match get_oauth_access_token(engine, &cfg.name).await {
+    let token = match get_oauth_access_token(engine, &cfg.id).await {
         Ok(t) => t,
         Err(e) => return error_snapshot(&cfg.name, QuotaProbeKind::ClaudeCode, e, fetched_at),
     };
@@ -243,7 +243,10 @@ async fn probe_claude_code(
         .uri(CLAUDE_USAGE_URL)
         .header("authorization", format!("Bearer {token}"))
         .header("anthropic-beta", "oauth-2025-04-20")
-        .header("user-agent", "claude-code/2.1.329")
+        .header(
+            "user-agent",
+            concat!("talkthattalk/", env!("CARGO_PKG_VERSION")),
+        )
         .header("content-type", "application/json")
         .body(Full::new(Bytes::new()))
     {
@@ -277,7 +280,7 @@ async fn probe_codex(
     cfg: &UpstreamConfig,
     fetched_at: i64,
 ) -> QuotaSnapshot {
-    let token = match get_oauth_access_token(engine, &cfg.name).await {
+    let token = match get_oauth_access_token(engine, &cfg.id).await {
         Ok(t) => t,
         Err(e) => return error_snapshot(&cfg.name, QuotaProbeKind::Codex, e, fetched_at),
     };
@@ -327,7 +330,7 @@ impl AntigravityQuotaSession {
             .router()
             .all_nodes()
             .into_iter()
-            .find(|node| node.name == cfg.name)
+            .find(|node| node.id == cfg.id)
             .ok_or_else(|| "upstream not active in router".to_string())?;
         let endpoint = node
             .endpoints
@@ -553,7 +556,7 @@ async fn probe_custom_http(
 
     let api_key = match &cfg.auth {
         UpstreamAuthConfig::ApiKey { keys, .. } => keys.first().cloned().unwrap_or_default(),
-        UpstreamAuthConfig::OAuth { .. } => get_oauth_access_token(engine, &cfg.name)
+        UpstreamAuthConfig::OAuth { .. } => get_oauth_access_token(engine, &cfg.id)
             .await
             .unwrap_or_default(),
     };
@@ -589,19 +592,25 @@ async fn probe_custom_http(
     }
 }
 
-async fn get_oauth_access_token(
-    engine: &ProxyEngine,
-    upstream_name: &str,
-) -> Result<String, String> {
+async fn get_oauth_access_token(engine: &ProxyEngine, upstream_id: &str) -> Result<String, String> {
     let nodes = engine.router().all_nodes();
     let node = nodes
         .iter()
-        .find(|u| u.name == upstream_name)
+        .find(|u| u.id == upstream_id)
         .ok_or_else(|| "upstream not active in router".to_string())?;
     let mgr = node
         .auth
         .oauth_manager()
         .ok_or_else(|| "upstream is not configured with OAuth".to_string())?;
+    let state = mgr.current_state();
+    if state.reauthorization_required {
+        return Err("OAuth 授权已失效，请重新授权".into());
+    }
+    if mgr.needs_proactive_refresh() && mgr.can_refresh() {
+        mgr.refresh_via_http(state.generation)
+            .await
+            .map_err(|err| err.to_string())?;
+    }
     let token = mgr.current_state().access_token.clone();
     if token.is_empty() {
         return Err("OAuth access token is empty (please authorize first)".to_string());

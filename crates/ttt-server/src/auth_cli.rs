@@ -27,12 +27,17 @@ pub async fn run_auth_login(
 ) -> Result<(), GatewayError> {
     let db = GatewayDb::open_from_config(&cfg.oauth_storage)?;
     let upstreams = db.list_upstreams()?;
+    let mut matches = upstreams.iter().filter(|u| u.name == upstream_name);
     let upstream = upstreams
         .iter()
-        .find(|u| u.name == upstream_name)
+        .find(|u| u.id == upstream_name)
+        .or_else(|| {
+            let found = matches.next()?;
+            matches.next().is_none().then_some(found)
+        })
         .ok_or_else(|| {
             GatewayError::Config(format!(
-                "upstream '{upstream_name}' not found in SQLite database"
+                "upstream '{upstream_name}' not found or ambiguous; use the channel ID"
             ))
         })?;
 
@@ -44,7 +49,6 @@ pub async fn run_auth_login(
         scopes,
         redirect_uri,
         token_request_format,
-        account_id,
         ..
     } = &upstream.auth
     else {
@@ -79,7 +83,7 @@ pub async fn run_auth_login(
     } else {
         scopes.clone()
     };
-    let acct_id = account_id.as_deref().unwrap_or(upstream_name);
+    let acct_id = upstream.oauth_storage_key();
     let client = OAuthHttpClient::new();
 
     let token = if use_device_flow {
@@ -178,7 +182,7 @@ pub async fn run_auth_login(
     let expires_at = record.expires_at;
     let project_id_pending = *preset == Some(OAuthPreset::Antigravity)
         && record.antigravity_project_id().is_none();
-    TokenStore::put(&db, acct_id, record)?;
+    TokenStore::put(&db, &acct_id, record)?;
 
     println!(
         "Successfully authenticated '{upstream_name}' (account_id='{acct_id}', refresh_token={}, expires_at={:?}).",
@@ -205,16 +209,15 @@ pub fn run_auth_status(cfg: &GatewayConfig) -> Result<(), GatewayError> {
         if let UpstreamAuthConfig::OAuth {
             preset,
             token_request_format,
-            account_id,
             access_token,
             refresh_token,
             expires_at,
             ..
         } = &up.auth
         {
-            let acct = account_id.as_deref().unwrap_or(&up.name);
+            let acct = up.oauth_storage_key();
             let fmt = UpstreamAuthConfig::effective_token_format(*preset, *token_request_format);
-            let rec = stored.get(acct);
+            let rec = stored.get(&acct);
             let has_token = rec
                 .map(|r| !r.access_token.is_empty())
                 .unwrap_or_else(|| access_token.as_deref().map(|s| !s.is_empty()).unwrap_or(false));
@@ -232,9 +235,9 @@ pub fn run_auth_status(cfg: &GatewayConfig) -> Result<(), GatewayError> {
             });
 
             println!(
-                "- upstream={} account={} preset={:?} format={:?} token={} refresh_token={} status={}",
+                "- upstream={} id={} preset={:?} format={:?} token={} refresh_token={} status={}",
                 up.name,
-                acct,
+                up.id,
                 preset.unwrap_or(OAuthPreset::Custom),
                 fmt,
                 if has_token { "present" } else { "missing" },

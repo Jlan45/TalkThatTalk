@@ -7,7 +7,8 @@ use http_body::{Body, Frame, SizeHint};
 use pin_project_lite::pin_project;
 use serde_json::{Value, json};
 
-use crate::openai_anthropic::{map_anthropic_stop_reason, map_openai_finish_reason};
+use crate::anthropic_stream::AnthropicStream;
+use crate::openai_anthropic::map_anthropic_stop_reason;
 use crate::openai_gemini::{
     google_candidate_delta, google_completion_id, google_finish_reason, google_usage,
 };
@@ -31,14 +32,7 @@ pub enum SseTranslator {
         usage: Option<Value>,
         sent_done: bool,
     },
-    OpenAiToAnthropic {
-        model: String,
-        msg_id: String,
-        started: bool,
-        finished: bool,
-        last_finish_reason: Option<String>,
-        output_tokens: u64,
-    },
+    OpenAiToAnthropic(AnthropicStream),
     ResponsesToOpenAi {
         model: String,
         resp_id: String,
@@ -48,13 +42,7 @@ pub enum SseTranslator {
         tools_by_item: HashMap<String, usize>,
         tools_by_output: HashMap<u64, usize>,
     },
-    ResponsesToAnthropic {
-        model: String,
-        msg_id: String,
-        started: bool,
-        finished: bool,
-        output_tokens: u64,
-    },
+    ResponsesToAnthropic(AnthropicStream),
 }
 
 impl SseTranslator {
@@ -81,14 +69,7 @@ impl SseTranslator {
     }
 
     pub fn openai_to_anthropic(model: String) -> Self {
-        Self::OpenAiToAnthropic {
-            model,
-            msg_id: "msg_ttt".to_string(),
-            started: false,
-            finished: false,
-            last_finish_reason: None,
-            output_tokens: 0,
-        }
+        Self::OpenAiToAnthropic(AnthropicStream::new(model))
     }
 
     pub fn responses_to_openai(model: String) -> Self {
@@ -104,13 +85,7 @@ impl SseTranslator {
     }
 
     pub fn responses_to_anthropic(model: String) -> Self {
-        Self::ResponsesToAnthropic {
-            model,
-            msg_id: "msg_ttt".to_string(),
-            started: false,
-            finished: false,
-            output_tokens: 0,
-        }
+        Self::ResponsesToAnthropic(AnthropicStream::new(model))
     }
 
     /// Translate a complete SSE data payload.
@@ -119,23 +94,26 @@ impl SseTranslator {
     }
 
     fn on_event(&mut self, event: &str, data: &str, out: &mut VecDeque<Bytes>) {
-        if self.is_finished() || event == "ping" || (data.trim().is_empty() && event != "error") {
+        if self.is_finished() {
+            return;
+        }
+        if event == "ping" {
+            if matches!(
+                self,
+                Self::OpenAiToAnthropic(_) | Self::ResponsesToAnthropic(_)
+            ) {
+                out.push_back(sse_event_bytes("ping", &json!({"type": "ping"})));
+            }
+            return;
+        }
+        if data.trim().is_empty() && event != "error" {
             return;
         }
         if data.trim() == "[DONE]" {
             match self {
-                Self::OpenAiToAnthropic {
-                    finished,
-                    last_finish_reason,
-                    output_tokens,
-                    ..
-                } => {
-                    emit_anthropic_finish(
-                        finished,
-                        last_finish_reason.as_deref(),
-                        *output_tokens,
-                        out,
-                    );
+                Self::OpenAiToAnthropic(state) => {
+                    state.finish_reason.get_or_insert("end_turn");
+                    state.finish(out);
                 }
                 Self::ResponsesToOpenAi { sent_done, .. } => {
                     *sent_done = true;
@@ -156,10 +134,8 @@ impl SseTranslator {
         };
         let event_type = v.get("type").and_then(Value::as_str).unwrap_or(event);
         if event == "error"
-            || matches!(
-                event_type,
-                "error" | "response.failed" | "response.incomplete"
-            )
+            || matches!(event_type, "error" | "response.failed")
+            || event_type == "response.incomplete" && !matches!(self, Self::ResponsesToAnthropic(_))
             || v.get("error")
                 .or_else(|| v.pointer("/response/error"))
                 .is_some_and(|error| error.is_object())
@@ -339,75 +315,7 @@ impl SseTranslator {
                 }
             }
 
-            Self::OpenAiToAnthropic {
-                model,
-                msg_id,
-                started,
-                last_finish_reason,
-                output_tokens,
-                ..
-            } => {
-                if let Some(id) = v.get("id").and_then(Value::as_str) {
-                    *msg_id = id.to_string();
-                }
-                if let Some(m) = v.get("model").and_then(Value::as_str)
-                    && !m.is_empty()
-                {
-                    *model = m.to_string();
-                }
-                if let Some(out_tok) = v
-                    .pointer("/usage/completion_tokens")
-                    .and_then(Value::as_u64)
-                {
-                    *output_tokens = out_tok;
-                }
-                if !*started {
-                    *started = true;
-                    let input_tokens = v
-                        .pointer("/usage/prompt_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let start_ev = json!({
-                        "type": "message_start",
-                        "message": {
-                            "id": msg_id,
-                            "type": "message",
-                            "role": "assistant",
-                            "model": model,
-                            "content": [],
-                            "stop_reason": Value::Null,
-                            "usage": { "input_tokens": input_tokens, "output_tokens": 0 },
-                        }
-                    });
-                    out.push_back(sse_event_bytes("message_start", &start_ev));
-                    let block_start = json!({
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": { "type": "text", "text": "" },
-                    });
-                    out.push_back(sse_event_bytes("content_block_start", &block_start));
-                }
-
-                if let Some(text) = v
-                    .pointer("/choices/0/delta/content")
-                    .and_then(Value::as_str)
-                    && !text.is_empty()
-                {
-                    let delta_ev = json!({
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": { "type": "text_delta", "text": text },
-                    });
-                    out.push_back(sse_event_bytes("content_block_delta", &delta_ev));
-                }
-
-                if let Some(fr) = v
-                    .pointer("/choices/0/finish_reason")
-                    .and_then(Value::as_str)
-                {
-                    *last_finish_reason = Some(fr.to_string());
-                }
-            }
+            Self::OpenAiToAnthropic(state) => state.openai_chunk(&v, out),
 
             Self::ResponsesToOpenAi {
                 model,
@@ -617,92 +525,7 @@ impl SseTranslator {
                 }
             }
 
-            Self::ResponsesToAnthropic {
-                model,
-                msg_id,
-                started,
-                finished,
-                output_tokens,
-            } => {
-                match event_type {
-                    "response.created" => {
-                        if let Some(id) = v.pointer("/response/id").and_then(Value::as_str) {
-                            *msg_id = id.to_string();
-                        }
-                        if let Some(m) = v.pointer("/response/model").and_then(Value::as_str)
-                            && !m.is_empty()
-                        {
-                            *model = m.to_string();
-                        }
-                        if !*started {
-                            *started = true;
-                            let start_ev = json!({
-                                "type": "message_start",
-                                "message": {
-                                    "id": msg_id,
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "model": model,
-                                    "content": [],
-                                    "stop_reason": Value::Null,
-                                    "usage": { "input_tokens": 0, "output_tokens": 0 },
-                                }
-                            });
-                            out.push_back(sse_event_bytes("message_start", &start_ev));
-                            let block_start = json!({
-                                "type": "content_block_start",
-                                "index": 0,
-                                "content_block": { "type": "text", "text": "" },
-                            });
-                            out.push_back(sse_event_bytes("content_block_start", &block_start));
-                        }
-                    }
-                    "response.output_text.delta" => {
-                        if !*started {
-                            *started = true;
-                            let start_ev = json!({
-                                "type": "message_start",
-                                "message": {
-                                    "id": msg_id,
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "model": model,
-                                    "content": [],
-                                    "stop_reason": Value::Null,
-                                    "usage": { "input_tokens": 0, "output_tokens": 0 },
-                                }
-                            });
-                            out.push_back(sse_event_bytes("message_start", &start_ev));
-                            let block_start = json!({
-                                "type": "content_block_start",
-                                "index": 0,
-                                "content_block": { "type": "text", "text": "" },
-                            });
-                            out.push_back(sse_event_bytes("content_block_start", &block_start));
-                        }
-                        if let Some(text) = v.get("delta").and_then(Value::as_str)
-                            && !text.is_empty()
-                        {
-                            let delta_ev = json!({
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": { "type": "text_delta", "text": text },
-                            });
-                            out.push_back(sse_event_bytes("content_block_delta", &delta_ev));
-                        }
-                    }
-                    "response.completed" => {
-                        if let Some(out_tok) = v
-                            .pointer("/response/usage/output_tokens")
-                            .and_then(Value::as_u64)
-                        {
-                            *output_tokens = out_tok;
-                        }
-                        emit_anthropic_finish(finished, Some("stop"), *output_tokens, out);
-                    }
-                    _ => {}
-                }
-            }
+            Self::ResponsesToAnthropic(state) => state.responses_event(event_type, &v, out),
         }
     }
 
@@ -711,8 +534,7 @@ impl SseTranslator {
             Self::AnthropicToOpenAi { sent_done, .. }
             | Self::GeminiToOpenAi { sent_done, .. }
             | Self::ResponsesToOpenAi { sent_done, .. } => *sent_done,
-            Self::OpenAiToAnthropic { finished, .. }
-            | Self::ResponsesToAnthropic { finished, .. } => *finished,
+            Self::OpenAiToAnthropic(state) | Self::ResponsesToAnthropic(state) => state.finished,
         }
     }
 
@@ -726,16 +548,8 @@ impl SseTranslator {
                     "error": { "message": message, "type": "upstream_error", "code": "upstream_stream_error" }
                 })));
             }
-            Self::OpenAiToAnthropic { finished, .. }
-            | Self::ResponsesToAnthropic { finished, .. } => {
-                *finished = true;
-                out.push_back(sse_event_bytes(
-                    "error",
-                    &json!({
-                        "type": "error",
-                        "error": { "type": "api_error", "message": message }
-                    }),
-                ));
+            Self::OpenAiToAnthropic(state) | Self::ResponsesToAnthropic(state) => {
+                state.fail(message, out)
             }
         }
     }
@@ -746,14 +560,7 @@ impl SseTranslator {
             return;
         }
         match self {
-            Self::OpenAiToAnthropic {
-                finished,
-                last_finish_reason,
-                output_tokens,
-                ..
-            } if last_finish_reason.is_some() => {
-                emit_anthropic_finish(finished, last_finish_reason.as_deref(), *output_tokens, out);
-            }
+            Self::OpenAiToAnthropic(state) => state.finish(out),
             Self::GeminiToOpenAi {
                 model,
                 response_id: Some(id),
@@ -814,34 +621,6 @@ fn emit_google_finish(
     }
     out.push_back(sse_data_bytes(&chunk));
     out.push_back(Bytes::from_static(b"data: [DONE]\n\n"));
-}
-
-fn emit_anthropic_finish(
-    finished: &mut bool,
-    last_finish_reason: Option<&str>,
-    output_tokens: u64,
-    out: &mut VecDeque<Bytes>,
-) {
-    if *finished {
-        return;
-    }
-    *finished = true;
-    out.push_back(sse_event_bytes(
-        "content_block_stop",
-        &json!({ "type": "content_block_stop", "index": 0 }),
-    ));
-    out.push_back(sse_event_bytes(
-        "message_delta",
-        &json!({
-            "type": "message_delta",
-            "delta": { "stop_reason": map_openai_finish_reason(last_finish_reason) },
-            "usage": { "output_tokens": output_tokens },
-        }),
-    ));
-    out.push_back(sse_event_bytes(
-        "message_stop",
-        &json!({ "type": "message_stop" }),
-    ));
 }
 
 pin_project! {

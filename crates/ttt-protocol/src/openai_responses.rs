@@ -3,6 +3,10 @@ use serde_json::{json, Value};
 use ttt_core::GatewayError;
 
 use crate::TranslatedRequest;
+use crate::openai_anthropic::{
+    anthropic_function_tools, anthropic_image_url, anthropic_tool_choice, anthropic_tool_id,
+    anthropic_tool_output, unsupported_anthropic_block,
+};
 
 /// Translate an OpenAI Chat Completions (`/v1/chat/completions`) request
 /// into an OpenAI Responses API (`/responses`) request (compatible with
@@ -221,77 +225,51 @@ pub fn anthropic_to_responses_request_with_session(
         _ => "You are a helpful assistant.".to_string(),
     };
 
-    let mut input_items: Vec<Value> = Vec::new();
-    if let Some(messages) = req.get("messages").and_then(Value::as_array) {
-        for msg in messages {
-            let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
-            match msg.get("content") {
-                Some(Value::String(s)) => {
-                    let ctype = if role == "assistant" {
-                        "output_text"
-                    } else {
-                        "input_text"
-                    };
-                    input_items.push(json!({
-                        "type": "message",
-                        "role": role,
-                        "content": [{ "type": ctype, "text": s }],
-                    }));
-                }
-                Some(Value::Array(blocks)) => {
-                    let mut text_parts = Vec::new();
-                    for b in blocks {
-                        match b.get("type").and_then(Value::as_str) {
-                            Some("text") => {
-                                if let Some(t) = b.get("text").and_then(Value::as_str) {
-                                    text_parts.push(t.to_string());
-                                }
-                            }
-                            Some("tool_use") => {
-                                let call_id = b.get("id").and_then(Value::as_str).unwrap_or("call_0");
-                                let name = b.get("name").and_then(Value::as_str).unwrap_or("");
-                                let args = b
-                                    .get("input")
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_else(|| "{}".to_string());
-                                input_items.push(json!({
-                                    "type": "function_call",
-                                    "call_id": call_id,
-                                    "name": name,
-                                    "arguments": args,
-                                }));
-                            }
-                            Some("tool_result") => {
-                                let call_id = b
-                                    .get("tool_use_id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("call_0");
-                                let output = extract_text_content(b.get("content"));
-                                input_items.push(json!({
-                                    "type": "function_call_output",
-                                    "call_id": call_id,
-                                    "output": output,
-                                }));
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !text_parts.is_empty() {
-                        let ctype = if role == "assistant" {
-                            "output_text"
-                        } else {
-                            "input_text"
-                        };
+    let mut input_items = Vec::new();
+    for message in req["messages"].as_array().into_iter().flatten() {
+        let role = message["role"].as_str().unwrap_or("user");
+        let text_type = if role == "assistant" {
+            "output_text"
+        } else {
+            "input_text"
+        };
+        let mut content = Vec::new();
+        let flush = |items: &mut Vec<Value>, content: &mut Vec<Value>| {
+            if !content.is_empty() {
+                items.push(
+                    json!({"type": "message", "role": role, "content": std::mem::take(content)}),
+                );
+            }
+        };
+        match &message["content"] {
+            Value::String(text) => content.push(json!({"type": text_type, "text": text})),
+            Value::Array(blocks) => {
+                for block in blocks {
+                    match block["type"].as_str() {
+                    Some("text") => content.push(json!({"type": text_type, "text": block["text"]})),
+                    Some("image") => content.push(json!({"type": "input_image", "image_url": anthropic_image_url(block)?})),
+                    Some("tool_use") => {
+                        flush(&mut input_items, &mut content);
                         input_items.push(json!({
-                            "type": "message",
-                            "role": role,
-                            "content": [{ "type": ctype, "text": text_parts.join("\n") }],
+                            "type": "function_call", "call_id": anthropic_tool_id(block, "id")?,
+                            "name": block["name"], "arguments": block["input"].to_string(),
                         }));
                     }
+                    Some("tool_result") => {
+                        flush(&mut input_items, &mut content);
+                        input_items.push(json!({
+                            "type": "function_call_output", "call_id": anthropic_tool_id(block, "tool_use_id")?,
+                            "output": anthropic_tool_output(block)?,
+                        }));
+                    }
+                    Some("thinking" | "redacted_thinking") => {}
+                    kind => return Err(unsupported_anthropic_block(kind)),
                 }
-                _ => {}
+                }
             }
+            _ => {}
         }
+        flush(&mut input_items, &mut content);
     }
 
     let mut out = json!({
@@ -302,26 +280,18 @@ pub fn anthropic_to_responses_request_with_session(
         "store": false,
     });
 
-    if let Some(tools) = req.get("tools").and_then(Value::as_array) {
-        let converted: Vec<Value> = tools
-            .iter()
-            .filter_map(|t| {
-                let name = t.get("name")?.as_str()?;
-                let mut item = json!({
-                    "type": "function",
-                    "name": name,
-                });
-                if let Some(desc) = t.get("description") {
-                    item["description"] = desc.clone();
-                }
-                if let Some(schema) = t.get("input_schema") {
-                    item["parameters"] = schema.clone();
-                }
-                Some(item)
-            })
-            .collect();
-        if !converted.is_empty() {
-            out["tools"] = Value::Array(converted);
+    let mut tools = anthropic_function_tools(&req)?;
+    if !tools.is_empty() {
+        for tool in &mut tools {
+            tool["type"] = json!("function");
+        }
+        out["tools"] = json!(tools);
+        let (choice, parallel) = anthropic_tool_choice(&req, true);
+        if let Some(choice) = choice {
+            out["tool_choice"] = choice;
+        }
+        if let Some(parallel) = parallel {
+            out["parallel_tool_calls"] = json!(parallel);
         }
     }
 

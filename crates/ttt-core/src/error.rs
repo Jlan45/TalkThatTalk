@@ -20,8 +20,17 @@ pub enum GatewayError {
     #[error("authentication provider error: {0}")]
     Auth(String),
 
+    #[error("OAuth authorization expired or was revoked; sign in again")]
+    OAuthReauthorizationRequired,
+
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+
+    #[error("request body exceeds inspection limit")]
+    RequestTooLarge,
+
+    #[error("{0}")]
+    NotImplemented(String),
 
     #[error("upstream connection error: {0}")]
     UpstreamConnect(String),
@@ -40,8 +49,10 @@ impl GatewayError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NoRoute(_) => StatusCode::BAD_GATEWAY,
-            Self::Auth(_) => StatusCode::BAD_GATEWAY,
+            Self::Auth(_) | Self::OAuthReauthorizationRequired => StatusCode::BAD_GATEWAY,
             Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             Self::UpstreamConnect(_) => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
         }
@@ -53,8 +64,10 @@ impl GatewayError {
             Self::Unauthorized(_) => "authentication_error",
             Self::Forbidden(_) => "permission_error",
             Self::NoRoute(_) => "no_upstream_route",
-            Self::Auth(_) => "upstream_auth_error",
+            Self::Auth(_) | Self::OAuthReauthorizationRequired => "upstream_auth_error",
             Self::InvalidRequest(_) => "invalid_request_error",
+            Self::RequestTooLarge => "request_too_large",
+            Self::NotImplemented(_) => "not_implemented_error",
             Self::UpstreamConnect(_) => "upstream_connection_error",
             Self::UpstreamTimeout => "upstream_timeout_error",
         }

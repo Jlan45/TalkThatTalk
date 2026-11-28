@@ -17,8 +17,9 @@ use ttt_core::{
 };
 use ttt_protocol::openai_antigravity::openai_to_antigravity_session_request;
 use ttt_protocol::{
-    NativeSse, create_sse_translator, detect_ingress_protocol, json_response_to_sse,
-    needs_translation, translate_request_with_session, translate_response_json,
+    NativeSse, create_sse_translator, detect_ingress_protocol, is_anthropic_count_tokens,
+    json_response_to_sse, needs_translation, translate_request_with_session,
+    translate_response_json,
 };
 
 use crate::affinity::{AffinityContext, AffinityExtractor};
@@ -34,6 +35,7 @@ static HEADER_X_TTT_PREFERRED_UPSTREAM: HeaderName =
     HeaderName::from_static("x-ttt-preferred-upstream");
 static HEADER_X_TTT_SESSION_ID: HeaderName = HeaderName::from_static("x-ttt-session-id");
 static HEADER_X_TTT_REQUEST_ID: HeaderName = HeaderName::from_static("x-ttt-request-id");
+static HEADER_X_TTT_UPSTREAM_ID: HeaderName = HeaderName::from_static("x-ttt-upstream-id");
 static HEADER_X_TTT_UPSTREAM: HeaderName = HeaderName::from_static("x-ttt-upstream");
 static HEADER_X_TTT_AFFINITY_SOURCE: HeaderName = HeaderName::from_static("x-ttt-affinity-source");
 static HEADER_X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
@@ -184,6 +186,12 @@ impl ProxyEngine {
         req: Request<Incoming>,
     ) -> Result<Response<ProxyBody>, std::convert::Infallible> {
         let path = req.uri().path();
+        if req.method() == Method::HEAD && path == "/api/hello" {
+            return Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(ProxyBody::empty())
+                .unwrap());
+        }
         if req.method() == Method::GET && (path == "/healthz" || path == "/readyz") {
             return Ok(health_response());
         }
@@ -217,9 +225,10 @@ impl ProxyEngine {
         let req_id = RequestId::next();
         let started_at = Instant::now();
 
+        let ingress = detect_ingress_protocol(req.uri().path());
         match self.forward(req, req_id, started_at, policy).await {
             Ok(resp) => resp,
-            Err(err) => error_response(&err, req_id),
+            Err(err) => error_response(&err, req_id, ingress),
         }
     }
 
@@ -276,16 +285,22 @@ impl ProxyEngine {
             .map(ToOwned::to_owned);
 
         // 2. Decide between pure streaming zero-copy fast path vs lightweight JSON model scan.
-        let policy_requires_model = active_policy.as_ref().is_some_and(|p| p.allowed_models.is_some());
-        let can_pure_stream = !is_playground && !policy_requires_model
+        let ingress_proto = detect_ingress_protocol(parts.uri.path());
+        let inspect = self.router.needs_body_inspection();
+        let requires_anthropic_body = ingress_proto == Some(ProtocolFamily::Anthropic);
+        let policy_requires_model = active_policy
+            .as_ref()
+            .is_some_and(|p| p.allowed_models.is_some());
+        let can_pure_stream = !is_playground
+            && !policy_requires_model
+            && !requires_anthropic_body
             && should_use_pure_stream(
                 &parts.method,
                 &parts.headers,
-                self.router.needs_body_inspection(),
+                inspect,
                 self.max_inspect_body_bytes,
             );
 
-        let ingress_proto = detect_ingress_protocol(parts.uri.path());
         let telemetry = RequestTelemetry {
             req_id,
             started_at,
@@ -314,7 +329,13 @@ impl ProxyEngine {
             .collect()
             .await
             .map_err(|e| {
-                GatewayError::InvalidRequest(format!("failed to read request body: {e}"))
+                if e.downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some()
+                {
+                    GatewayError::RequestTooLarge
+                } else {
+                    GatewayError::InvalidRequest(format!("failed to read request body: {e}"))
+                }
             })?
             .to_bytes();
         let raw_body = if is_playground {
@@ -404,7 +425,7 @@ impl ProxyEngine {
         self.emit_start(
             &telemetry,
             policy.and_then(|p| p.owner_user_id),
-            &node.name,
+            node,
             model,
             path_and_query,
         );
@@ -445,7 +466,7 @@ impl ProxyEngine {
 
         Ok(self.wrap_upstream_response(
             upstream_resp,
-            &node.name,
+            node,
             affinity_source,
             path_and_query,
             telemetry,
@@ -487,6 +508,12 @@ impl ProxyEngine {
         let mut plan = self
             .router
             .plan_route(model, ingress_proto, policy, affinity_hash);
+        let is_count =
+            is_anthropic_count_tokens(path_and_query.split('?').next().unwrap_or_default());
+        if is_count {
+            plan.candidates
+                .retain(|node| node.supports_protocol(ProtocolFamily::Anthropic));
+        }
         let preferred_applied = preferred_upstream(incoming_headers)
             .is_some_and(|preferred| self.router.prefer_upstream(&mut plan, preferred, None));
         if plan.blocked_by_policy {
@@ -496,6 +523,11 @@ impl ProxyEngine {
             )));
         }
         if plan.candidates.is_empty() {
+            if is_count {
+                return Err(GatewayError::NotImplemented(
+                    "Token counting is unavailable for this model".into(),
+                ));
+            }
             return Err(GatewayError::NoRoute(
                 model.unwrap_or("<default>").to_string(),
             ));
@@ -516,7 +548,7 @@ impl ProxyEngine {
             self.emit_start(
                 &telemetry,
                 policy.and_then(|p| p.owner_user_id),
-                &node.name,
+                node,
                 model,
                 path_and_query,
             );
@@ -530,8 +562,16 @@ impl ProxyEngine {
                 .filter(|aff| {
                     target_proto == ProtocolFamily::Antigravity && aff.source != "prefix_hash"
                 })
-                .map(|aff| format!("{}:{:016x}", node.name, aff.hash));
+                .map(|aff| format!("{}:{:016x}", node.id, aff.hash));
 
+            if node
+                .auth
+                .oauth_manager()
+                .is_some_and(|mgr| mgr.current_state().reauthorization_required)
+            {
+                last_err = Some(GatewayError::OAuthReauthorizationRequired);
+                continue;
+            }
             let mut oauth_refreshed_on_node = false;
 
             loop {
@@ -553,11 +593,8 @@ impl ProxyEngine {
 
                 // Fast Path (same protocol): zero-copy slice rewrite or O(1) Bytes::clone.
                 // Cross-Protocol Path (L1 framework): translate request + path + headers.
-                let claude_code_compat =
-                    node.is_claude_code_oauth && target_proto == ProtocolFamily::Anthropic;
-
                 let (
-                    mut target_path,
+                    target_path,
                     body,
                     content_length_override,
                     proto_headers,
@@ -586,65 +623,15 @@ impl ProxyEngine {
                             affinity.as_ref().map(|a| a.session_id.as_str()),
                         )?
                     };
-                    let final_bytes = if claude_code_compat {
-                        ensure_claude_code_system_prompt(&tr.body).unwrap_or(tr.body)
-                    } else {
-                        tr.body
-                    };
-                    let len = final_bytes.len() as u64;
+                    let len = tr.body.len() as u64;
                     (
                         tr.target_path_and_query,
-                        ProxyBody::full(final_bytes),
+                        ProxyBody::full(tr.body),
                         Some(len),
                         tr.extra_headers,
                         tr.model,
                         tr.is_stream,
                     )
-                } else if claude_code_compat {
-                    // For real Claude Code clients, `"You are Claude Code"` is already present
-                    // and we stay on the zero-copy path; for non-Claude-Code clients we inject
-                    // the required identity system block so Anthropic OAuth accepts the request.
-                    let rewritten_bytes = if let (Some(span), Some(orig_model)) =
-                        (model_span.as_ref(), model)
-                        && let Some(mapped) = node.mapped_model(orig_model)
-                        && mapped != orig_model
-                    {
-                        let mut v = Vec::with_capacity(
-                            raw_body.len() + mapped.len().saturating_sub(orig_model.len()),
-                        );
-                        v.extend_from_slice(&raw_body[..span.value_range.start]);
-                        v.extend_from_slice(mapped.as_bytes());
-                        v.extend_from_slice(&raw_body[span.value_range.end..]);
-                        Bytes::from(v)
-                    } else {
-                        raw_body.clone()
-                    };
-                    if let Some(patched) = ensure_claude_code_system_prompt(&rewritten_bytes) {
-                        let len = patched.len() as u64;
-                        (
-                            path_and_query.to_string(),
-                            ProxyBody::full(patched),
-                            Some(len),
-                            Vec::new(),
-                            model.unwrap_or("").to_string(),
-                            false,
-                        )
-                    } else {
-                        let (body, cl) = build_rewritten_or_cloned_body(
-                            &raw_body,
-                            model_span.as_ref(),
-                            model,
-                            node,
-                        );
-                        (
-                            path_and_query.to_string(),
-                            body,
-                            cl,
-                            Vec::new(),
-                            model.unwrap_or("").to_string(),
-                            false,
-                        )
-                    }
                 } else {
                     let mapped_model = model.and_then(|m| node.mapped_model(m));
                     if let Some(cleaned) = strip_openai_cache_fields_if_present(
@@ -678,10 +665,6 @@ impl ProxyEngine {
                         )
                     }
                 };
-
-                if claude_code_compat {
-                    target_path = ensure_beta_query_param(&target_path);
-                }
 
                 let (cred_handle, mut upstream_req) = self.build_upstream_request(
                     node,
@@ -754,7 +737,11 @@ impl ProxyEngine {
                             }
                         }
 
-                        if status == StatusCode::TOO_MANY_REQUESTS {
+                        let upstream_disallows_retry = resp
+                            .headers()
+                            .get("x-should-retry")
+                            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"false"));
+                        if status == StatusCode::TOO_MANY_REQUESTS && !upstream_disallows_retry {
                             let cooldown = parse_retry_after(resp.headers())
                                 .unwrap_or(node.default_cooldown_secs);
                             node.auth.on_rate_limited(cred_handle, cooldown);
@@ -768,7 +755,7 @@ impl ProxyEngine {
                                 );
                                 break;
                             }
-                        } else if is_retryable_status(status) {
+                        } else if is_retryable_status(status) && !upstream_disallows_retry {
                             node.record_transient_failure(
                                 self.router.routing_config().failure_cooldown_base_secs,
                             );
@@ -788,10 +775,10 @@ impl ProxyEngine {
                         if status.is_success()
                             && !preferred_applied
                             && let Some(aff) = affinity.as_ref()
-                            && (plan.primary_hrw_node.as_deref() != Some(node.name.as_str())
+                            && (plan.primary_hrw_node.as_deref() != Some(node.id.as_str())
                                 || plan.sticky_hit)
                         {
-                            self.router.record_failover_success(aff.hash, &node.name);
+                            self.router.record_failover_success(aff.hash, &node.id);
                         }
 
                         if let Some(in_p) = cross_proto
@@ -803,7 +790,7 @@ impl ProxyEngine {
                                     in_p,
                                     target_proto,
                                     &effective_model,
-                                    &node.name,
+                                    node,
                                     affinity_source,
                                     translated_is_stream,
                                     telemetry,
@@ -812,15 +799,19 @@ impl ProxyEngine {
                                 .await;
                         }
 
-                        return Ok(self.wrap_upstream_response(
+                        let response = self.wrap_upstream_response(
                             resp,
-                            &node.name,
+                            node,
                             affinity_source,
                             path_and_query,
                             telemetry,
                             upload_timing,
                             target_proto,
-                        ));
+                        );
+                        if cross_proto == Some(ProtocolFamily::Anthropic) && !status.is_success() {
+                            return Ok(translate_anthropic_error(response, req_id).await);
+                        }
+                        return Ok(response);
                     }
                     Err(err) => {
                         node.record_transient_failure(
@@ -928,37 +919,19 @@ impl ProxyEngine {
             }
         }
 
-        // Claude Code OAuth compatibility headers: merge required beta flags without clobbering
-        // client flags, and mimic Claude CLI headers only when the caller is not already Claude CLI.
-        if node.is_claude_code_oauth && target_proto == ProtocolFamily::Anthropic {
-            let beta_name = HeaderName::from_static("anthropic-beta");
-            merge_comma_header(headers, &beta_name, "claude-code-20250219,oauth-2025-04-20");
-
+        if target_proto == ProtocolFamily::Anthropic {
             headers
                 .entry(HeaderName::from_static("anthropic-version"))
-                .or_insert_with(|| HeaderValue::from_static("2023-06-01"));
-
-            let is_real_claude_cli = incoming_headers
-                .get(header::USER_AGENT)
-                .and_then(|v| v.to_str().ok())
-                .map(|ua| ua.starts_with("claude-cli/"))
-                .unwrap_or(false);
-            if !is_real_claude_cli {
-                headers.insert(
-                    header::USER_AGENT,
-                    HeaderValue::from_static("claude-cli/2.1.251 (external, cli)"),
-                );
-                headers.insert(
-                    HeaderName::from_static("x-app"),
-                    HeaderValue::from_static("cli"),
-                );
-                headers.insert(
-                    HeaderName::from_static("anthropic-dangerous-direct-browser-access"),
-                    HeaderValue::from_static("true"),
-                );
-            }
+                .or_insert(HeaderValue::from_static("2023-06-01"));
         }
 
+        if node
+            .auth
+            .oauth_manager()
+            .is_some_and(|mgr| mgr.current_state().reauthorization_required)
+        {
+            return Err(GatewayError::OAuthReauthorizationRequired);
+        }
         let (cred_handle, cred) = node.auth.acquire_with_affinity(affinity.map(|a| a.hash));
         headers.insert(cred.header_name, cred.header_value);
 
@@ -978,7 +951,7 @@ impl ProxyEngine {
     fn wrap_upstream_response(
         &self,
         upstream_resp: Response<Incoming>,
-        upstream_name: &str,
+        node: &UpstreamNode,
         affinity_source: Option<&str>,
         path_and_query: &str,
         telemetry: RequestTelemetry,
@@ -1015,8 +988,11 @@ impl ProxyEngine {
             if let Ok(hv) = HeaderValue::from_str(&req_id.to_string()) {
                 headers.insert(HEADER_X_TTT_REQUEST_ID.clone(), hv);
             }
-            if let Ok(hv) = HeaderValue::from_str(&encode_header_value(upstream_name)) {
+            if let Ok(hv) = HeaderValue::from_str(&encode_header_value(&node.name)) {
                 headers.insert(HEADER_X_TTT_UPSTREAM.clone(), hv);
+            }
+            if let Ok(hv) = HeaderValue::from_str(&encode_header_value(&node.id)) {
+                headers.insert(HEADER_X_TTT_UPSTREAM_ID.clone(), hv);
             }
             if let Ok(hv) = HeaderValue::from_str(affinity_source.unwrap_or("none")) {
                 headers.insert(HEADER_X_TTT_AFFINITY_SOURCE.clone(), hv);
@@ -1057,7 +1033,7 @@ impl ProxyEngine {
         ingress_proto: ProtocolFamily,
         upstream_proto: ProtocolFamily,
         model: &str,
-        upstream_name: &str,
+        node: &UpstreamNode,
         affinity_source: Option<&str>,
         client_wants_stream: bool,
         telemetry: RequestTelemetry,
@@ -1073,6 +1049,8 @@ impl ProxyEngine {
             .and_then(|value| value.split(';').next())
             .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
         let is_sse = is_event_stream(&parts.headers) || (client_wants_stream && !explicit_json);
+        let collect_completed_responses =
+            is_sse && !client_wants_stream && upstream_proto == ProtocolFamily::OpenAiResponses;
 
         let mut builder = Response::builder().status(status);
         if let Some(headers) = builder.headers_mut() {
@@ -1084,14 +1062,17 @@ impl ProxyEngine {
             if let Ok(hv) = HeaderValue::from_str(&req_id.to_string()) {
                 headers.insert(HEADER_X_TTT_REQUEST_ID.clone(), hv);
             }
-            if let Ok(hv) = HeaderValue::from_str(&encode_header_value(upstream_name)) {
+            if let Ok(hv) = HeaderValue::from_str(&encode_header_value(&node.name)) {
                 headers.insert(HEADER_X_TTT_UPSTREAM.clone(), hv);
+            }
+            if let Ok(hv) = HeaderValue::from_str(&encode_header_value(&node.id)) {
+                headers.insert(HEADER_X_TTT_UPSTREAM_ID.clone(), hv);
             }
             if let Ok(hv) = HeaderValue::from_str(affinity_source.unwrap_or("none")) {
                 headers.insert(HEADER_X_TTT_AFFINITY_SOURCE.clone(), hv);
             }
 
-            if is_sse || client_wants_stream {
+            if !collect_completed_responses && (is_sse || client_wants_stream) {
                 headers.insert(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("text/event-stream; charset=utf-8"),
@@ -1111,12 +1092,13 @@ impl ProxyEngine {
             }
         }
 
-        if is_sse {
+        if is_sse && !collect_completed_responses {
             let translator =
                 create_sse_translator(ingress_proto, upstream_proto, model.to_string())?;
             let stream_body = ProxyBody::translated(
                 body,
                 translator,
+                ingress_proto == ProtocolFamily::Anthropic,
                 req_id,
                 lifetime,
                 status,
@@ -1141,13 +1123,16 @@ impl ProxyEngine {
             })
             .collect()
             .await
-            .map_err(|e| GatewayError::UpstreamConnect(format!("{upstream_name}: {e}")))?
+            .map_err(|e| GatewayError::UpstreamConnect(format!("{}: {e}", node.name)))?
             .to_bytes();
 
-        if client_wants_stream {
-            let payload: serde_json::Value = serde_json::from_slice(&upstream_bytes)
-                .map_err(|err| {
-                    GatewayError::UpstreamConnect(format!("{upstream_name}: invalid JSON response: {err}"))
+        if explicit_json || client_wants_stream {
+            let payload: serde_json::Value =
+                serde_json::from_slice(&upstream_bytes).map_err(|err| {
+                    GatewayError::UpstreamConnect(format!(
+                        "{}: invalid JSON response: {err}",
+                        node.name
+                    ))
                 })?;
             if let Some(error) = payload.get("error").filter(|error| error.is_object() || error.is_string()) {
                 let message = error
@@ -1155,7 +1140,10 @@ impl ProxyEngine {
                     .and_then(serde_json::Value::as_str)
                     .or_else(|| error.as_str())
                     .unwrap_or("upstream returned an error response");
-                return Err(GatewayError::UpstreamConnect(format!("{upstream_name}: {message}")));
+                return Err(GatewayError::UpstreamConnect(format!(
+                    "{}: {message}",
+                    node.name
+                )));
             }
         }
 
@@ -1197,7 +1185,7 @@ impl ProxyEngine {
         &self,
         telemetry: &RequestTelemetry,
         user_id: Option<i64>,
-        upstream: &str,
+        upstream: &UpstreamNode,
         model: Option<&str>,
         path: &str,
     ) {
@@ -1208,7 +1196,8 @@ impl ProxyEngine {
                 req_id: telemetry.req_id,
                 lifetime: Arc::downgrade(lifetime),
                 user_id,
-                upstream: upstream.to_string(),
+                upstream: upstream.name.clone(),
+                upstream_id: upstream.id.clone(),
                 model: model.map(ToOwned::to_owned),
                 path: path.to_string(),
             });
@@ -1444,8 +1433,11 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
 fn is_retryable_status(status: StatusCode) -> bool {
     matches!(
         status,
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
-    )
+        StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    ) || status.as_u16() == 529
 }
 
 fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
@@ -1453,55 +1445,6 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
         .get(header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
-}
-
-const CLAUDE_CODE_IDENTITY_PROMPT: &str =
-    "You are Claude Code, Anthropic's official CLI for Claude.";
-
-fn ensure_beta_query_param(path_and_query: &str) -> String {
-    let path_only = path_and_query.split('?').next().unwrap_or(path_and_query);
-    if !path_only.ends_with("/messages") {
-        return path_and_query.to_string();
-    }
-    if let Some((_, q)) = path_and_query.split_once('?') {
-        if q.split('&').any(|pair| pair == "beta=true" || pair.starts_with("beta=")) {
-            return path_and_query.to_string();
-        }
-        format!("{path_and_query}&beta=true")
-    } else {
-        format!("{path_and_query}?beta=true")
-    }
-}
-
-fn ensure_claude_code_system_prompt(raw: &[u8]) -> Option<Bytes> {
-    if memchr::memmem::find(raw, b"You are Claude Code").is_some() {
-        return None;
-    }
-    let mut val: serde_json::Value = serde_json::from_slice(raw).ok()?;
-    let obj = val.as_object_mut()?;
-    let identity_block = serde_json::json!({
-        "type": "text",
-        "text": CLAUDE_CODE_IDENTITY_PROMPT,
-    });
-
-    match obj.get_mut("system") {
-        Some(serde_json::Value::Array(arr)) => {
-            arr.insert(0, identity_block);
-        }
-        Some(serde_json::Value::String(s)) => {
-            let existing = std::mem::take(s);
-            let mut blocks = vec![identity_block];
-            if !existing.is_empty() {
-                blocks.push(serde_json::json!({ "type": "text", "text": existing }));
-            }
-            obj.insert("system".to_string(), serde_json::Value::Array(blocks));
-        }
-        _ => {
-            obj.insert("system".to_string(), serde_json::Value::Array(vec![identity_block]));
-        }
-    }
-
-    serde_json::to_vec(&val).ok().map(Bytes::from)
 }
 
 fn merge_comma_header(headers: &mut HeaderMap, name: &HeaderName, extra_csv: &str) {
@@ -1553,14 +1496,64 @@ fn health_response() -> Response<ProxyBody> {
         .unwrap()
 }
 
-fn error_response(err: &GatewayError, req_id: RequestId) -> Response<ProxyBody> {
+fn error_response(
+    err: &GatewayError,
+    req_id: RequestId,
+    ingress: Option<ProtocolFamily>,
+) -> Response<ProxyBody> {
     let mut builder = Response::builder()
         .status(err.status_code())
         .header(header::CONTENT_TYPE, "application/json");
     if let Ok(hv) = HeaderValue::from_str(&req_id.to_string()) {
         builder = builder.header(HEADER_X_TTT_REQUEST_ID.clone(), hv);
     }
-    builder
-        .body(ProxyBody::full(err.to_json_bytes()))
-        .unwrap()
+    let body = if ingress == Some(ProtocolFamily::Anthropic) {
+        anthropic_error_body(err.status_code(), &err.to_string(), req_id)
+    } else {
+        err.to_json_bytes()
+    };
+    builder.body(ProxyBody::full(body)).unwrap()
+}
+
+async fn translate_anthropic_error(
+    response: Response<ProxyBody>,
+    req_id: RequestId,
+) -> Response<ProxyBody> {
+    let (mut parts, body) = response.into_parts();
+    let message = match Limited::new(body, 1024 * 1024).collect().await {
+        Ok(body) => serde_json::from_slice::<serde_json::Value>(&body.to_bytes())
+            .ok()
+            .and_then(|json| {
+                json.pointer("/error/message")
+                    .or_else(|| json.get("error"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            }),
+        Err(_) => None,
+    }
+    .unwrap_or_else(|| format!("Upstream returned HTTP {}", parts.status));
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.remove(header::CONTENT_ENCODING);
+    parts.headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let body = anthropic_error_body(parts.status, &message, req_id);
+    Response::from_parts(parts, ProxyBody::full(body))
+}
+
+fn anthropic_error_body(status: StatusCode, message: &str, req_id: RequestId) -> Bytes {
+    let kind = match status.as_u16() {
+        400 | 422 | 501 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        529 => "overloaded_error",
+        _ => "api_error",
+    };
+    Bytes::from(serde_json::json!({
+        "type": "error", "error": {"type": kind, "message": message}, "request_id": req_id.to_string(),
+    }).to_string())
 }

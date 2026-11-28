@@ -138,10 +138,10 @@ export function DashboardPage() {
           {upstreamEntries.length === 0 ? (
             <p className="muted">暂无流量记录，前往 Playground 发一条测试请求试试。</p>
           ) : (
-            upstreamEntries.map(([name, item]) => (
-              <div className="bar-row" key={name}>
+            upstreamEntries.map(([id, item]) => (
+              <div className="bar-row" key={id}>
                 <div className="bar-meta">
-                  <span className="mono">{name}</span>
+                  <span className="mono" title={id}>{item.name || id}</span>
                   <span className="muted tabular">
                     {item.requests} reqs · {formatNumber(item.total_tokens)} tok
                     {item.input_tokens > 0 ? ` · 缓存 ${formatCacheHitRate(item.cache_hit_rate)}` : ""}

@@ -267,86 +267,81 @@ pub fn anthropic_to_openai_request(
         .unwrap_or_default();
     let stream = obj.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
-    let mut openai_messages: Vec<Value> = Vec::new();
-
-    if let Some(sys) = obj.get("system")
-        && let Some(sys_text) = extract_text_content(Some(sys))
-        && !sys_text.is_empty()
-    {
-        openai_messages.push(json!({
-            "role": "system",
-            "content": sys_text,
-        }));
+    let mut messages = Vec::new();
+    if let Some(system) = extract_text_content(obj.get("system")).filter(|s| !s.is_empty()) {
+        messages.push(json!({"role": "system", "content": system}));
     }
-
-    if let Some(messages) = obj.get("messages").and_then(Value::as_array) {
-        for msg in messages {
-            let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
-            if let Some(blocks) = msg.get("content").and_then(Value::as_array) {
-                let mut text_parts = Vec::new();
-                let mut tool_calls = Vec::new();
-                let mut tool_results = Vec::new();
-
-                for block in blocks {
-                    match block.get("type").and_then(Value::as_str) {
-                        Some("text") => {
-                            if let Some(t) = block.get("text").and_then(Value::as_str) {
-                                text_parts.push(t.to_string());
-                            }
-                        }
-                        Some("tool_use") => {
-                            let id = block.get("id").and_then(Value::as_str).unwrap_or("call_0");
-                            let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-                            let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
-                            tool_calls.push(json!({
-                                "id": id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": input.to_string(),
-                                }
-                            }));
-                        }
-                        Some("tool_result") => {
-                            let id = block
-                                .get("tool_use_id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("call_0");
-                            let content =
-                                extract_text_content(block.get("content")).unwrap_or_default();
-                            tool_results.push(json!({
-                                "role": "tool",
-                                "tool_call_id": id,
-                                "content": content,
-                            }));
-                        }
-                        _ => {}
-                    }
-                }
-
-                if !text_parts.is_empty() || !tool_calls.is_empty() {
-                    let mut m = Map::new();
-                    m.insert("role".into(), Value::String(role.to_string()));
-                    m.insert("content".into(), Value::String(text_parts.join("")));
-                    if !tool_calls.is_empty() {
-                        m.insert("tool_calls".into(), Value::Array(tool_calls));
-                    }
-                    openai_messages.push(Value::Object(m));
-                }
-                openai_messages.extend(tool_results);
-            } else {
-                let text = extract_text_content(msg.get("content")).unwrap_or_default();
-                openai_messages.push(json!({
-                    "role": role,
-                    "content": text,
-                }));
+    for message in obj
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let role = message["role"].as_str().unwrap_or("user");
+        let Some(blocks) = message["content"].as_array() else {
+            messages.push(json!({"role": role, "content": message["content"]}));
+            continue;
+        };
+        let mut parts = Vec::new();
+        let mut calls = Vec::new();
+        for block in blocks {
+            match block["type"].as_str() {
+                Some("text") => parts.push(json!({"type": "text", "text": block["text"]})),
+                Some("image") => parts.push(
+                    json!({"type": "image_url", "image_url": {"url": anthropic_image_url(block)?}}),
+                ),
+                Some("tool_use") => calls.push(json!({
+                    "type": "function", "id": anthropic_tool_id(block, "id")?,
+                    "function": {"name": block["name"], "arguments": block["input"].to_string()},
+                })),
+                Some("tool_result") => messages.push(json!({
+                    "role": "tool", "tool_call_id": anthropic_tool_id(block, "tool_use_id")?,
+                    "content": anthropic_tool_output(block)?,
+                })),
+                Some("thinking" | "redacted_thinking") => {}
+                kind => return Err(unsupported_anthropic_block(kind)),
             }
         }
+        if calls.is_empty() && parts.is_empty() {
+            continue;
+        }
+        let content = if parts.is_empty() {
+            Value::Null
+        } else if parts.iter().all(|p| p["type"] == "text") {
+            json!(
+                parts
+                    .iter()
+                    .filter_map(|p| p["text"].as_str())
+                    .collect::<String>()
+            )
+        } else {
+            Value::Array(parts)
+        };
+        let mut translated = json!({"role": role, "content": content});
+        if !calls.is_empty() {
+            translated["tool_calls"] = json!(calls);
+        }
+        messages.push(translated);
     }
 
     let mut out = Map::new();
     out.insert("model".into(), Value::String(model.clone()));
-    out.insert("messages".into(), Value::Array(openai_messages));
+    out.insert("messages".into(), Value::Array(messages));
+    let tools = anthropic_function_tools(&v)?;
+    if !tools.is_empty() {
+        let tools: Vec<_> = tools
+            .into_iter()
+            .map(|function| json!({"type": "function", "function": function}))
+            .collect();
+        out.insert("tools".into(), json!(tools));
+        let (choice, parallel) = anthropic_tool_choice(&v, false);
+        if let Some(choice) = choice {
+            out.insert("tool_choice".into(), choice);
+        }
+        if let Some(parallel) = parallel {
+            out.insert("parallel_tool_calls".into(), json!(parallel));
+        }
+    }
     if let Some(max_tokens) = obj.get("max_tokens") {
         out.insert("max_tokens".into(), max_tokens.clone());
     }
@@ -374,6 +369,110 @@ pub fn anthropic_to_openai_request(
         model,
         is_stream: stream,
     })
+}
+
+pub(crate) fn anthropic_function_tools(request: &Value) -> Result<Vec<Value>, GatewayError> {
+    request["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|tool| {
+            let Some(name) = tool["name"].as_str() else {
+                return Err(GatewayError::InvalidRequest(
+                    "Anthropic tool needs a name".into(),
+                ));
+            };
+            let Some(schema) = tool.get("input_schema").filter(|schema| schema.is_object()) else {
+                return Err(GatewayError::InvalidRequest(format!(
+                    "Input tag '{}' is unsupported by this upstream",
+                    tool["type"].as_str().unwrap_or(name)
+                )));
+            };
+            let mut function = json!({"name": name, "parameters": schema});
+            if let Some(description) = tool["description"].as_str() {
+                function["description"] = json!(description);
+            }
+            if let Some(strict) = tool["strict"].as_bool() {
+                function["strict"] = json!(strict);
+            }
+            Ok(function)
+        })
+        .collect()
+}
+
+pub(crate) fn anthropic_tool_choice(
+    request: &Value,
+    responses: bool,
+) -> (Option<Value>, Option<bool>) {
+    let choice = &request["tool_choice"];
+    let mapped = match choice["type"].as_str() {
+        Some("auto") => Some(json!("auto")),
+        Some("any") => Some(json!("required")),
+        Some("none") => Some(json!("none")),
+        Some("tool") => choice["name"].as_str().map(|name| {
+            if responses {
+                json!({"type": "function", "name": name})
+            } else {
+                json!({"type": "function", "function": {"name": name}})
+            }
+        }),
+        _ => None,
+    };
+    (
+        mapped,
+        choice["disable_parallel_tool_use"]
+            .as_bool()
+            .map(|disabled| !disabled),
+    )
+}
+
+pub(crate) fn anthropic_tool_id<'a>(block: &'a Value, name: &str) -> Result<&'a str, GatewayError> {
+    block[name]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            GatewayError::InvalidRequest(format!("Anthropic tool block is missing {name}"))
+        })
+}
+
+pub(crate) fn anthropic_tool_output(block: &Value) -> Result<String, GatewayError> {
+    if let Some(parts) = block["content"].as_array() {
+        for part in parts {
+            if part["type"] != "text" {
+                return Err(unsupported_anthropic_block(part["type"].as_str()));
+            }
+        }
+    }
+    let text = extract_text_content(block.get("content")).unwrap_or_default();
+    if block["is_error"].as_bool() == Some(true) {
+        Ok(format!("Tool error: {text}"))
+    } else {
+        Ok(text)
+    }
+}
+
+pub(crate) fn anthropic_image_url(block: &Value) -> Result<String, GatewayError> {
+    let source = &block["source"];
+    if source["type"] == "url"
+        && let Some(url) = source["url"].as_str()
+    {
+        return Ok(url.to_owned());
+    }
+    if source["type"] == "base64"
+        && let (Some(mime), Some(data)) = (source["media_type"].as_str(), source["data"].as_str())
+    {
+        return Ok(format!("data:{mime};base64,{data}"));
+    }
+    Err(GatewayError::InvalidRequest(
+        "Unsupported Anthropic image source".into(),
+    ))
+}
+
+pub(crate) fn unsupported_anthropic_block(kind: Option<&str>) -> GatewayError {
+    GatewayError::InvalidRequest(format!(
+        "Input tag '{}' is unsupported by this upstream",
+        kind.unwrap_or("unknown")
+    ))
 }
 
 /// Translate an OpenAI Chat Completions JSON response into an Anthropic Messages JSON response.
@@ -463,6 +562,7 @@ pub(crate) fn map_openai_finish_reason(reason: Option<&str>) -> &'static str {
     match reason {
         Some("length") => "max_tokens",
         Some("tool_calls") => "tool_use",
+        Some("content_filter") => "refusal",
         _ => "end_turn",
     }
 }

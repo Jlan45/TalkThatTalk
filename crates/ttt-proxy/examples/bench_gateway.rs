@@ -126,6 +126,7 @@ async fn spawn_gateway(upstream_addr: SocketAddr) -> SocketAddr {
         routing: Default::default(),
         upstreams: vec![
             UpstreamConfig {
+                id: String::new(),
                 name: "oai-native".into(),
                 base_url: format!("http://{upstream_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -150,6 +151,7 @@ async fn spawn_gateway(upstream_addr: SocketAddr) -> SocketAddr {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "ant-cross".into(),
                 base_url: format!("http://{upstream_addr}"),
                 protocol: ProtocolFamily::Anthropic,

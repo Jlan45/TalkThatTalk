@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use ttt_auth::{StoredOAuthToken, TokenStore};
@@ -22,7 +22,7 @@ const REQUEST_LOGS_NEWEST_FIRST: &str =
     "SELECT req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms,
             duration_ms, total_bytes, input_tokens, output_tokens, total_tokens,
             cache_read_tokens, cache_write_tokens, COALESCE(log.username, users.username),
-            is_stream, ttft_measured, stream_failure
+            is_stream, ttft_measured, stream_failure, upstream_id
      FROM request_logs AS log
      LEFT JOIN users ON users.id = log.user_id
      ORDER BY log.id DESC
@@ -70,7 +70,7 @@ impl GatewayDb {
 
         let conn = Connection::open(db_path)
             .map_err(|e| GatewayError::Config(format!("failed to open SQLite db: {e}")))?;
-        init_schema(&conn)?;
+        init_schema(&conn, &master_key)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -81,7 +81,7 @@ impl GatewayDb {
     pub fn open_in_memory(master_key: [u8; 32]) -> Result<Self, GatewayError> {
         let conn = Connection::open_in_memory()
             .map_err(|e| GatewayError::Config(format!("failed to open in-memory SQLite: {e}")))?;
-        init_schema(&conn)?;
+        init_schema(&conn, &master_key)?;
         Ok(Self {
             conn: Mutex::new(conn),
             master_key,
@@ -92,36 +92,48 @@ impl GatewayDb {
     // Upstreams (AES-256-GCM encrypted JSON blobs)
     // =========================================================================
 
+    pub fn new_upstream_id() -> String {
+        let mut bytes = [0; 16];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        format!("up_{}", URL_SAFE_NO_PAD.encode(bytes))
+    }
+
     pub fn list_upstreams(&self) -> Result<Vec<UpstreamConfig>, GatewayError> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| GatewayError::Internal("db mutex poisoned".into()))?;
         let mut stmt = conn
-            .prepare("SELECT nonce, ciphertext FROM upstreams ORDER BY created_at ASC, name ASC")
+            .prepare("SELECT id, nonce, ciphertext FROM upstreams ORDER BY created_at, name, id")
             .map_err(db_err)?;
 
         let rows = stmt
             .query_map([], |row| {
-                let nonce: Vec<u8> = row.get(0)?;
-                let ct: Vec<u8> = row.get(1)?;
-                Ok((nonce, ct))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
             })
             .map_err(db_err)?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (nonce, ct) = row.map_err(db_err)?;
+            let (id, nonce, ct) = row.map_err(db_err)?;
             let plain = decrypt_bytes(&self.master_key, &nonce, &ct)?;
-            let up: UpstreamConfig = serde_json::from_slice(&plain).map_err(|e| {
+            let mut up: UpstreamConfig = serde_json::from_slice(&plain).map_err(|e| {
                 GatewayError::Internal(format!("corrupted upstream record in db: {e}"))
             })?;
+            up.id = id;
             out.push(up);
         }
         Ok(out)
     }
 
     pub fn upsert_upstream(&self, up: &UpstreamConfig) -> Result<(), GatewayError> {
+        if up.id.is_empty() {
+            return Err(GatewayError::Config("missing upstream ID".into()));
+        }
         let plain = serde_json::to_vec(up)
             .map_err(|e| GatewayError::Internal(format!("failed to encode upstream: {e}")))?;
         let (nonce, ct) = encrypt_bytes(&self.master_key, &plain)?;
@@ -132,26 +144,37 @@ impl GatewayDb {
             .lock()
             .map_err(|_| GatewayError::Internal("db mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO upstreams (name, nonce, ciphertext, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)
-             ON CONFLICT(name) DO UPDATE SET
+            "INSERT INTO upstreams (id, name, nonce, ciphertext, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               name = excluded.name,
                nonce = excluded.nonce,
                ciphertext = excluded.ciphertext,
                updated_at = excluded.updated_at",
-            params![up.name, nonce, ct, now],
+            params![up.id, up.name, nonce, ct, now],
         )
         .map_err(db_err)?;
         Ok(())
     }
 
-    pub fn delete_upstream(&self, name: &str) -> Result<bool, GatewayError> {
-        let conn = self
+    pub fn delete_upstream(&self, id: &str) -> Result<bool, GatewayError> {
+        let mut conn = self
             .conn
             .lock()
             .map_err(|_| GatewayError::Internal("db mutex poisoned".into()))?;
-        let affected = conn
-            .execute("DELETE FROM upstreams WHERE name = ?1", params![name])
+        let tx = conn.transaction().map_err(db_err)?;
+        let affected = tx
+            .execute("DELETE FROM upstreams WHERE id = ?1", params![id])
             .map_err(db_err)?;
+        if affected > 0 {
+            tx.execute("DELETE FROM quota_snapshots WHERE upstream_id = ?1", [id])
+                .map_err(db_err)?;
+            tx.execute(
+                "DELETE FROM oauth_tokens WHERE account_id GLOB 'upstream:*' AND substr(account_id, -length(?1) - 1) = ':' || ?1",
+                [id],
+            ).map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
         Ok(affected > 0)
     }
 
@@ -487,8 +510,8 @@ impl GatewayDb {
             "INSERT OR REPLACE INTO request_logs
                (req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms, duration_ms,
                 total_bytes, input_tokens, output_tokens, total_tokens, cache_read_tokens,
-                cache_write_tokens, username, is_stream, ttft_measured, stream_failure)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                cache_write_tokens, username, is_stream, ttft_measured, stream_failure, upstream_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 entry.req_id,
                 entry.user_id,
@@ -509,6 +532,7 @@ impl GatewayDb {
                 entry.is_stream,
                 entry.ttft_measured,
                 entry.stream_failure.map(StreamFailure::as_str),
+                entry.upstream_id,
             ],
         )
         .map_err(db_err)?;
@@ -559,7 +583,7 @@ impl GatewayDb {
                 "SELECT req_id, user_id, timestamp_secs, upstream, model, path, status, ttft_ms,
                         duration_ms, total_bytes, input_tokens, output_tokens, total_tokens,
                         cache_read_tokens, cache_write_tokens, COALESCE(log.username, users.username),
-                        is_stream, ttft_measured, stream_failure
+                        is_stream, ttft_measured, stream_failure, upstream_id
                  FROM request_logs AS log
                  LEFT JOIN users ON users.id = log.user_id
                  WHERE log.user_id = ?1
@@ -917,7 +941,11 @@ impl GatewayDb {
         Ok(affected > 0)
     }
 
-    pub fn upsert_quota_snapshot(&self, snap: &QuotaSnapshot) -> Result<(), GatewayError> {
+    pub fn upsert_quota_snapshot(
+        &self,
+        upstream_id: &str,
+        snap: &QuotaSnapshot,
+    ) -> Result<(), GatewayError> {
         let json = serde_json::to_string(snap)
             .map_err(|e| GatewayError::Internal(format!("failed to encode quota snapshot: {e}")))?;
         let conn = self
@@ -925,12 +953,12 @@ impl GatewayDb {
             .lock()
             .map_err(|_| GatewayError::Internal("db mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO quota_snapshots (upstream, payload_json, fetched_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(upstream) DO UPDATE SET
+            "INSERT INTO quota_snapshots (upstream_id, payload_json, fetched_at)
+             SELECT ?1, ?2, ?3 WHERE EXISTS (SELECT 1 FROM upstreams WHERE id = ?1)
+             ON CONFLICT(upstream_id) DO UPDATE SET
                payload_json = excluded.payload_json,
                fetched_at = excluded.fetched_at",
-            params![snap.upstream, json, snap.fetched_at],
+            params![upstream_id, json, snap.fetched_at],
         )
         .map_err(db_err)?;
         Ok(())
@@ -942,7 +970,7 @@ impl GatewayDb {
             .lock()
             .map_err(|_| GatewayError::Internal("db mutex poisoned".into()))?;
         let mut stmt = conn
-            .prepare("SELECT upstream, payload_json FROM quota_snapshots")
+            .prepare("SELECT upstream_id, payload_json FROM quota_snapshots")
             .map_err(db_err)?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -963,7 +991,7 @@ impl GatewayDb {
             .lock()
             .map_err(|_| GatewayError::Internal("db mutex poisoned".into()))?;
         conn.execute(
-            "DELETE FROM quota_snapshots WHERE upstream = ?1",
+            "DELETE FROM quota_snapshots WHERE upstream_id = ?1",
             params![upstream],
         )
         .map_err(db_err)?;
@@ -1053,13 +1081,14 @@ impl TokenStore for GatewayDb {
     }
 }
 
-fn init_schema(conn: &Connection) -> Result<(), GatewayError> {
+fn init_schema(conn: &Connection, master_key: &[u8; 32]) -> Result<(), GatewayError> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
 
          CREATE TABLE IF NOT EXISTS upstreams (
-             name TEXT PRIMARY KEY,
+             id TEXT NOT NULL PRIMARY KEY,
+             name TEXT NOT NULL,
              nonce BLOB NOT NULL,
              ciphertext BLOB NOT NULL,
              created_at INTEGER NOT NULL,
@@ -1121,6 +1150,7 @@ fn init_schema(conn: &Connection) -> Result<(), GatewayError> {
              user_id INTEGER,
              timestamp_secs INTEGER NOT NULL,
              upstream TEXT NOT NULL,
+             upstream_id TEXT,
              model TEXT,
              path TEXT NOT NULL,
              status INTEGER NOT NULL,
@@ -1139,7 +1169,7 @@ fn init_schema(conn: &Connection) -> Result<(), GatewayError> {
          );
 
          CREATE TABLE IF NOT EXISTS quota_snapshots (
-             upstream TEXT PRIMARY KEY,
+             upstream_id TEXT NOT NULL PRIMARY KEY,
              payload_json TEXT NOT NULL,
              fetched_at INTEGER NOT NULL
          );",
@@ -1195,7 +1225,123 @@ fn init_schema(conn: &Connection) -> Result<(), GatewayError> {
     {
         return Err(db_err(err));
     }
-    Ok(())
+    migrate_upstream_ids(conn, master_key)
+}
+
+fn migrate_upstream_ids(conn: &Connection, master_key: &[u8; 32]) -> Result<(), GatewayError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(db_err)?;
+    if tx
+        .prepare("SELECT upstream_id FROM request_logs LIMIT 0")
+        .is_err()
+    {
+        tx.execute("ALTER TABLE request_logs ADD COLUMN upstream_id TEXT", [])
+            .map_err(db_err)?;
+    }
+    if tx.prepare("SELECT id FROM upstreams LIMIT 0").is_ok() {
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS upstreams_display_name ON upstreams(name)",
+            [],
+        )
+        .map_err(db_err)?;
+        return tx.commit().map_err(db_err);
+    }
+
+    let records = {
+        let mut query = tx
+            .prepare("SELECT name, nonce, ciphertext FROM upstreams")
+            .map_err(db_err)?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut configs = Vec::new();
+        for row in rows {
+            let (name, nonce, ciphertext) = row.map_err(db_err)?;
+            let mut cfg: UpstreamConfig =
+                serde_json::from_slice(&decrypt_bytes(master_key, &nonce, &ciphertext)?).map_err(
+                    |err| {
+                        GatewayError::Internal(format!("invalid upstream during migration: {err}"))
+                    },
+                )?;
+            cfg.name = name;
+            cfg.id = GatewayDb::new_upstream_id();
+            configs.push(cfg);
+        }
+        configs
+    };
+
+    let mut account_counts = HashMap::<&str, usize>::new();
+    for account in records
+        .iter()
+        .filter_map(UpstreamConfig::legacy_oauth_account)
+    {
+        *account_counts.entry(account).or_default() += 1;
+    }
+    tx.execute_batch(
+        "ALTER TABLE upstreams RENAME TO upstreams_by_name;
+         CREATE TABLE upstreams (
+            id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL, nonce BLOB NOT NULL,
+            ciphertext BLOB NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+         );
+         CREATE INDEX upstreams_display_name ON upstreams(name);",
+    )
+    .map_err(db_err)?;
+    let legacy_quota = tx
+        .prepare("SELECT upstream FROM quota_snapshots LIMIT 0")
+        .is_ok();
+    if legacy_quota {
+        tx.execute(
+            "ALTER TABLE quota_snapshots RENAME COLUMN upstream TO upstream_id",
+            [],
+        )
+        .map_err(db_err)?;
+    }
+    for cfg in &records {
+        tx.execute(
+            "INSERT INTO upstreams (id, name, nonce, ciphertext, created_at, updated_at)
+             SELECT ?1, name, nonce, ciphertext, created_at, updated_at FROM upstreams_by_name WHERE name = ?2",
+            params![cfg.id, cfg.name],
+        ).map_err(db_err)?;
+        if let Some(account) = cfg.legacy_oauth_account()
+            && account_counts[account] == 1
+        {
+            tx.execute(
+                "INSERT INTO oauth_tokens (account_id, nonce, ciphertext, updated_at)
+                 SELECT ?1, nonce, ciphertext, updated_at FROM oauth_tokens WHERE account_id = ?2",
+                params![cfg.oauth_storage_key(), account],
+            )
+            .map_err(db_err)?;
+        }
+    }
+    tx.execute_batch(
+        "UPDATE users SET allowed_upstreams = (
+             SELECT json_group_array(u.id) FROM json_each(users.allowed_upstreams) AS entry
+             JOIN upstreams AS u ON u.name = entry.value
+         ) WHERE json_valid(allowed_upstreams);
+         UPDATE client_keys SET allowed_upstreams = (
+             SELECT json_group_array(u.id) FROM json_each(client_keys.allowed_upstreams) AS entry
+             JOIN upstreams AS u ON u.name = entry.value
+         ) WHERE json_valid(allowed_upstreams);
+         UPDATE settings SET value = (
+             SELECT json_group_array(u.id) FROM json_each(settings.value) AS entry
+             JOIN upstreams AS u ON u.name = entry.value
+         ) WHERE key = 'default_user_allowed_upstreams' AND json_valid(value);
+         UPDATE request_logs SET upstream_id = (SELECT u.id FROM upstreams AS u WHERE u.name = request_logs.upstream);
+         DROP TABLE upstreams_by_name;",
+    ).map_err(db_err)?;
+    if legacy_quota {
+        tx.execute_batch(
+            "DELETE FROM quota_snapshots WHERE NOT EXISTS (SELECT 1 FROM upstreams AS u WHERE u.name = upstream_id);
+             UPDATE quota_snapshots SET upstream_id = (SELECT u.id FROM upstreams AS u WHERE u.name = upstream_id);",
+        ).map_err(db_err)?;
+    }
+    tx.commit().map_err(db_err)
 }
 
 fn read_request_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogEntry> {
@@ -1205,6 +1351,7 @@ fn read_request_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestLogEntry
         user_id: row.get(1)?,
         timestamp_secs: row.get::<_, i64>(2)? as u64,
         upstream: row.get(3)?,
+        upstream_id: row.get(19)?,
         model: row.get(4)?,
         path: row.get(5)?,
         status: row.get::<_, i64>(6)? as u16,
@@ -1315,6 +1462,126 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_channel_ids_without_sharing_ambiguous_oauth_tokens() {
+        let key = [41; 32];
+        let db = GatewayDb::open_in_memory(key).unwrap();
+        let legacy_config = |name: &str, owner: i64, account: &str| {
+            serde_json::from_value::<UpstreamConfig>(serde_json::json!({
+                "name": name, "owner_user_id": owner, "base_url": "https://api.anthropic.com",
+                "protocol": "anthropic", "auth": {"type":"oauth", "preset":"claude_code", "account_id":account},
+            })).unwrap()
+        };
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TABLE upstreams;
+                 CREATE TABLE upstreams (name TEXT PRIMARY KEY, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL,
+                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 ALTER TABLE quota_snapshots RENAME COLUMN upstream_id TO upstream;",
+            ).unwrap();
+            for up in [
+                legacy_config("work", 1, "single"),
+                legacy_config("a", 1, "shared"),
+                legacy_config("b", 2, "shared"),
+            ] {
+                let (nonce, ct) = encrypt_bytes(&key, &serde_json::to_vec(&up).unwrap()).unwrap();
+                conn.execute(
+                    "INSERT INTO upstreams VALUES (?1, ?2, ?3, 1, 1)",
+                    params![up.name, nonce, ct],
+                )
+                .unwrap();
+            }
+            conn.execute("INSERT INTO settings VALUES ('default_user_allowed_upstreams', '[\"work\",\"missing\"]', 0)", []).unwrap();
+            conn.execute(
+                "INSERT INTO quota_snapshots VALUES ('work', ?1, 1)",
+                params![
+                    r#"{"upstream":"work","probe":"claude_code","status":"healthy","fetched_at":1}"#
+                ],
+            )
+            .unwrap();
+        }
+        for account in ["single", "shared"] {
+            db.put(
+                account,
+                StoredOAuthToken {
+                    access_token: format!("token-{account}"),
+                    refresh_token: None,
+                    expires_at: None,
+                    token_type: None,
+                    scope: None,
+                    extra: HashMap::new(),
+                },
+            )
+            .unwrap();
+        }
+        db.upsert_client_key(&ClientKeyConfig {
+            key: "legacy-key".into(),
+            name: String::new(),
+            enabled: true,
+            restrict_upstreams: true,
+            allowed_upstreams: vec!["work".into(), "missing".into()],
+            restrict_models: false,
+            allowed_models: Vec::new(),
+            owner_user_id: None,
+        })
+        .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            migrate_upstream_ids(&conn, &key).unwrap();
+            migrate_upstream_ids(&conn, &key).unwrap();
+        }
+        let upstreams = db.list_upstreams().unwrap();
+        let work = upstreams.iter().find(|up| up.name == "work").unwrap();
+        assert_ne!(work.id, work.name);
+        assert_eq!(
+            db.get(&work.oauth_storage_key())
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "token-single"
+        );
+        for up in upstreams.iter().filter(|up| up.id != work.id) {
+            assert!(db.get(&up.oauth_storage_key()).unwrap().is_none());
+        }
+        assert_eq!(
+            db.list_client_keys().unwrap()[0].allowed_upstreams,
+            [work.id.clone()]
+        );
+        let setting = db
+            .get_setting("default_user_allowed_upstreams")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&setting).unwrap(),
+            [work.id.clone()]
+        );
+        assert!(db.list_quota_snapshots().unwrap().contains_key(&work.id));
+
+        let mut renamed = work.clone();
+        renamed.name = "b".into();
+        db.upsert_upstream(&renamed).unwrap();
+        assert_eq!(
+            db.list_upstreams()
+                .unwrap()
+                .iter()
+                .filter(|up| up.name == "b")
+                .count(),
+            2
+        );
+        assert_eq!(renamed.oauth_storage_key(), work.oauth_storage_key());
+        db.delete_upstream(&renamed.id).unwrap();
+        assert!(db.get(&renamed.oauth_storage_key()).unwrap().is_none());
+        assert_eq!(
+            db.list_upstreams()
+                .unwrap()
+                .iter()
+                .filter(|up| up.name == "b")
+                .count(),
+            1
+        );
+    }
     use std::collections::HashMap;
     use ttt_core::{ProtocolFamily, UpstreamAuthConfig};
 
@@ -1363,6 +1630,7 @@ mod tests {
         let db = GatewayDb::open_in_memory([11u8; 32]).unwrap();
 
         let up = UpstreamConfig {
+            id: "up_deepseek".into(),
             name: "deepseek".into(),
             base_url: "https://api.deepseek.com/v1".into(),
             protocol: ProtocolFamily::OpenAi,
@@ -1390,7 +1658,7 @@ mod tests {
         let list = db.list_upstreams().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "deepseek");
-        assert!(db.delete_upstream("deepseek").unwrap());
+        assert!(db.delete_upstream(&up.id).unwrap());
         assert!(db.list_upstreams().unwrap().is_empty());
 
         let key = ClientKeyConfig {
@@ -1441,6 +1709,7 @@ mod tests {
             username: Some("alice".into()),
             timestamp_secs: 1_700_000_000,
             upstream: "deepseek".into(),
+            upstream_id: None,
             model: Some("deepseek-chat".into()),
             path: "/v1/chat/completions".into(),
             status: 200,
@@ -1492,7 +1761,7 @@ mod tests {
                 [user.id],
             )
             .unwrap();
-            init_schema(&conn).unwrap();
+            init_schema(&conn, &[9_u8; 32]).unwrap();
         }
 
         let logs = db.load_recent_logs(10).unwrap();

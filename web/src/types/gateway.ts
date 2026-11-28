@@ -74,6 +74,7 @@ export interface OAuthStatusView {
   expires_in_secs?: number;
   can_login_pkce: boolean;
   can_refresh: boolean;
+  reauthorization_required?: boolean;
   client_id?: string | null;
   effective_client_id?: string;
   redirect_uri?: string | null;
@@ -87,6 +88,7 @@ export interface AntigravityOAuthDefaults {
 }
 
 export interface UpstreamView {
+  id: string;
   name: string;
   base_url: string;
   protocol: ProtocolFamily;
@@ -151,6 +153,7 @@ export type QuotaDimension =
 
 export interface QuotaSnapshot {
   upstream: string;
+  upstream_id?: string;
   probe: QuotaProbeKind;
   status: QuotaStatus;
   dimensions: QuotaDimension[];
@@ -161,6 +164,7 @@ export interface QuotaSnapshot {
 }
 
 export interface UpstreamStats {
+  name: string;
   requests: number;
   errors: number;
   input_tokens: number;
@@ -175,6 +179,7 @@ export interface ActiveRequest {
   user_id?: number;
   username?: string;
   upstream: string;
+  upstream_id?: string;
   model?: string | null;
   path: string;
   elapsed_ms: number;
@@ -192,6 +197,7 @@ export interface RequestLogEntry {
   username?: string;
   timestamp_secs: number;
   upstream: string;
+  upstream_id?: string;
   model?: string;
   path: string;
   status: number;

@@ -9,9 +9,9 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use ttt_core::{GatewayError, OAuthPreset, TokenRequestFormat, UpstreamAuthConfig};
 
+use crate::Credential;
 use crate::client::OAuthHttpClient;
 use crate::store::{StoredOAuthToken, TokenStore};
-use crate::Credential;
 
 /// Immutable snapshot of an OAuth token pair stored in `ArcSwap`.
 #[derive(Debug, Clone)]
@@ -21,6 +21,7 @@ pub struct OAuthTokenState {
     pub refresh_token: Option<String>,
     pub expires_at: Option<u64>,
     pub antigravity_project_id: Option<String>,
+    pub reauthorization_required: bool,
     /// Pre-formatted header value for O(1) zero-alloc hot-path reads.
     pub header_value: HeaderValue,
 }
@@ -100,7 +101,11 @@ impl OAuthTokenManager {
             .as_ref()
             .and_then(StoredOAuthToken::antigravity_project_id)
             .map(str::to_owned);
+        let reauthorization_required = stored
+            .as_ref()
+            .is_some_and(StoredOAuthToken::requires_reauthorization);
         let (access_token, refresh_token, expires_at) = match stored {
+            Some(_) if reauthorization_required => (String::new(), None, None),
             Some(tok) => (
                 tok.access_token,
                 tok.refresh_token.or(initial_refresh_token),
@@ -125,6 +130,7 @@ impl OAuthTokenManager {
             refresh_token,
             expires_at,
             antigravity_project_id,
+            reauthorization_required,
             header_value,
         };
 
@@ -159,6 +165,9 @@ impl OAuthTokenManager {
     /// Returns whether the current token is missing, expired, or within `leeway_secs` of expiring.
     pub fn needs_proactive_refresh(&self) -> bool {
         let guard = self.state.load();
+        if guard.reauthorization_required {
+            return false;
+        }
         if guard.access_token.is_empty() {
             return self.can_refresh();
         }
@@ -179,6 +188,9 @@ impl OAuthTokenManager {
             return false;
         }
         let guard = self.state.load();
+        if guard.reauthorization_required {
+            return false;
+        }
         let has_refresh_token = guard.refresh_token.is_some();
         if self.meta.preset == Some(OAuthPreset::Antigravity) {
             return has_refresh_token
@@ -189,8 +201,7 @@ impl OAuthTokenManager {
                 )
                 .is_ok();
         }
-        let has_client_creds =
-            self.meta.client_id.is_some() && self.meta.client_secret.is_some();
+        let has_client_creds = self.meta.client_id.is_some() && self.meta.client_secret.is_some();
         has_refresh_token || has_client_creds
     }
 
@@ -210,7 +221,12 @@ impl OAuthTokenManager {
             refresh_token: record.refresh_token.clone(),
             expires_at: record.expires_at,
             antigravity_project_id: record.antigravity_project_id().map(str::to_owned),
-            header_value: build_header_value(self.prefix.as_deref(), &record.access_token)?,
+            reauthorization_required: record.requires_reauthorization(),
+            header_value: if record.access_token.is_empty() {
+                HeaderValue::from_static("")
+            } else {
+                build_header_value(self.prefix.as_deref(), &record.access_token)?
+            },
         };
         if let Some(store) = &self.store
             && let Err(err) = store.put(&self.meta.account_id, record)
@@ -309,10 +325,10 @@ impl OAuthTokenManager {
                     )
                     .await
             } else if meta.preset == Some(OAuthPreset::Antigravity) {
-                Err(GatewayError::Auth("Antigravity 缺少 refresh token，请重新授权".into()))
-            } else if let (Some(cid), Some(secret)) =
-                (meta.client_id.as_deref(), client_secret)
-            {
+                Err(GatewayError::Auth(
+                    "Antigravity 缺少 refresh token，请重新授权".into(),
+                ))
+            } else if let (Some(cid), Some(secret)) = (meta.client_id.as_deref(), client_secret) {
                 info!(
                     account_id = %meta.account_id,
                     "acquiring OAuth access token via client_credentials grant"
@@ -344,6 +360,9 @@ impl OAuthTokenManager {
 
         // Double-check after acquiring the lock: another caller may have already refreshed.
         let current = self.state.load();
+        if current.reauthorization_required {
+            return Err(GatewayError::OAuthReauthorizationRequired);
+        }
         if current.generation != failed_generation {
             return Ok(Credential {
                 header_name: self.header_name.clone(),
@@ -351,9 +370,24 @@ impl OAuthTokenManager {
             });
         }
 
-        let mut record = refresh_fn(self.meta.clone(), current.refresh_token.clone())
-            .await?
-            .into_stored();
+        let mut record = match refresh_fn(self.meta.clone(), current.refresh_token.clone()).await {
+            Ok(token) => token.into_stored(),
+            Err(GatewayError::OAuthReauthorizationRequired) => {
+                self.replace_token(
+                    StoredOAuthToken {
+                        access_token: String::new(),
+                        refresh_token: None,
+                        expires_at: None,
+                        token_type: None,
+                        scope: None,
+                        extra: HashMap::from([("reauthorization_required".into(), "true".into())]),
+                    },
+                    false,
+                )?;
+                return Err(GatewayError::OAuthReauthorizationRequired);
+            }
+            Err(error) => return Err(error),
+        };
         record.refresh_token = record
             .refresh_token
             .or_else(|| current.refresh_token.clone());
@@ -393,6 +427,69 @@ fn now_epoch_secs() -> u64 {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn revoked_refresh_is_persisted_until_new_login() {
+        let path =
+            std::env::temp_dir().join(format!("ttt-revoked-oauth-{}.enc", std::process::id()));
+        let store = Arc::new(crate::EncryptedTokenStore::with_key(&path, [43; 32]));
+        let make_manager = || {
+            OAuthTokenManager::new(
+                "authorization",
+                Some("Bearer ".into()),
+                OAuthClientMeta {
+                    account_id: "upstream:user:3:up_revoked".into(),
+                    preset: Some(OAuthPreset::ClaudeCode),
+                    token_url: Some("https://example.invalid/oauth/token".into()),
+                    authorize_url: None,
+                    device_code_url: None,
+                    client_id: Some("local".into()),
+                    client_secret: None,
+                    scopes: Vec::new(),
+                    redirect_uri: None,
+                    token_format: TokenRequestFormat::Json,
+                    proactive_refresh_leeway_secs: 300,
+                },
+                Some("initial-token".into()),
+                Some("initial-refresh".into()),
+                None,
+                Some(store.clone()),
+            )
+            .unwrap()
+        };
+        let mgr = make_manager();
+        let rejected = mgr
+            .refresh_singleflight(mgr.current_state().generation, |_, _| async {
+                Err(GatewayError::OAuthReauthorizationRequired)
+            })
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(GatewayError::OAuthReauthorizationRequired)
+        ));
+        assert!(!mgr.can_refresh());
+        assert!(!mgr.needs_proactive_refresh());
+        let reloaded = make_manager();
+        assert!(reloaded.current_state().reauthorization_required);
+        assert!(reloaded.current_state().access_token.is_empty());
+        reloaded
+            .install_login(
+                RefreshedToken {
+                    access_token: "new-token".into(),
+                    refresh_token: Some("new-refresh".into()),
+                    expires_at: None,
+                    token_type: None,
+                    scope: None,
+                }
+                .into_stored(),
+            )
+            .await
+            .unwrap();
+        let reloaded = make_manager();
+        assert!(reloaded.can_refresh());
+        assert_eq!(reloaded.current_state().access_token, "new-token");
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[tokio::test]
     async fn singleflight_coalesces_concurrent_refreshes() {

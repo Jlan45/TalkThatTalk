@@ -11,7 +11,7 @@
 - **同协议零拷贝透传**：当下游与上游协议一致且无需改写模型时，直接流式透传 `hyper::body::Incoming`，不做全量 JSON 反序列化。
 - **零反序列化模型路由与切片改写**：使用 SIMD `memchr::memmem` 在原始字节中定位 `"model"` 字段，并通过三段式零拷贝 `SegmentedBody` 完成模型别名映射。
 - **零拷贝 SSE 旁路计量**：`TapBody` 通过 O(1) `Bytes::clone()` 切片异步采集 TTFT 与 Token 用量，`UsageAccumulator` 在热路径之外批量写入 SQLite。
-- **首包前失败重试与 401 无感刷新**：遇到 `429`/`502`/`503`/`504` 自动切换健康上游；OAuth Token 过期返回 `401` 时通过 `Singleflight` 自动刷新并透明重试。
+- **首包前失败重试与 401 无感刷新**：遇到可重试的 `429` 或上游过载可切换健康上游；OAuth Token 过期返回 `401` 时通过 `Singleflight` 自动刷新并重试，撤销的授权会提示重新登录。
 
 ### 2. 多协议支持与互转（`ttt-protocol`）
 - 支持 **OpenAI Chat Completions**（`/v1/chat/completions`）、**OpenAI Responses**（`/v1/responses`）、**Anthropic Messages**（`/v1/messages`）、**Google Gemini** 以及 **OpenCode Go** 接入。
@@ -116,13 +116,16 @@ cargo build --release --bin talkthattalk
 ```bash
 cp config.example.toml config.toml
 
-# 登录 OAuth 上游（Codex / Claude Code）
-./target/release/talkthattalk auth login --upstream codex-oauth --config config.toml
-./target/release/talkthattalk auth login --upstream claude-code-oauth --config config.toml
+# 登录 OAuth 上游（传入渠道 ID）
+./target/release/talkthattalk auth login --upstream '<渠道 ID>' --config config.toml
 
 # 查看 Token 状态
 ./target/release/talkthattalk auth status --config config.toml
 ```
+
+渠道名称可以修改或重复。管理接口、OAuth 和用户渠道授权都使用渠道 ID。`X-TTT-Preferred-Upstream` 优先接受渠道 ID，也兼容唯一的旧渠道名称。响应里的 `X-TTT-Upstream-Id` 标识实际渠道，`X-TTT-Upstream` 显示其名称。升级时 SQLite 会为旧渠道生成 ID，并迁移可识别的权限、额度和请求记录。旧 OAuth 账户键若被多个渠道共用，对应渠道需要重新授权。
+
+Claude Code 建议使用控制台的「Anthropic API · Claude Code」渠道。CLI 设置 `ANTHROPIC_BASE_URL` 为网关地址，并用 `ANTHROPIC_AUTH_TOKEN` 传 TalkThatTalk 的客户端 Key。可用 `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` 在 CLI 中发现已配置且当前 Key 有权使用的 Claude 模型。原生 Anthropic 渠道支持 `/v1/messages` 和 `/v1/messages/count_tokens`。使用支持函数调用的 OpenAI Chat 或 Responses 上游时，网关会转换普通函数调用和结果。Claude 原生的思考签名、原生服务器工具和专属 beta 功能适用于原生 Anthropic 渠道。
 
 Antigravity 预设沿用 `pi-antigravity 0.15.0` 发布包中的桌面 OAuth Client ID（App ID）、配套 Client Secret 和授权范围。Release 构建会导入默认客户端，保存渠道即可发起授权。控制台显示实际使用的 App ID。离线构建或使用自己的 OAuth 应用时，可为渠道填写配套的 Client ID 和 Client Secret，或在服务端同时设置 `ANTIGRAVITY_CLIENT_ID` 和 `ANTIGRAVITY_CLIENT_SECRET`。通过安装脚本部署时，可将环境变量写入仅管理员可读的 `/etc/talkthattalk/environment`，再重启服务。默认 Redirect URI 为 `http://localhost:51121/oauth-callback`，也可填写与 OAuth 客户端配置一致的地址。授权后网关会发现并保存账号的 Project ID，供模型请求和后续令牌刷新使用。
 

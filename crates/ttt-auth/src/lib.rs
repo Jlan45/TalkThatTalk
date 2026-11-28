@@ -7,7 +7,7 @@ pub mod store;
 use std::sync::Arc;
 
 use http::header::{HeaderName, HeaderValue};
-use ttt_core::{GatewayError, UpstreamAuthConfig};
+use ttt_core::{GatewayError, UpstreamAuthConfig, UpstreamConfig};
 
 pub use api_key::ApiKeyPool;
 pub use client::{DeviceCodeResponse, OAuthHttpClient, TokenEndpointResponse};
@@ -38,10 +38,10 @@ pub enum AuthProvider {
 
 impl AuthProvider {
     pub fn from_config(
-        upstream_name: &str,
-        cfg: &UpstreamAuthConfig,
+        upstream: &UpstreamConfig,
         token_store: Option<Arc<dyn TokenStore>>,
     ) -> Result<Self, GatewayError> {
+        let cfg = &upstream.auth;
         match cfg {
             UpstreamAuthConfig::ApiKey {
                 keys,
@@ -63,7 +63,6 @@ impl AuthProvider {
                 scopes,
                 redirect_uri,
                 token_request_format,
-                account_id,
                 proactive_refresh_leeway_secs,
                 header_name,
                 prefix,
@@ -81,9 +80,7 @@ impl AuthProvider {
                     scopes.clone()
                 };
                 let meta = OAuthClientMeta {
-                    account_id: account_id
-                        .clone()
-                        .unwrap_or_else(|| upstream_name.to_string()),
+                    account_id: upstream.oauth_storage_key(),
                     preset: *preset,
                     token_url: token_url
                         .clone()

@@ -332,6 +332,7 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
         routing: Default::default(),
         upstreams: vec![
             UpstreamConfig {
+                id: String::new(),
                 name: "api-base-up".into(),
                 base_url: format!("http://{up_api_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -356,6 +357,7 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "oauth-up".into(),
                 base_url: format!("http://{up_oauth_addr}"),
                 protocol: ProtocolFamily::Anthropic,
@@ -393,6 +395,7 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "flaky-primary".into(),
                 base_url: format!("http://{up_flaky_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -417,6 +420,7 @@ async fn e2e_api_key_rewrite_oauth_sse_tap_and_retry() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "healthy-backup".into(),
                 base_url: format!("http://{up_api_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -683,6 +687,7 @@ async fn e2e_oauth_401_singleflight_refresh_rotation_and_persistence() {
         routing: Default::default(),
         upstreams: vec![
             UpstreamConfig {
+                id: String::new(),
                 name: "claude-code-up".into(),
                 base_url: format!("http://{llm_addr}"),
                 protocol: ProtocolFamily::Anthropic,
@@ -720,6 +725,7 @@ async fn e2e_oauth_401_singleflight_refresh_rotation_and_persistence() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "codex-up".into(),
                 base_url: format!("http://{llm_addr}"),
                 protocol: ProtocolFamily::OpenAiResponses,
@@ -1220,6 +1226,7 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
         routing: Default::default(),
         upstreams: vec![
             UpstreamConfig {
+                id: String::new(),
                 name: "anthropic-up".into(),
                 base_url: format!("http://{anthropic_addr}/v1"),
                 protocol: ProtocolFamily::Anthropic,
@@ -1244,6 +1251,7 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "gemini-up".into(),
                 base_url: format!("http://{gemini_addr}/v1beta"),
                 protocol: ProtocolFamily::Gemini,
@@ -1268,6 +1276,7 @@ async fn e2e_cross_protocol_translation_streaming_and_non_streaming() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "deepseek-openai-up".into(),
                 base_url: format!("http://{openai_addr}/v1"),
                 protocol: ProtocolFamily::OpenAi,
@@ -1518,6 +1527,7 @@ async fn e2e_client_key_provider_and_model_restrictions() {
         routing: Default::default(),
         upstreams: vec![
             UpstreamConfig {
+                id: String::new(),
                 name: "provider-a".into(),
                 base_url: format!("http://{up_a_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -1542,6 +1552,7 @@ async fn e2e_client_key_provider_and_model_restrictions() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "provider-b 测试".into(),
                 base_url: format!("http://{up_b_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -1825,6 +1836,7 @@ async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
         oauth_storage: OAuthStorageConfig::default(),
         routing: Default::default(),
         upstreams: vec![UpstreamConfig {
+            id: String::new(),
             name: "volcengine-agent-plan".into(),
             base_url: String::new(),
             protocol: ProtocolFamily::Anthropic,
@@ -2021,7 +2033,7 @@ async fn e2e_multi_protocol_endpoints_zero_copy_routing() {
 }
 
 #[tokio::test]
-async fn e2e_claude_code_oauth_compat_mode() {
+async fn e2e_claude_code_preserves_native_request_and_routes_token_count() {
     let (mock_addr, _hm) = spawn_mock_upstream(|req| async move {
         let pq = req
             .uri()
@@ -2049,6 +2061,15 @@ async fn e2e_claude_code_oauth_compat_mode() {
             .to_string();
         let body = req.into_body().collect().await.unwrap().to_bytes();
         let body_str = String::from_utf8_lossy(&body).into_owned();
+        if pq.starts_with("/v1/messages/count_tokens") {
+            let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(payload.get("max_tokens").is_none());
+            assert_eq!(pq, "/v1/messages/count_tokens?beta=true");
+            return Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(full_body(r#"{"input_tokens":42}"#))
+                .unwrap();
+        }
         let resp_json = serde_json::json!({
             "id": "msg_cc",
             "model": "claude-sonnet-4-20250514",
@@ -2078,6 +2099,7 @@ async fn e2e_claude_code_oauth_compat_mode() {
         oauth_storage: OAuthStorageConfig::default(),
         routing: Default::default(),
         upstreams: vec![UpstreamConfig {
+            id: "up_claude".into(),
             name: "claude-code-oauth".into(),
             base_url: format!("http://{mock_addr}"),
             protocol: ProtocolFamily::Anthropic,
@@ -2119,11 +2141,12 @@ async fn e2e_claude_code_oauth_compat_mode() {
     let (gw_addr, _tap_rx, _gw) = spawn_gateway(cfg, None).await;
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
 
-    // 1. OpenAI client calling Claude Code OAuth -> gets ?beta=true, CLI headers, merged beta, system identity block
+    // Cross-protocol requests use the caller identity and system prompt.
     let resp = client
         .request(
             Request::post(format!("http://{gw_addr}/v1/chat/completions"))
                 .header(header::CONTENT_TYPE, "application/json")
+                .header(header::USER_AGENT, "test-openai-client")
                 .body(Full::new(Bytes::from_static(
                     br#"{"model":"claude-sonnet-4-20250514","messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}"#,
                 )))
@@ -2132,41 +2155,23 @@ async fn e2e_claude_code_oauth_compat_mode() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(
-        resp.headers().get("x-seen-pq").unwrap().to_str().unwrap(),
-        "/v1/messages?beta=true"
-    );
-    let beta = resp.headers().get("x-seen-beta").unwrap().to_str().unwrap();
-    assert!(beta.contains("claude-code-20250219"));
-    assert!(beta.contains("oauth-2025-04-20"));
-    assert!(
-        resp.headers()
-            .get("x-seen-ua")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("claude-cli/")
-    );
-    assert_eq!(
-        resp.headers().get("x-seen-xapp").unwrap().to_str().unwrap(),
-        "cli"
-    );
+    assert_eq!(resp.headers()["x-ttt-upstream-id"], "up_claude");
+    assert_eq!(resp.headers()["x-seen-pq"], "/v1/messages");
+    assert_eq!(resp.headers()["x-seen-beta"], "");
+    assert_eq!(resp.headers()["x-seen-ua"], "test-openai-client");
+    assert_eq!(resp.headers()["x-seen-xapp"], "");
     let oai_resp: serde_json::Value =
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let sent_body: serde_json::Value =
         serde_json::from_str(oai_resp["choices"][0]["message"]["content"].as_str().unwrap())
             .unwrap();
-    assert_eq!(
-        sent_body["system"][0]["text"],
-        "You are Claude Code, Anthropic's official CLI for Claude."
-    );
-    assert_eq!(sent_body["system"][1]["text"], "be brief");
+    assert_eq!(sent_body["system"], "be brief");
 
-    // 2. Real Claude Code CLI client -> preserves its UA, merges beta flags, and does NOT mutate body
+    // The native request keeps its headers and block-form body.
     let raw_cli = br#"{"model":"claude-sonnet-4-20250514","system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#;
     let resp = client
         .request(
-            Request::post(format!("http://{gw_addr}/v1/messages"))
+            Request::post(format!("http://{gw_addr}/v1/messages?beta=true"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::USER_AGENT, "claude-cli/2.1.300 (external, cli)")
                 .header("anthropic-beta", "prompt-caching-2024-07-31")
@@ -2181,14 +2186,145 @@ async fn e2e_claude_code_oauth_compat_mode() {
         "claude-cli/2.1.300 (external, cli)"
     );
     let beta2 = resp.headers().get("x-seen-beta").unwrap().to_str().unwrap();
-    assert!(beta2.contains("prompt-caching-2024-07-31"));
-    assert!(beta2.contains("oauth-2025-04-20"));
+    assert_eq!(beta2, "prompt-caching-2024-07-31");
     let ant_resp: serde_json::Value =
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(
         ant_resp["content"][0]["text"].as_str().unwrap().as_bytes(),
         raw_cli
     );
+    let count = client.request(
+        Request::post(format!("http://{gw_addr}/v1/messages/count_tokens?beta=true"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from_static(
+                br#"{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}"#,
+            )))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(count.status(), StatusCode::OK);
+    assert_eq!(
+        count.into_body().collect().await.unwrap().to_bytes(),
+        r#"{"input_tokens":42}"#
+    );
+}
+
+#[tokio::test]
+async fn claude_code_completes_parallel_tools_over_chat_and_responses() {
+    use serde_json::{Value, json};
+
+    for responses in [false, true] {
+        let (upstream, _upstream_task) = spawn_mock_upstream(move |req| async move {
+            assert_eq!(req.uri().path(), if responses { "/responses" } else { "/chat/completions" });
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            let finished = if responses {
+                assert_eq!(body["tools"][0]["name"], "lookup");
+                let results: Vec<_> = body["input"].as_array().unwrap().iter()
+                    .filter(|item| item["type"] == "function_call_output").collect();
+                if !results.is_empty() {
+                    assert_eq!(results[0]["call_id"], "call-a");
+                    assert_eq!(results[1]["output"], "second result");
+                }
+                !results.is_empty()
+            } else {
+                assert_eq!(body["tools"][0]["function"]["name"], "lookup");
+                let results: Vec<_> = body["messages"].as_array().unwrap().iter()
+                    .filter(|item| item["role"] == "tool").collect();
+                if !results.is_empty() {
+                    assert_eq!(results[0]["tool_call_id"], "call-a");
+                    assert_eq!(results[1]["content"], "second result");
+                }
+                !results.is_empty()
+            };
+            let events = match (responses, finished) {
+                (true, false) => vec![
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"id":"item-a","type":"function_call","call_id":"call-a","name":"lookup","arguments":""}}),
+                    json!({"type":"response.output_item.added","output_index":1,"item":{"id":"item-b","type":"function_call","call_id":"call-b","name":"lookup","arguments":""}}),
+                    json!({"type":"response.function_call_arguments.delta","item_id":"item-a","delta":"{\"n\":"}),
+                    json!({"type":"response.function_call_arguments.delta","item_id":"item-b","delta":"{}"}),
+                    json!({"type":"response.function_call_arguments.delta","item_id":"item-a","delta":"1}"}),
+                    json!({"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":3}}}),
+                ],
+                (false, false) => vec![
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","function":{"name":"lookup","arguments":"{\"n\":"}},{"index":1,"id":"call-b","function":{"name":"lookup","arguments":"{}"}}]}}]}),
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":"tool_calls"}]}),
+                    json!({"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+                ],
+                (true, true) => vec![
+                    json!({"type":"response.output_text.delta","delta":"finished"}),
+                    json!({"type":"response.completed","response":{}}),
+                ],
+                (false, true) => vec![json!({"choices":[{"delta":{"content":"finished"},"finish_reason":"stop"}]})],
+            };
+            let mut stream: String = events.into_iter().map(|event| format!("data: {event}\n\n")).collect();
+            if !responses {
+                stream.push_str("data: [DONE]\n\n");
+            }
+            Response::builder().header(header::CONTENT_TYPE, "text/event-stream")
+                .body(full_body(stream)).unwrap()
+        }).await;
+
+        let cfg: GatewayConfig = serde_json::from_value(json!({"upstreams": [{
+            "id": "up_agent", "name": "agent", "base_url": format!("http://{upstream}"),
+            "protocol": if responses { "openai_responses" } else { "openai" },
+            "auth": {"type":"api_key", "keys":["mock-key"]},
+        }]})).unwrap();
+        let (gateway, _, _gateway_task) = spawn_gateway(cfg, None).await;
+        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+        let send = |body: Value| {
+            let client = &client;
+            async move {
+                let resp = client
+                    .request(
+                        Request::post(format!("http://{gateway}/v1/messages?beta=true"))
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Full::new(Bytes::from(body.to_string())))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|data| serde_json::from_str::<Value>(data).unwrap())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let mut body = json!({"model":"agent","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hello"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}]});
+        let first = send(body.clone()).await;
+        let calls: Vec<_> = first
+            .iter()
+            .filter_map(|event| event.get("content_block"))
+            .collect();
+        assert_eq!(calls[0]["id"], "call-a");
+        assert_eq!(calls[1]["id"], "call-b");
+        let args = first
+            .iter()
+            .find(|event| event["delta"]["type"] == "input_json_delta")
+            .unwrap();
+        assert_eq!(args["delta"]["partial_json"], r#"{"n":1}"#);
+        let final_delta = first
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(final_delta["delta"]["stop_reason"], "tool_use");
+        assert_eq!(final_delta["usage"]["input_tokens"], 7);
+        assert_eq!(first.last().unwrap()["type"], "message_stop");
+        body["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","content":[{"type":"tool_use","id":"call-a","name":"lookup","input":{"n":1}},{"type":"tool_use","id":"call-b","name":"lookup","input":{}}]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"call-a","content":"first result"},{"type":"tool_result","tool_use_id":"call-b","content":"second result"}]}),
+        ]);
+        let second = send(body).await;
+        assert!(
+            second
+                .iter()
+                .any(|event| event["delta"]["text"] == "finished")
+        );
+        assert_eq!(second.last().unwrap()["type"], "message_stop");
+    }
 }
 
 #[tokio::test]
@@ -2263,6 +2399,7 @@ async fn e2e_multi_agent_session_and_prefix_affinity_and_failover() {
         routing: Default::default(),
         upstreams: vec![
             UpstreamConfig {
+                id: String::new(),
                 name: "up-a".into(),
                 base_url: format!("http://{up_a_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -2290,6 +2427,7 @@ async fn e2e_multi_agent_session_and_prefix_affinity_and_failover() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "up-b".into(),
                 base_url: format!("http://{up_b_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -2317,6 +2455,7 @@ async fn e2e_multi_agent_session_and_prefix_affinity_and_failover() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "flaky-up".into(),
                 base_url: format!("http://{flaky_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -2341,6 +2480,7 @@ async fn e2e_multi_agent_session_and_prefix_affinity_and_failover() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "backup-up".into(),
                 base_url: format!("http://{up_b_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -2365,6 +2505,7 @@ async fn e2e_multi_agent_session_and_prefix_affinity_and_failover() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "priv-u1".into(),
                 base_url: format!("http://{priv_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -2389,6 +2530,7 @@ async fn e2e_multi_agent_session_and_prefix_affinity_and_failover() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "global-wild".into(),
                 base_url: format!("http://{up_a_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -2643,6 +2785,7 @@ async fn e2e_outbound_provider_session_header_translation() {
         routing: Default::default(),
         upstreams: vec![
             UpstreamConfig {
+                id: String::new(),
                 name: "plain-up".into(),
                 base_url: format!("http://{plain_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -2667,6 +2810,7 @@ async fn e2e_outbound_provider_session_header_translation() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "custom-mapped-up".into(),
                 base_url: format!("http://{custom_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -2691,6 +2835,7 @@ async fn e2e_outbound_provider_session_header_translation() {
                 prompt_cache_mode: Default::default(),
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "codex-responses-up".into(),
                 base_url: format!("http://{responses_addr}"),
                 protocol: ProtocolFamily::OpenAiResponses,
@@ -2894,6 +3039,7 @@ async fn e2e_provider_builtin_cache_profiles() {
         routing: Default::default(),
         upstreams: vec![
             UpstreamConfig {
+                id: String::new(),
                 name: "xai-grok".into(),
                 base_url: format!("http://{grok_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -2918,6 +3064,7 @@ async fn e2e_provider_builtin_cache_profiles() {
                 prompt_cache_mode: PromptCacheMode::XaiGrok,
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "openrouter".into(),
                 base_url: format!("http://{or_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -2942,6 +3089,7 @@ async fn e2e_provider_builtin_cache_profiles() {
                 prompt_cache_mode: PromptCacheMode::OpenRouter,
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "strict-deepseek".into(),
                 base_url: format!("http://{strict_addr}"),
                 protocol: ProtocolFamily::OpenAi,
@@ -2966,6 +3114,7 @@ async fn e2e_provider_builtin_cache_profiles() {
                 prompt_cache_mode: PromptCacheMode::StripOpenAiCacheFields,
             },
             UpstreamConfig {
+                id: String::new(),
                 name: "opencode-go".into(),
                 base_url: format!("http://{opencode_addr}"),
                 protocol: ProtocolFamily::OpenAi,

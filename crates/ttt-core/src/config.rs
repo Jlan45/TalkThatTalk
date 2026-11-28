@@ -286,6 +286,8 @@ pub enum PromptCacheMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub name: String,
     /// Legacy/primary base URL. Prefer `protocol_endpoints` for multi-protocol providers.
     #[serde(default)]
@@ -673,7 +675,7 @@ pub enum TokenRequestFormat {
     Json,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
 pub enum UpstreamAuthConfig {
@@ -719,7 +721,7 @@ pub enum UpstreamAuthConfig {
         /// Override wire format (`form` or `json`). Defaults based on `preset`.
         #[serde(default)]
         token_request_format: Option<TokenRequestFormat>,
-        /// Account key inside the encrypted token store (defaults to upstream name).
+        /// Optional account label and source key for migrating legacy stored tokens.
         #[serde(default)]
         account_id: Option<String>,
         /// Seconds before expiration to trigger proactive background refresh.
@@ -814,6 +816,32 @@ impl UpstreamAuthConfig {
 }
 
 impl UpstreamConfig {
+    pub fn channel_id(&self) -> &str {
+        if self.id.is_empty() {
+            &self.name
+        } else {
+            &self.id
+        }
+    }
+
+    pub fn legacy_oauth_account(&self) -> Option<&str> {
+        match &self.auth {
+            UpstreamAuthConfig::OAuth { account_id, .. } => {
+                Some(account_id.as_deref().unwrap_or(&self.name))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn oauth_storage_key(&self) -> String {
+        if self.id.is_empty() {
+            return self.legacy_oauth_account().unwrap_or(&self.name).to_owned();
+        }
+        match self.owner_user_id {
+            Some(owner) => format!("upstream:user:{owner}:{}", self.id),
+            None => format!("upstream:global:{}", self.id),
+        }
+    }
     /// Join `base_url` with an endpoint entry.
     /// If `endpoint` is already a full `http(s)://` URL, returns it as-is;
     /// otherwise returns `base_url + endpoint`.
@@ -862,6 +890,16 @@ impl UpstreamConfig {
     pub fn validate(&self) -> Result<(), GatewayError> {
         if self.name.trim().is_empty() {
             return Err(GatewayError::Config("upstream name cannot be empty".into()));
+        }
+        if self.id.len() > 128
+            || !self
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(GatewayError::Config(
+                "upstream ID must use ASCII letters, digits, hyphens, or underscores".into(),
+            ));
         }
         let endpoints = self.effective_endpoints();
         if endpoints.is_empty() {
